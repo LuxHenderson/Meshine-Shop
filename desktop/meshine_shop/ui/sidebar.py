@@ -25,7 +25,7 @@ class Sidebar(QWidget):
         # Logo / title
         title = QLabel("MESHINE SHOP")
         title.setStyleSheet(
-            "color: #64ffda; font-size: 16px; font-weight: 700; "
+            "color: #dc3545; font-size: 16px; font-weight: 700; "
             "letter-spacing: 2px; padding: 0 8px 20px 8px;"
         )
         layout.addWidget(title)

@@ -22,7 +22,7 @@ class ImportView(QWidget):
         layout.addWidget(self.drop_zone)
 
         self.file_count_label = QLabel("")
-        self.file_count_label.setStyleSheet("color: #64ffda; font-size: 13px;")
+        self.file_count_label.setStyleSheet("color: #dc3545; font-size: 13px;")
         layout.addWidget(self.file_count_label)
 
         layout.addStretch()
@@ -57,7 +57,7 @@ class ExportView(QWidget):
         placeholder = QLabel(
             "Export settings will appear here once an asset has been processed."
         )
-        placeholder.setStyleSheet("color: #8892b0;")
+        placeholder.setStyleSheet("color: #999999;")
         placeholder.setWordWrap(True)
         layout.addWidget(placeholder)
 
