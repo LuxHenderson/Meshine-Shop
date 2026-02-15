@@ -7,6 +7,12 @@ for the entire application. It assembles the core layout:
     - A main content area that swaps views based on sidebar selection
     - A status bar for real-time feedback
 
+Beyond layout, this is the orchestration hub for the pipeline:
+    1. ImportView emits start_requested(paths) when the user clicks Start
+    2. This module creates a workspace, engine, and worker
+    3. Worker signals are connected to the ProcessingQueue for live updates
+    4. The status bar reflects current pipeline state
+
 The charcoal + crimson dark theme is applied globally here via QSS
 (Qt Style Sheets), which styles every child widget in the window.
 This approach was chosen over per-widget styling because it keeps
@@ -16,9 +22,14 @@ future theme changes trivial.
 
 from PySide6.QtWidgets import QMainWindow, QHBoxLayout, QWidget, QStatusBar
 from PySide6.QtCore import Qt
+
 from meshine_shop.ui.sidebar import Sidebar
 from meshine_shop.ui.main_window import MainContent
 from meshine_shop.ui.styles import DARK_THEME
+from meshine_shop.core.engine import ColmapEngine
+from meshine_shop.core.worker import PipelineWorker
+from meshine_shop.core.workspace import create_workspace
+from meshine_shop.core.pipeline import STAGE_DISPLAY_NAMES
 
 
 class MeshineShopApp(QMainWindow):
@@ -64,8 +75,105 @@ class MeshineShopApp(QMainWindow):
         self.sidebar.nav_changed.connect(self.main_content.switch_view)
 
         # Status bar provides real-time feedback at the bottom of the window.
-        # It will display pipeline progress, error messages, and file counts
-        # as the app evolves beyond scaffolding.
+        # It displays pipeline progress, error messages, and status updates.
         status_bar = QStatusBar()
         status_bar.showMessage("Ready")
         self.setStatusBar(status_bar)
+
+        # Connect the Import view's "Start Processing" button to the pipeline
+        # orchestration method. This is the entry point for the entire pipeline.
+        self.main_content.import_view.start_requested.connect(self._start_pipeline)
+
+        # Keep a reference to the active worker to prevent garbage collection.
+        # QThread must be stored as an instance attribute or it gets destroyed
+        # when the local variable goes out of scope.
+        self._worker: PipelineWorker | None = None
+
+    def _start_pipeline(self, image_paths: list[str]):
+        """
+        Create a workspace, engine, and worker, then start the pipeline.
+
+        This method is called when the user clicks "Start Processing" in
+        the Import view. It:
+        1. Creates a fresh workspace directory for this reconstruction job
+        2. Instantiates the COLMAP engine
+        3. Creates a PipelineWorker on a background thread
+        4. Connects all worker signals to the UI
+        5. Starts the worker thread
+
+        The worker runs on a background thread so the UI stays responsive.
+        All communication back to the UI happens via Qt signals, which are
+        automatically marshaled to the main thread.
+        """
+        # Create a fresh workspace for this job.
+        workspace = create_workspace()
+        self.statusBar().showMessage(f"Workspace: {workspace.root}")
+
+        # Instantiate the COLMAP engine.
+        engine = ColmapEngine()
+
+        # Create the background worker.
+        self._worker = PipelineWorker(engine, image_paths, workspace)
+
+        # Get a reference to the processing queue for signal connections.
+        queue = self.main_content.process_view.queue
+
+        # Initialize the queue UI — switch from empty state to active state
+        # with all stages showing as "pending."
+        queue.start_pipeline()
+
+        # --- Connect worker signals to the processing queue ---
+
+        # When a stage starts, mark it as running in the queue.
+        self._worker.stage_started.connect(queue.set_stage_started)
+
+        # When a stage completes, mark it as done in the queue.
+        self._worker.stage_completed.connect(queue.set_stage_completed)
+
+        # Progress messages update the status text on the active stage row.
+        self._worker.progress.connect(queue.set_progress)
+
+        # Errors mark the stage as failed and display the error message.
+        self._worker.error.connect(queue.set_stage_error)
+
+        # When the full pipeline finishes, show the completion banner.
+        self._worker.pipeline_finished.connect(queue.set_finished)
+
+        # --- Connect worker signals to the status bar ---
+
+        # Show the current stage name in the status bar as each stage starts.
+        self._worker.stage_started.connect(
+            lambda stage: self.statusBar().showMessage(
+                f"Running: {STAGE_DISPLAY_NAMES.get(stage, stage)}"
+            )
+        )
+
+        # Show completion in the status bar.
+        self._worker.pipeline_finished.connect(
+            lambda: self.statusBar().showMessage("Pipeline complete!")
+        )
+
+        # Show errors in the status bar.
+        self._worker.error.connect(
+            lambda stage, msg: self.statusBar().showMessage(
+                f"Error in {STAGE_DISPLAY_NAMES.get(stage, stage)}: {msg}"
+            )
+        )
+
+        # --- Connect worker signals to post-pipeline actions ---
+
+        # Re-enable the Start button after the pipeline finishes or errors.
+        self._worker.pipeline_finished.connect(
+            self.main_content.import_view.reset_start_button
+        )
+        self._worker.error.connect(
+            lambda _stage, _msg: self.main_content.import_view.reset_start_button()
+        )
+
+        # Auto-switch to the Process view so the user can watch progress.
+        self.main_content.switch_view(1)
+        # Also update the sidebar to reflect the view change.
+        self.sidebar.button_group.button(1).setChecked(True)
+
+        # Start the worker thread — this calls worker.run() on the background thread.
+        self._worker.start()

@@ -17,9 +17,9 @@ than relying on Qt's built-in tab styling.
 """
 
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QLabel, QStackedWidget,
+    QWidget, QVBoxLayout, QLabel, QStackedWidget, QPushButton,
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from meshine_shop.ui.drop_zone import DropZone
 from meshine_shop.ui.processing_queue import ProcessingQueue
 
@@ -28,11 +28,20 @@ class ImportView(QWidget):
     """
     The first step in the workflow — importing source data.
 
-    Contains a drag-and-drop zone for photo sets and a label that
-    updates to show how many files have been loaded. This view will
-    eventually include file validation, thumbnail previews, and the
-    ability to start the processing pipeline from here.
+    Contains a drag-and-drop zone for photo sets, a label showing how many
+    files have been loaded, and a "Start Processing" button that kicks off
+    the photogrammetry pipeline.
+
+    Signal flow:
+        1. User drops files → DropZone emits files_dropped(list)
+        2. ImportView stores the paths and enables the Start button
+        3. User clicks Start → ImportView emits start_requested(list)
+        4. App layer receives start_requested and creates the pipeline worker
     """
+
+    # Emitted when the user clicks "Start Processing". Carries the list
+    # of file paths that were dropped into the import zone.
+    start_requested = Signal(list)
 
     def __init__(self):
         super().__init__()
@@ -59,23 +68,52 @@ class ImportView(QWidget):
         self.file_count_label.setStyleSheet("color: #dc3545; font-size: 13px;")
         layout.addWidget(self.file_count_label)
 
+        # "Start Processing" button — disabled until files are dropped.
+        # Clicking this triggers the full photogrammetry pipeline via
+        # the start_requested signal, which the app layer listens for.
+        self._start_btn = QPushButton("Start Processing")
+        self._start_btn.setObjectName("start_button")
+        self._start_btn.setEnabled(False)
+        self._start_btn.setFixedHeight(44)
+        self._start_btn.clicked.connect(self._on_start_clicked)
+        layout.addWidget(self._start_btn)
+
         # Stretch pushes all content to the top of the view.
         layout.addStretch()
 
+        # Store dropped file paths for when the user clicks Start.
+        self._pending_paths: list[str] = []
+
     def _on_files_dropped(self, paths):
-        """Update the file count label when files are dropped into the zone."""
+        """Update the file count label and enable the Start button."""
+        self._pending_paths = paths
         count = len(paths)
-        self.file_count_label.setText(f"{count} file{'s' if count != 1 else ''} ready for processing")
+        self.file_count_label.setText(
+            f"{count} file{'s' if count != 1 else ''} ready for processing"
+        )
+        # Enable the Start button now that we have files to process.
+        self._start_btn.setEnabled(True)
+
+    def _on_start_clicked(self):
+        """Emit the start_requested signal with the pending file paths."""
+        if self._pending_paths:
+            # Disable the button to prevent double-clicks while processing.
+            self._start_btn.setEnabled(False)
+            self._start_btn.setText("Processing...")
+            self.start_requested.emit(self._pending_paths)
+
+    def reset_start_button(self):
+        """Re-enable the Start button after pipeline completes or errors."""
+        self._start_btn.setEnabled(bool(self._pending_paths))
+        self._start_btn.setText("Start Processing")
 
 
 class ProcessView(QWidget):
     """
     The second step — running the photogrammetry pipeline.
 
-    Contains the processing queue panel, which will show active jobs,
-    their current pipeline stage, and progress indicators. Currently
-    displays an empty state message until Phase 1b/1c add actual
-    pipeline execution.
+    Contains the processing queue panel, which shows active jobs with
+    their current pipeline stage and progress indicators.
     """
 
     def __init__(self):
@@ -84,8 +122,8 @@ class ProcessView(QWidget):
         layout.setContentsMargins(32, 32, 32, 32)
         layout.setSpacing(20)
 
-        # The queue widget manages its own layout and will be expanded
-        # in Phase 1c to show real-time pipeline stage progress.
+        # The queue widget manages its own layout and displays
+        # real-time pipeline stage progress via signal connections.
         self.queue = ProcessingQueue()
         layout.addWidget(self.queue)
 
@@ -134,6 +172,10 @@ class MainContent(QWidget):
         0 = ImportView
         1 = ProcessView
         2 = ExportView
+
+    The import_view and process_view attributes are exposed publicly so
+    the app layer can connect signals to them (e.g., start_requested from
+    ImportView, and worker signals to ProcessView's queue).
     """
 
     def __init__(self):
@@ -141,12 +183,18 @@ class MainContent(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
+        # Create named references to views so the app can access them
+        # for signal wiring. Previously these were anonymous addWidget calls.
+        self.import_view = ImportView()
+        self.process_view = ProcessView()
+        self.export_view = ExportView()
+
         # QStackedWidget shows one child at a time. Views are added in
         # the same order as the sidebar buttons, so their indices match.
         self.stack = QStackedWidget()
-        self.stack.addWidget(ImportView())
-        self.stack.addWidget(ProcessView())
-        self.stack.addWidget(ExportView())
+        self.stack.addWidget(self.import_view)     # index 0
+        self.stack.addWidget(self.process_view)    # index 1
+        self.stack.addWidget(self.export_view)     # index 2
 
         layout.addWidget(self.stack)
 

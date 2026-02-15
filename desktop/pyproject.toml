@@ -9,6 +9,10 @@ packages = [{include = "meshine_shop"}]
 [tool.poetry.dependencies]
 python = ">=3.11,<3.13"
 PySide6 = "^6.7"
+pycolmap = "^3.13"
+pillow-heif = "^1.2.0"
+pillow = "^12.1.1"
+open3d = "^0.19.0"
 
 [tool.poetry.group.dev.dependencies]
 watchfiles = "^1.0"

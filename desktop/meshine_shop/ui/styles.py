@@ -172,4 +172,72 @@ QScrollBar::handle:vertical:hover {
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
     height: 0;
 }
+
+/* ===== Start Processing Button ===== */
+/* Crimson accent button that stands out against the charcoal theme.
+   Disabled state dims the button to signal it's not yet interactive
+   (files must be dropped first). */
+QPushButton#start_button {
+    background-color: #dc3545;
+    color: #ffffff;
+    border: none;
+    border-radius: 8px;
+    font-size: 14px;
+    font-weight: 600;
+    padding: 10px 24px;
+}
+
+QPushButton#start_button:hover {
+    background-color: #c82333;
+}
+
+QPushButton#start_button:pressed {
+    background-color: #a71d2a;
+}
+
+QPushButton#start_button:disabled {
+    background-color: #3a3a3a;
+    color: #666666;
+}
+
+/* ===== Pipeline Stage Rows ===== */
+/* Each row in the processing queue represents one pipeline stage.
+   Minimal styling to keep the focus on the status indicators. */
+QWidget#stage_row {
+    background-color: transparent;
+}
+
+/* Stage name labels — slightly brighter than body text for readability. */
+QLabel#stage_name {
+    color: #d4d4d4;
+    font-size: 13px;
+}
+
+/* Status indicator colors for each pipeline stage state. */
+QLabel#stage_status_pending {
+    color: #4a5568;
+    font-size: 16px;
+}
+
+QLabel#stage_status_running {
+    color: #dc3545;
+    font-size: 16px;
+}
+
+QLabel#stage_status_done {
+    color: #28a745;
+    font-size: 16px;
+}
+
+QLabel#stage_status_error {
+    color: #dc3545;
+    font-size: 16px;
+    font-weight: 600;
+}
+
+/* Status message text — muted so the stage name and indicator are primary. */
+QLabel#stage_message {
+    color: #999999;
+    font-size: 12px;
+}
 """

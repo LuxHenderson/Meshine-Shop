@@ -50,3 +50,14 @@ STAGE_ORDER = [
     PipelineStage.MESH,
     PipelineStage.TEXTURE,
 ]
+
+# Human-readable display names for each stage, used in the processing
+# queue UI to show users what's happening in plain language.
+STAGE_DISPLAY_NAMES = {
+    PipelineStage.INGEST: "Importing Images",
+    PipelineStage.FEATURES: "Extracting Features",
+    PipelineStage.SPARSE: "Sparse Reconstruction",
+    PipelineStage.DENSE: "Dense Reconstruction",
+    PipelineStage.MESH: "Building Mesh",
+    PipelineStage.TEXTURE: "Texture Mapping",
+}
