@@ -84,6 +84,10 @@ class MeshineShopApp(QMainWindow):
         # orchestration method. This is the entry point for the entire pipeline.
         self.main_content.import_view.start_requested.connect(self._start_pipeline)
 
+        # Connect the Reset button in the processing queue to the reset handler.
+        # This lets the user cancel a running pipeline and return to the Import view.
+        self.main_content.process_view.queue.reset_requested.connect(self._reset_pipeline)
+
         # Keep a reference to the active worker to prevent garbage collection.
         # QThread must be stored as an instance attribute or it gets destroyed
         # when the local variable goes out of scope.
@@ -177,3 +181,36 @@ class MeshineShopApp(QMainWindow):
 
         # Start the worker thread — this calls worker.run() on the background thread.
         self._worker.start()
+
+    def _reset_pipeline(self):
+        """
+        Cancel any running pipeline and reset the UI to its initial state.
+
+        Called when the user clicks the Reset button in the processing queue.
+        This method:
+        1. Cancels the background worker (cooperative — takes effect between stages)
+        2. Resets the processing queue to its empty state
+        3. Re-enables the Start button on the Import view
+        4. Switches back to the Import view
+        5. Updates the status bar
+        """
+        # Cancel the worker if one is running. The cancellation flag is checked
+        # between pipeline stages, so the current stage will finish before stopping.
+        if self._worker is not None:
+            self._worker.cancel()
+            # Wait for the worker thread to finish (with a timeout to avoid freezing).
+            self._worker.wait(5000)
+            self._worker = None
+
+        # Reset the processing queue back to its empty state.
+        self.main_content.process_view.queue.reset()
+
+        # Re-enable the Start button so the user can start a new job.
+        self.main_content.import_view.reset_start_button()
+
+        # Switch back to the Import view.
+        self.main_content.switch_view(0)
+        self.sidebar.button_group.button(0).setChecked(True)
+
+        # Update the status bar.
+        self.statusBar().showMessage("Ready")

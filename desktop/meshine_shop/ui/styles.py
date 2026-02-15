@@ -240,4 +240,28 @@ QLabel#stage_message {
     color: #999999;
     font-size: 12px;
 }
+
+/* ===== Reset Button ===== */
+/* Outlined style (no fill) to visually distinguish it from the primary
+   Start Processing button. The border uses a muted gray that brightens
+   on hover to indicate interactivity without competing for attention. */
+QPushButton#reset_button {
+    background-color: transparent;
+    color: #999999;
+    border: 1px solid #3a3a3a;
+    border-radius: 8px;
+    font-size: 13px;
+    font-weight: 500;
+    padding: 8px 20px;
+}
+
+QPushButton#reset_button:hover {
+    background-color: #333333;
+    color: #e0e0e0;
+    border-color: #999999;
+}
+
+QPushButton#reset_button:pressed {
+    background-color: #3a3a3a;
+}
 """

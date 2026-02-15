@@ -79,7 +79,23 @@ All visual styling is defined in a single `styles.py` file using Qt Style Sheets
 
 **Solution:** Accepted CPU-mode for macOS development (still fast enough for small-to-medium datasets). The architecture is engine-agnostic, so Metal-accelerated alternatives can be integrated later. Windows users with NVIDIA GPUs get full CUDA acceleration.
 
-*More challenges will be documented as development progresses through Phases 1b–4.*
+### Challenge: iPhone photos aren't really JPEG
+
+**Problem:** Users drag-and-drop photos from their iPhone into the app. The files have `.JPEG` extensions, but macOS silently preserves the original HEIC format. COLMAP cannot read HEIC — it silently fails to extract features from every image, producing an empty database and a misleading "not enough visual overlap" error.
+
+**Solution:** Added a Pillow-based image conversion layer in the ingest stage. Every image passes through `PIL.Image.open()` → `convert("RGB")` → `save(JPEG)` before entering the workspace. The `pillow-heif` library registers HEIC support with Pillow, so the conversion is transparent regardless of the source format. This also future-proofs the ingest against other unusual formats (16-bit PNG, TIFF variants, etc.).
+
+**Lesson:** Never trust file extensions. Always validate the actual format — and when working with Apple's ecosystem, assume HEIC until proven otherwise.
+
+### Challenge: Poisson meshing requires normals that sparse reconstructions don't have
+
+**Problem:** On macOS (no CUDA), dense reconstruction is skipped and the pipeline falls back to sparse point cloud data. COLMAP's sparse PLY export contains only XYZ coordinates and RGB color — no surface normals. Poisson surface reconstruction requires oriented normals to determine inside vs. outside of the surface. Without them, `pycolmap.poisson_meshing()` silently produces a 0-byte output file.
+
+**Solution:** Replaced pycolmap's Poisson meshing with Open3D's implementation, which provides automatic normal estimation. The pipeline now: (1) loads the sparse PLY, (2) estimates normals via PCA on k-nearest neighbors, (3) orients normals consistently using tangent plane propagation, (4) runs Poisson reconstruction, and (5) trims low-density vertices to remove phantom surface extensions. This produces a usable mesh (~5,800 vertices, ~11,500 triangles from a 17,500-point sparse cloud).
+
+**Lesson:** CPU-only fallback paths need end-to-end testing with real data. The sparse-to-mesh path was architecturally correct but broke at the data format level — a gap that only showed up when running the full pipeline with actual iPhone photos.
+
+*More challenges will be documented as development progresses through Phases 1c–4.*
 
 ## Results and Impact
 
@@ -91,11 +107,21 @@ All visual styling is defined in a single `styles.py` file using Qt Style Sheets
 - Project architecture designed for 14-week build cycle
 - All code comprehensively commented for maintainability
 
+### Phase 1b Complete
+- End-to-end photogrammetry pipeline: 65 iPhone photos → 3D mesh in one click
+- COLMAP integration via pycolmap with automatic HEIC image conversion
+- Background QThread processing with live stage-by-stage UI updates
+- Graceful CPU-only fallback: skips dense reconstruction, estimates normals, meshes from sparse data
+- Pipeline produces usable output: ~5,800 vertices, ~11,500 triangles from 65 source photos
+- Reset button allows re-running without restarting the app
+
 ## What I'd Improve
 
 *This section will be updated as development reveals areas for iteration.*
 
 - **Initial consideration:** Evaluate whether a hybrid approach (Rust core + Python bindings) would yield better performance for the compute-heavy pipeline stages, while maintaining the Python UI layer.
+- **Image conversion overhead:** Converting every image through Pillow adds processing time at ingest. A smarter approach would detect the actual format first (via file magic bytes) and only convert when necessary.
+- **Sparse mesh quality:** The CPU-only path produces a functional but low-detail mesh. Investigating Metal-based dense reconstruction (via custom compute shaders or alternative engines) could significantly improve macOS output quality.
 
 ## What This Proves
 

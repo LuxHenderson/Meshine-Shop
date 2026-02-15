@@ -56,12 +56,19 @@ Meshine Shop/
 
 **Centralized QSS theming:** All visual styling lives in a single `styles.py` file rather than being scattered across widgets. This makes theme changes trivial and keeps UI code focused on layout and behavior.
 
-## Current Features (Phase 1a — Scaffold)
+## Current Features (Phase 1b — Engine Integration)
 
 - Desktop application shell with charcoal + crimson dark theme
 - Sidebar navigation (Import / Process / Export views)
-- Drag-and-drop file import zone accepting JPEG, PNG, TIFF, and PLY files
-- Processing queue panel (empty state — pipeline integration pending)
+- Drag-and-drop file import zone accepting JPEG, PNG, TIFF, HEIC, and PLY files
+- Automatic HEIC-to-JPEG conversion for iPhone photos (via Pillow + pillow-heif)
+- Full COLMAP photogrammetry pipeline: ingest → feature extraction → sparse reconstruction → dense reconstruction → mesh → texture mapping
+- Background processing via QThread — UI stays responsive during pipeline execution
+- Live processing queue with per-stage status indicators (pending / running / done / error)
+- Real-time progress messages in the queue and status bar
+- Poisson surface reconstruction via Open3D with automatic normal estimation
+- Dense reconstruction support on CUDA-enabled systems; graceful fallback to sparse meshing on CPU-only (macOS)
+- Reset button to cancel/clear the pipeline and start a new job
 - Export view (placeholder — export logic pending)
 - Development file watcher with auto-restart on save
 - Cross-platform targeting (macOS + Windows)
@@ -70,7 +77,7 @@ Meshine Shop/
 
 ### Phase 1: Core Pipeline (In Progress)
 - [x] 1a — Project scaffolding and app shell
-- [ ] 1b — COLMAP photogrammetry engine integration
+- [x] 1b — COLMAP photogrammetry engine integration
 - [ ] 1c — Processing pipeline with stage-by-stage UI feedback
 - [ ] 1d — Basic mesh export (.OBJ / .glTF)
 
@@ -137,8 +144,9 @@ poetry run python scripts/dev.py
 
 ## Known Limitations
 
-- **No GPU acceleration for COLMAP on macOS:** Apple Silicon uses Metal, not CUDA. COLMAP runs on CPU, which is sufficient for development and small-to-medium datasets but slower for large reconstructions.
-- **Pipeline not yet functional:** Phase 1a is the app shell only. Photogrammetry processing begins in Phase 1b.
+- **No GPU acceleration for COLMAP on macOS:** Apple Silicon uses Metal, not CUDA. Dense reconstruction (patch-match stereo) is skipped on macOS; meshing proceeds from the sparse point cloud. Windows with NVIDIA GPUs get full CUDA acceleration.
+- **Sparse-only meshing on macOS:** Without dense reconstruction, the Poisson mesh is built from the sparse point cloud (~17k points for 65 images). Quality is lower than dense-based meshing but the pipeline completes end-to-end.
+- **iPhone photos are HEIC internally:** Even when named `.JPEG`, iPhone photos are HEIC format. The app handles this automatically via Pillow + pillow-heif conversion, but users should be aware of the extra processing step.
 - **macOS-only testing so far:** Cross-platform support is architected in but Windows testing has not started.
 
 ## Future Improvements
