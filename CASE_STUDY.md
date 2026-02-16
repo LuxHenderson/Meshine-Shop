@@ -95,7 +95,15 @@ All visual styling is defined in a single `styles.py` file using Qt Style Sheets
 
 **Lesson:** CPU-only fallback paths need end-to-end testing with real data. The sparse-to-mesh path was architecturally correct but broke at the data format level — a gap that only showed up when running the full pipeline with actual iPhone photos.
 
-*More challenges will be documented as development progresses through Phases 1c–4.*
+### Challenge: PLY is not a universal format
+
+**Problem:** The pipeline's output is a `.ply` file — a format that COLMAP and Open3D use natively, but that most game engines and 3D modeling tools don't import directly. Unity expects `.fbx` or `.glTF`. Blender prefers `.obj` or `.glTF`. The pipeline was technically complete but the output was stranded in a format only pipeline tools could read.
+
+**Solution:** Added trimesh as an export layer. trimesh loads the PLY mesh (vertices, faces, vertex colors) and writes it out as `.obj` or `.glb` (glTF Binary). The Export view presents mesh stats (vertex count, triangle count, file size) so the user can verify the output before committing to an export. A native save dialog lets the user choose the destination and format.
+
+**Lesson:** "End-to-end" means end-to-end. A pipeline that produces output in an intermediate format isn't complete — it needs to deliver files in the formats the user's downstream tools actually consume.
+
+*More challenges will be documented as development progresses through Phases 2–4.*
 
 ## Results and Impact
 
@@ -114,6 +122,14 @@ All visual styling is defined in a single `styles.py` file using Qt Style Sheets
 - Graceful CPU-only fallback: skips dense reconstruction, estimates normals, meshes from sparse data
 - Pipeline produces usable output: ~5,800 vertices, ~11,500 triangles from 65 source photos
 - Reset button allows re-running without restarting the app
+
+### Phase 1 Complete (1c + 1d)
+- Stage-by-stage UI feedback already delivered as part of 1b's processing queue
+- Mesh export to OBJ and glTF Binary via trimesh — the pipeline now delivers files that Unity, Unreal, and Blender can import directly
+- Export view shows mesh stats before export, with format selection and native save dialog
+- Auto-transition from pipeline completion to Export view for a seamless workflow
+- Full reset flow: clears all three views (Import, Process, Export) back to clean state
+- Phase 1 goal achieved: photos in → standard 3D mesh out, end-to-end in one application
 
 ## What I'd Improve
 

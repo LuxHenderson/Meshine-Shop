@@ -56,7 +56,7 @@ Meshine Shop/
 
 **Centralized QSS theming:** All visual styling lives in a single `styles.py` file rather than being scattered across widgets. This makes theme changes trivial and keeps UI code focused on layout and behavior.
 
-## Current Features (Phase 1b — Engine Integration)
+## Current Features (Phase 1 — Core Pipeline Complete)
 
 - Desktop application shell with charcoal + crimson dark theme
 - Sidebar navigation (Import / Process / Export views)
@@ -68,18 +68,20 @@ Meshine Shop/
 - Real-time progress messages in the queue and status bar
 - Poisson surface reconstruction via Open3D with automatic normal estimation
 - Dense reconstruction support on CUDA-enabled systems; graceful fallback to sparse meshing on CPU-only (macOS)
-- Reset button to cancel/clear the pipeline and start a new job
-- Export view (placeholder — export logic pending)
+- Reset button to cancel/clear the pipeline and start a new job — resets all views to clean state
+- Mesh export to OBJ (.obj) and glTF Binary (.glb) via trimesh
+- Export view with mesh stats (vertex count, triangle count, file size), format selector, and native save dialog
+- Auto-transition to Export view after pipeline completes
 - Development file watcher with auto-restart on save
 - Cross-platform targeting (macOS + Windows)
 
 ## Roadmap
 
-### Phase 1: Core Pipeline (In Progress)
+### Phase 1: Core Pipeline (Complete)
 - [x] 1a — Project scaffolding and app shell
 - [x] 1b — COLMAP photogrammetry engine integration
-- [ ] 1c — Processing pipeline with stage-by-stage UI feedback
-- [ ] 1d — Basic mesh export (.OBJ / .glTF)
+- [x] 1c — Processing pipeline with stage-by-stage UI feedback
+- [x] 1d — Basic mesh export (.OBJ / .glTF)
 
 ### Phase 2: Game-Ready Optimization
 - [ ] 2a — Mesh decimation with quality presets

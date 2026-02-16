@@ -30,6 +30,7 @@ from meshine_shop.core.engine import ColmapEngine
 from meshine_shop.core.worker import PipelineWorker
 from meshine_shop.core.workspace import create_workspace
 from meshine_shop.core.pipeline import STAGE_DISPLAY_NAMES
+from meshine_shop.core.exporter import load_mesh_info, export_mesh
 
 
 class MeshineShopApp(QMainWindow):
@@ -88,10 +89,17 @@ class MeshineShopApp(QMainWindow):
         # This lets the user cancel a running pipeline and return to the Import view.
         self.main_content.process_view.queue.reset_requested.connect(self._reset_pipeline)
 
+        # Connect the Export view's export button to the export handler.
+        self.main_content.export_view.export_requested.connect(self._run_export)
+
         # Keep a reference to the active worker to prevent garbage collection.
         # QThread must be stored as an instance attribute or it gets destroyed
         # when the local variable goes out of scope.
         self._worker: PipelineWorker | None = None
+
+        # Store the workspace from the current pipeline run so the Export view
+        # can locate the output mesh after the pipeline completes.
+        self._workspace = None
 
     def _start_pipeline(self, image_paths: list[str]):
         """
@@ -109,8 +117,10 @@ class MeshineShopApp(QMainWindow):
         All communication back to the UI happens via Qt signals, which are
         automatically marshaled to the main thread.
         """
-        # Create a fresh workspace for this job.
+        # Create a fresh workspace for this job and store it so the Export
+        # view can find the output mesh after the pipeline completes.
         workspace = create_workspace()
+        self._workspace = workspace
         self.statusBar().showMessage(f"Workspace: {workspace.root}")
 
         # Instantiate the COLMAP engine.
@@ -157,6 +167,10 @@ class MeshineShopApp(QMainWindow):
             lambda: self.statusBar().showMessage("Pipeline complete!")
         )
 
+        # When the pipeline finishes, prepare the Export view with mesh info
+        # and auto-switch to it so the user can export immediately.
+        self._worker.pipeline_finished.connect(self._on_pipeline_finished)
+
         # Show errors in the status bar.
         self._worker.error.connect(
             lambda stage, msg: self.statusBar().showMessage(
@@ -182,6 +196,53 @@ class MeshineShopApp(QMainWindow):
         # Start the worker thread — this calls worker.run() on the background thread.
         self._worker.start()
 
+    def _on_pipeline_finished(self):
+        """
+        Prepare the Export view after the pipeline completes successfully.
+
+        Loads mesh stats from the output PLY file and passes them to the
+        Export view, then auto-switches to the Export tab so the user can
+        export immediately without manually navigating.
+        """
+        if self._workspace is None:
+            return
+
+        mesh_ply = self._workspace.mesh / "meshed.ply"
+        if not mesh_ply.exists():
+            self.statusBar().showMessage("Pipeline complete, but no mesh file found.")
+            return
+
+        # Load mesh stats (vertex count, triangle count, file size) for display.
+        from pathlib import Path
+        mesh_info = load_mesh_info(mesh_ply)
+
+        # Populate the Export view with mesh details and switch to it.
+        self.main_content.export_view.set_mesh_ready(self._workspace, mesh_info)
+        self.main_content.switch_view(2)
+        self.sidebar.button_group.button(2).setChecked(True)
+
+    def _run_export(self, source_ply: str, dest_path: str):
+        """
+        Execute the mesh export when the user clicks Export in the Export view.
+
+        Converts the pipeline's PLY output to the user's chosen format (OBJ or
+        glTF Binary) using trimesh, then reports success or failure back to the
+        Export view.
+
+        Args:
+            source_ply: Path to the pipeline's output PLY mesh.
+            dest_path:  User-chosen save location with format extension.
+        """
+        from pathlib import Path
+
+        try:
+            export_mesh(Path(source_ply), Path(dest_path))
+            self.main_content.export_view.set_export_success(dest_path)
+            self.statusBar().showMessage(f"Exported to: {dest_path}")
+        except Exception as e:
+            self.main_content.export_view.set_export_error(str(e))
+            self.statusBar().showMessage(f"Export failed: {e}")
+
     def _reset_pipeline(self):
         """
         Cancel any running pipeline and reset the UI to its initial state.
@@ -205,8 +266,15 @@ class MeshineShopApp(QMainWindow):
         # Reset the processing queue back to its empty state.
         self.main_content.process_view.queue.reset()
 
-        # Re-enable the Start button so the user can start a new job.
-        self.main_content.import_view.reset_start_button()
+        # Reset the Export view back to its placeholder state.
+        self.main_content.export_view.reset()
+
+        # Clear the stored workspace reference.
+        self._workspace = None
+
+        # Reset the Import view — clears dropped files, file count label,
+        # and disables the Start button so the user starts fresh.
+        self.main_content.import_view.reset()
 
         # Switch back to the Import view.
         self.main_content.switch_view(0)

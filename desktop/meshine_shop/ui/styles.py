@@ -264,4 +264,69 @@ QPushButton#reset_button:hover {
 QPushButton#reset_button:pressed {
     background-color: #3a3a3a;
 }
+
+/* ===== Export View ===== */
+/* Export button — same crimson accent as the Start Processing button
+   to keep the primary action visually consistent across views. */
+QPushButton#export_button {
+    background-color: #dc3545;
+    color: #ffffff;
+    border: none;
+    border-radius: 8px;
+    font-size: 14px;
+    font-weight: 600;
+    padding: 10px 24px;
+}
+
+QPushButton#export_button:hover {
+    background-color: #c82333;
+}
+
+QPushButton#export_button:pressed {
+    background-color: #a71d2a;
+}
+
+/* Mesh info label — slightly brighter text for the stats readout so
+   it stands out against the dark background. */
+QLabel#mesh_info {
+    color: #d4d4d4;
+    font-size: 14px;
+    padding: 12px 0;
+}
+
+/* Format label next to the dropdown. */
+QLabel#export_label {
+    color: #d4d4d4;
+    font-size: 13px;
+}
+
+/* Format dropdown — dark surface with subtle border to match the
+   overall theme. The drop-down arrow area gets a slightly different
+   background for visual separation. */
+QComboBox#format_combo {
+    background-color: #252525;
+    color: #e0e0e0;
+    border: 1px solid #3a3a3a;
+    border-radius: 6px;
+    padding: 8px 12px;
+    font-size: 13px;
+}
+
+QComboBox#format_combo:hover {
+    border-color: #999999;
+}
+
+QComboBox#format_combo::drop-down {
+    border: none;
+    width: 28px;
+}
+
+/* Dropdown list styling — matches the dark surface palette. */
+QComboBox#format_combo QAbstractItemView {
+    background-color: #252525;
+    color: #e0e0e0;
+    border: 1px solid #3a3a3a;
+    selection-background-color: #3a3a3a;
+    selection-color: #dc3545;
+}
 """

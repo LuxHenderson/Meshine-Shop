@@ -16,12 +16,17 @@ and gives us full control over the navigation UI (the sidebar) rather
 than relying on Qt's built-in tab styling.
 """
 
+from pathlib import Path
+
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QLabel, QStackedWidget, QPushButton,
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QStackedWidget,
+    QPushButton, QComboBox, QFileDialog,
 )
 from PySide6.QtCore import Qt, Signal
 from meshine_shop.ui.drop_zone import DropZone
 from meshine_shop.ui.processing_queue import ProcessingQueue
+from meshine_shop.core.pipeline import EXPORT_FORMATS
+from meshine_shop.core.workspace import WorkspacePaths
 
 
 class ImportView(QWidget):
@@ -107,6 +112,17 @@ class ImportView(QWidget):
         self._start_btn.setEnabled(bool(self._pending_paths))
         self._start_btn.setText("Start Processing")
 
+    def reset(self):
+        """Clear all imported files and return to the initial empty state.
+
+        Called by the app layer when the user resets the pipeline, so the
+        Import view is clean for a fresh job — no stale file list lingering.
+        """
+        self._pending_paths = []
+        self.file_count_label.setText("")
+        self._start_btn.setEnabled(False)
+        self._start_btn.setText("Start Processing")
+
 
 class ProcessView(QWidget):
     """
@@ -130,12 +146,27 @@ class ProcessView(QWidget):
 
 class ExportView(QWidget):
     """
-    The third step — exporting game-ready assets.
+    The third step — exporting the reconstructed mesh.
 
-    Will eventually contain format selection (FBX/glTF), quality presets
-    (mobile, desktop, cinematic), and export path configuration. Currently
-    shows a placeholder message until Phase 1d/2e implement export logic.
+    Toggles between two states:
+        - Placeholder: shown when no mesh is available yet
+        - Active: shows mesh info, format selector, and export button
+
+    After the pipeline completes, the app calls set_mesh_ready() with the
+    workspace paths and mesh stats. The user picks a format, clicks Export,
+    and a save dialog lets them choose where to save the file.
+
+    Signal flow:
+        1. App calls set_mesh_ready(workspace, mesh_info) after pipeline completes
+        2. User selects format from dropdown and clicks "Export"
+        3. QFileDialog opens for the user to choose a save location
+        4. ExportView emits export_requested(source_ply, dest_path)
+        5. App layer calls the exporter and reports success/error back
     """
+
+    # Emitted when the user confirms an export. Carries the source PLY path
+    # and the destination path (with the chosen format extension).
+    export_requested = Signal(str, str)
 
     def __init__(self):
         super().__init__()
@@ -143,21 +174,161 @@ class ExportView(QWidget):
         layout.setContentsMargins(32, 32, 32, 32)
         layout.setSpacing(20)
 
-        # Section header for the Export view.
+        # Section header — always visible.
         header = QLabel("Export")
         header.setObjectName("section_title")
         layout.addWidget(header)
 
-        # Placeholder text — communicates that export functionality
-        # depends on having a processed asset first.
-        placeholder = QLabel(
+        # --- Placeholder state ---
+        # Shown when no mesh has been processed yet.
+        self._placeholder = QLabel(
             "Export settings will appear here once an asset has been processed."
         )
-        placeholder.setStyleSheet("color: #999999;")
-        placeholder.setWordWrap(True)
-        layout.addWidget(placeholder)
+        self._placeholder.setStyleSheet("color: #999999;")
+        self._placeholder.setWordWrap(True)
+        layout.addWidget(self._placeholder)
+
+        # --- Active state container ---
+        # Contains mesh info, format selector, export button, and feedback.
+        # Hidden until set_mesh_ready() is called.
+        self._active_container = QWidget()
+        active_layout = QVBoxLayout(self._active_container)
+        active_layout.setContentsMargins(0, 0, 0, 0)
+        active_layout.setSpacing(16)
+
+        # Mesh info panel — shows vertex count, triangle count, file size.
+        # Gives the user confidence that the pipeline produced valid output
+        # before they commit to exporting.
+        self._mesh_info = QLabel("")
+        self._mesh_info.setObjectName("mesh_info")
+        self._mesh_info.setWordWrap(True)
+        active_layout.addWidget(self._mesh_info)
+
+        # Format selector row — dropdown + label on one line.
+        format_row = QWidget()
+        format_layout = QHBoxLayout(format_row)
+        format_layout.setContentsMargins(0, 0, 0, 0)
+        format_layout.setSpacing(12)
+
+        format_label = QLabel("Format:")
+        format_label.setObjectName("export_label")
+        format_label.setFixedWidth(60)
+        format_layout.addWidget(format_label)
+
+        # QComboBox populated with the export formats defined in pipeline.py.
+        # The user selects a format before clicking Export.
+        self._format_combo = QComboBox()
+        self._format_combo.setObjectName("format_combo")
+        for label in EXPORT_FORMATS:
+            self._format_combo.addItem(label)
+        self._format_combo.setFixedWidth(200)
+        format_layout.addWidget(self._format_combo)
+
+        format_layout.addStretch()
+        active_layout.addWidget(format_row)
+
+        # Export button — opens a save dialog then emits export_requested.
+        # Uses the same crimson accent as the Start Processing button so
+        # the primary action is always visually consistent.
+        self._export_btn = QPushButton("Choose Location && Export")
+        self._export_btn.setObjectName("export_button")
+        self._export_btn.setFixedHeight(44)
+        self._export_btn.clicked.connect(self._on_export_clicked)
+        active_layout.addWidget(self._export_btn)
+
+        # Feedback label — shows success or error messages after export.
+        self._feedback = QLabel("")
+        self._feedback.setObjectName("export_feedback")
+        self._feedback.setWordWrap(True)
+        active_layout.addWidget(self._feedback)
+
+        active_layout.addStretch()
+        layout.addWidget(self._active_container)
+        self._active_container.hide()
 
         layout.addStretch()
+
+        # Store the source PLY path once the pipeline provides it.
+        self._source_ply: Path | None = None
+
+    def set_mesh_ready(self, workspace: WorkspacePaths, mesh_info: dict):
+        """
+        Switch from placeholder to active state with mesh details.
+
+        Called by the app layer after the pipeline completes successfully.
+        Populates the mesh info label and enables the export controls.
+
+        Args:
+            workspace: The workspace containing the pipeline output.
+            mesh_info: Dict with 'vertices', 'triangles', 'file_size_mb' keys.
+        """
+        self._source_ply = workspace.mesh / "meshed.ply"
+
+        # Format mesh stats into a readable summary.
+        self._mesh_info.setText(
+            f"Vertices: {mesh_info['vertices']:,}    "
+            f"Triangles: {mesh_info['triangles']:,}    "
+            f"File size: {mesh_info['file_size_mb']} MB"
+        )
+
+        # Switch to active state.
+        self._placeholder.hide()
+        self._active_container.show()
+        self._feedback.setText("")
+
+    def set_export_success(self, dest_path: str):
+        """Show a success message after a successful export."""
+        self._feedback.setStyleSheet("color: #28a745; font-size: 13px;")
+        self._feedback.setText(f"Exported to: {dest_path}")
+
+    def set_export_error(self, message: str):
+        """Show an error message if export fails."""
+        self._feedback.setStyleSheet("color: #dc3545; font-size: 13px;")
+        self._feedback.setText(f"Export failed: {message}")
+
+    def reset(self):
+        """Return to placeholder state. Called when the pipeline is reset."""
+        self._source_ply = None
+        self._active_container.hide()
+        self._placeholder.show()
+        self._feedback.setText("")
+
+    def _on_export_clicked(self):
+        """Open a save dialog and emit export_requested with the chosen path."""
+        if self._source_ply is None:
+            return
+
+        # Get the selected format's file extension from the pipeline constants.
+        selected_label = self._format_combo.currentText()
+        extension = EXPORT_FORMATS[selected_label]
+
+        # Build the file filter string for the save dialog.
+        # e.g., "OBJ Files (*.obj)" or "glTF Binary Files (*.glb)"
+        format_name = selected_label.split(" (")[0]
+        file_filter = f"{format_name} Files (*{extension})"
+
+        # Default filename based on the format.
+        default_name = f"mesh{extension}"
+
+        # Open a native save dialog so the user picks where to save.
+        dest_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Mesh",
+            default_name,
+            file_filter,
+        )
+
+        # User cancelled the dialog.
+        if not dest_path:
+            return
+
+        # Ensure the file has the correct extension (some OS dialogs
+        # don't append it automatically).
+        if not dest_path.lower().endswith(extension):
+            dest_path += extension
+
+        # Emit the signal for the app layer to handle the actual export.
+        self.export_requested.emit(str(self._source_ply), dest_path)
 
 
 class MainContent(QWidget):

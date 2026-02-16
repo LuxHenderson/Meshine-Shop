@@ -61,3 +61,11 @@ STAGE_DISPLAY_NAMES = {
     PipelineStage.MESH: "Building Mesh",
     PipelineStage.TEXTURE: "Texture Mapping",
 }
+
+# Export format options presented to the user in the Export view.
+# Keys are human-readable labels; values are file extensions used by
+# trimesh to determine the output format.
+EXPORT_FORMATS = {
+    "OBJ (.obj)": ".obj",
+    "glTF Binary (.glb)": ".glb",
+}
