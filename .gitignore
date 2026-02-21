@@ -23,6 +23,10 @@ poetry.lock
 .DS_Store
 Thumbs.db
 
+# Swift
+.build/
+.swiftpm/
+
 # Project
 *.obj
 *.fbx
