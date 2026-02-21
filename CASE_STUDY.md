@@ -77,7 +77,7 @@ All visual styling is defined in a single `styles.py` file using Qt Style Sheets
 
 **Problem:** Apple Silicon uses Metal, not CUDA. COLMAP's GPU acceleration requires CUDA, so it falls back to CPU on Mac.
 
-**Solution:** Accepted CPU-mode for macOS development (still fast enough for small-to-medium datasets). The architecture is engine-agnostic, so Metal-accelerated alternatives can be integrated later. Windows users with NVIDIA GPUs get full CUDA acceleration.
+**Solution:** Designed the pipeline with an engine-agnostic abstraction layer (`ReconstructionEngine` ABC) so the photogrammetry engine is swappable. This paid off immediately — when Apple Object Capture was integrated in Phase 1e, it slotted in as a second engine behind the same interface. macOS now uses Metal-accelerated reconstruction via Object Capture (producing ~50K vertices with PBR textures), while COLMAP remains the engine for Windows with CUDA. The engine factory auto-detects the best available engine at startup — no user configuration needed.
 
 ### Challenge: iPhone photos aren't really JPEG
 
@@ -103,6 +103,30 @@ All visual styling is defined in a single `styles.py` file using Qt Style Sheets
 
 **Lesson:** "End-to-end" means end-to-end. A pipeline that produces output in an intermediate format isn't complete — it needs to deliver files in the formats the user's downstream tools actually consume.
 
+### Challenge: Apple's PhotogrammetrySession is Swift-only
+
+**Problem:** Apple's Object Capture API (`PhotogrammetrySession` in RealityKit) produces dramatically better results than COLMAP on macOS — ~50K vertices with PBR textures vs. ~5,800 sparse vertices. But the API is Swift-only. It cannot be accessed via PyObjC (which only bridges Objective-C), and there is no Python binding. The entire desktop app is Python + PySide6, so calling this API directly from the application was impossible.
+
+**Solution:** Built a lightweight Swift CLI tool (`apple_photogrammetry/`) that wraps `PhotogrammetrySession` and communicates with the Python app via a JSON lines protocol over stdout. The CLI accepts an input directory and output path, runs the reconstruction, and streams structured progress updates (`{"stage": "...", "progress": 0.75}`) that the Python worker parses in real time. This keeps the integration clean — the Swift code is a thin wrapper around Apple's API, and the Python code treats it as just another subprocess with a well-defined contract.
+
+**Lesson:** When a platform API locks you into a specific language, a subprocess bridge with a structured protocol is often cleaner than FFI or binding generators. The JSON lines protocol is trivial to parse, easy to debug, and naturally decouples the two codebases.
+
+### Challenge: Swift CLI process hangs after completion
+
+**Problem:** After the Apple Object Capture pipeline finished processing, the Swift CLI subprocess would not exit. The Python `stdout` reader would hang indefinitely at the "Extracting Features" stage, even though all stages had completed. The pipeline appeared frozen.
+
+**Solution:** The bug was a subtle Swift language trap. Inside a `for try await output in session.outputs` loop, the `.processingComplete` case used a bare `break` statement. In Swift, `break` inside a `switch` only exits the switch — it does not break out of the enclosing `for` loop. The loop continued waiting for more output that would never come. The fix was a labeled loop: `outputLoop: for try await output in session.outputs { ... break outputLoop }`. This explicitly breaks the `for` loop when processing completes, allowing the CLI to exit cleanly.
+
+**Lesson:** In Swift, `break` inside a `switch` is a no-op that only exits the switch. To break out of an enclosing loop from inside a switch case, you need a labeled loop. This is a well-known gotcha, but it produces no compiler warning — the code looks correct and compiles fine.
+
+### Challenge: Object Capture outputs USDZ, not PLY
+
+**Problem:** Apple Object Capture produces a `.usdz` file — a compressed USD archive containing geometry, PBR textures (diffuse, normal, roughness, AO), and material definitions. The existing export pipeline expected `.ply` input. USDZ is not a format that trimesh, Open3D, or any of the Python mesh libraries can read natively. The high-quality reconstruction was stranded in a format the rest of the pipeline couldn't consume.
+
+**Solution:** Added Pixar's `usd-core` Python library to extract geometry from the USDZ archive. The conversion pipeline opens the USD stage, finds the mesh prim, reads the vertex positions and face indices, and writes them out as a standard PLY file that the existing export flow can handle. This approach was chosen over Apple's ModelIO framework (which hung indefinitely in testing) because `usd-core` is the canonical USD implementation and provides reliable, headless operation.
+
+**Lesson:** Format conversion between proprietary and open formats is often the hardest part of integrating platform-specific APIs. The reconstruction itself was easy — Apple's API is excellent. Getting the output into a format the rest of the pipeline could use required a separate library and a custom conversion step.
+
 *More challenges will be documented as development progresses through Phases 2–4.*
 
 ## Results and Impact
@@ -123,12 +147,28 @@ All visual styling is defined in a single `styles.py` file using Qt Style Sheets
 - Pipeline produces usable output: ~5,800 vertices, ~11,500 triangles from 65 source photos
 - Reset button allows re-running without restarting the app
 
-### Phase 1 Complete (1c + 1d)
+### Phase 1c + 1d Complete
 - Stage-by-stage UI feedback already delivered as part of 1b's processing queue
 - Mesh export to OBJ and glTF Binary via trimesh — the pipeline now delivers files that Unity, Unreal, and Blender can import directly
 - Export view shows mesh stats before export, with format selection and native save dialog
 - Auto-transition from pipeline completion to Export view for a seamless workflow
 - Full reset flow: clears all three views (Import, Process, Export) back to clean state
+
+### Phase 1e Complete — Apple Object Capture Integration
+- Metal-accelerated reconstruction on macOS via RealityKit's PhotogrammetrySession API
+- Output quality leap: ~50K vertices, ~100K triangles with PBR textures (vs. ~5,800 sparse vertices from COLMAP on Mac)
+- Engine-agnostic architecture validated — Apple Object Capture slots in behind the same `ReconstructionEngine` interface as COLMAP
+- Swift CLI subprocess bridge with JSON lines protocol for real-time progress streaming
+- USDZ-to-PLY format conversion via Pixar USD library for pipeline compatibility
+- Engine factory auto-detects the best engine at startup — no user configuration needed
+
+### Phase 1f Complete — UI Refinements
+- Folder import: drag-and-drop entire directories with recursive image scanning
+- Browse Folder button as an alternative to drag-and-drop for native directory picker
+- Clear button to reset file selection before processing
+- Unified outlined button style (charcoal + crimson accent) across all three views
+- Consistent layout: all views share the same header + content pattern
+- Reset button moved from Process to Export page for logical workflow placement
 - Phase 1 goal achieved: photos in → standard 3D mesh out, end-to-end in one application
 
 ## What I'd Improve
@@ -137,12 +177,14 @@ All visual styling is defined in a single `styles.py` file using Qt Style Sheets
 
 - **Initial consideration:** Evaluate whether a hybrid approach (Rust core + Python bindings) would yield better performance for the compute-heavy pipeline stages, while maintaining the Python UI layer.
 - **Image conversion overhead:** Converting every image through Pillow adds processing time at ingest. A smarter approach would detect the actual format first (via file magic bytes) and only convert when necessary.
-- **Sparse mesh quality:** The CPU-only path produces a functional but low-detail mesh. Investigating Metal-based dense reconstruction (via custom compute shaders or alternative engines) could significantly improve macOS output quality.
+- **Texture carry-over from USDZ:** Object Capture produces PBR textures (diffuse, normal, roughness, AO) inside its USDZ output, but the current PLY conversion extracts geometry only. Carrying those textures through to the final export would deliver fully textured models without the Phase 2 texture baking step.
+- **COLMAP on macOS is still sparse-only:** Apple Object Capture solved the macOS quality problem, but COLMAP remains the only option on Windows. Ensuring COLMAP's CUDA path is thoroughly tested on Windows hardware is a priority before Phase 2.
 
 ## What This Proves
 
 - **Systems architecture:** Choosing the right tools for each layer of a complex application — not defaulting to the most popular option, but the most effective one for the domain.
 - **Pipeline design:** Breaking a multi-stage computational workflow into discrete, observable, resumable steps — the same pattern used in data engineering, CI/CD, and game asset pipelines.
-- **Full-stack thinking:** From low-level GPU compute (COLMAP, PyTorch) to high-level UI/UX (Qt theming, drag-and-drop interaction) to developer experience (file watcher, Poetry, monorepo structure).
+- **Cross-language integration:** Bridging Python, Swift, and C++ (via COLMAP) across a single application using clean subprocess protocols and abstract interfaces — without resorting to fragile FFI or binding generators.
+- **Full-stack thinking:** From low-level GPU compute (COLMAP, Metal via Object Capture) to high-level UI/UX (Qt theming, drag-and-drop interaction) to developer experience (file watcher, Poetry, monorepo structure).
 - **Scope management:** Phased delivery with standalone value at each milestone — not trying to build everything at once, but shipping incrementally while maintaining a coherent architecture.
 - **Technical writing:** Every module is documented with what it does and why it exists. The codebase is designed to be read, not just executed.

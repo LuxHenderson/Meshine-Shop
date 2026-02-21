@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
     QPushButton, QComboBox, QFileDialog,
 )
 from PySide6.QtCore import Qt, Signal
-from meshine_shop.ui.drop_zone import DropZone
+from meshine_shop.ui.drop_zone import DropZone, collect_images_from_paths
 from meshine_shop.ui.processing_queue import ProcessingQueue
 from meshine_shop.core.pipeline import EXPORT_FORMATS
 from meshine_shop.core.workspace import WorkspacePaths
@@ -66,12 +66,41 @@ class ImportView(QWidget):
         self.drop_zone.files_dropped.connect(self._on_files_dropped)
         layout.addWidget(self.drop_zone)
 
-        # File count feedback — shows the user how many files they've
-        # imported, confirming the drop was successful. Uses crimson
-        # accent color to draw attention to the confirmation.
+        # "Browse Folder" button — alternative to drag-and-drop for users
+        # who prefer a native directory picker. Opens QFileDialog to select
+        # a folder, then scans it for supported images the same way as a
+        # folder drop.
+        self._browse_btn = QPushButton("Browse Folder")
+        self._browse_btn.setObjectName("browse_button")
+        self._browse_btn.setFixedSize(200, 36)
+        self._browse_btn.clicked.connect(self._on_browse_clicked)
+        layout.addWidget(self._browse_btn, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        # File count row — shows how many images are loaded, with a Clear
+        # button to reset the selection if the user picked the wrong files.
+        file_count_row = QWidget()
+        file_count_layout = QHBoxLayout(file_count_row)
+        file_count_layout.setContentsMargins(0, 0, 0, 0)
+        file_count_layout.setSpacing(12)
+
+        file_count_layout.addStretch()
+
         self.file_count_label = QLabel("")
         self.file_count_label.setStyleSheet("color: #dc3545; font-size: 13px;")
-        layout.addWidget(self.file_count_label)
+        file_count_layout.addWidget(self.file_count_label)
+
+        # "Clear" button — hidden until files are loaded. Resets the import
+        # selection so the user can start over without navigating away.
+        self._clear_btn = QPushButton("Clear")
+        self._clear_btn.setObjectName("clear_button")
+        self._clear_btn.setFixedHeight(28)
+        self._clear_btn.setFixedWidth(70)
+        self._clear_btn.clicked.connect(self._on_clear_clicked)
+        self._clear_btn.hide()
+        file_count_layout.addWidget(self._clear_btn)
+
+        file_count_layout.addStretch()
+        layout.addWidget(file_count_row, alignment=Qt.AlignmentFlag.AlignCenter)
 
         # "Start Processing" button — disabled until files are dropped.
         # Clicking this triggers the full photogrammetry pipeline via
@@ -79,9 +108,9 @@ class ImportView(QWidget):
         self._start_btn = QPushButton("Start Processing")
         self._start_btn.setObjectName("start_button")
         self._start_btn.setEnabled(False)
-        self._start_btn.setFixedHeight(44)
+        self._start_btn.setFixedSize(200, 36)
         self._start_btn.clicked.connect(self._on_start_clicked)
-        layout.addWidget(self._start_btn)
+        layout.addWidget(self._start_btn, alignment=Qt.AlignmentFlag.AlignCenter)
 
         # Stretch pushes all content to the top of the view.
         layout.addStretch()
@@ -89,13 +118,43 @@ class ImportView(QWidget):
         # Store dropped file paths for when the user clicks Start.
         self._pending_paths: list[str] = []
 
+    def _on_browse_clicked(self):
+        """Open a native directory picker and scan the selected folder for images."""
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Select Photo Folder",
+            "",
+            QFileDialog.Option.ShowDirsOnly,
+        )
+        # User cancelled the dialog.
+        if not folder:
+            return
+
+        # Scan the selected folder for supported image files, then feed
+        # the results through the same handler as drag-and-drop.
+        image_paths = collect_images_from_paths([folder])
+        if image_paths:
+            self._on_files_dropped(image_paths)
+        else:
+            # No images found — show a message instead of enabling Start.
+            self.file_count_label.setText("No supported images found in folder")
+
+    def _on_clear_clicked(self):
+        """Clear the current file selection so the user can start over."""
+        self._pending_paths = []
+        self.file_count_label.setText("")
+        self._clear_btn.hide()
+        self._start_btn.setEnabled(False)
+
     def _on_files_dropped(self, paths):
-        """Update the file count label and enable the Start button."""
+        """Update the file count label, show Clear button, and enable Start."""
         self._pending_paths = paths
         count = len(paths)
         self.file_count_label.setText(
-            f"{count} file{'s' if count != 1 else ''} ready for processing"
+            f"{count} image{'s' if count != 1 else ''} ready for processing"
         )
+        # Show the Clear button so the user can reset if they picked wrong files.
+        self._clear_btn.show()
         # Enable the Start button now that we have files to process.
         self._start_btn.setEnabled(True)
 
@@ -120,6 +179,7 @@ class ImportView(QWidget):
         """
         self._pending_paths = []
         self.file_count_label.setText("")
+        self._clear_btn.hide()
         self._start_btn.setEnabled(False)
         self._start_btn.setText("Start Processing")
 
@@ -137,6 +197,11 @@ class ProcessView(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(32, 32, 32, 32)
         layout.setSpacing(20)
+
+        # Section header — matches the Export view's layout style.
+        header = QLabel("Process")
+        header.setObjectName("section_title")
+        layout.addWidget(header)
 
         # The queue widget manages its own layout and displays
         # real-time pipeline stage progress via signal connections.
@@ -167,6 +232,11 @@ class ExportView(QWidget):
     # Emitted when the user confirms an export. Carries the source PLY path
     # and the destination path (with the chosen format extension).
     export_requested = Signal(str, str)
+
+    # Emitted when the user clicks Reset to clear the pipeline and start
+    # a new job from scratch. The app layer handles cancellation, UI reset,
+    # and switching back to the Import view.
+    reset_requested = Signal()
 
     def __init__(self):
         super().__init__()
@@ -232,15 +302,23 @@ class ExportView(QWidget):
         # the primary action is always visually consistent.
         self._export_btn = QPushButton("Choose Location && Export")
         self._export_btn.setObjectName("export_button")
-        self._export_btn.setFixedHeight(44)
+        self._export_btn.setFixedSize(200, 36)
         self._export_btn.clicked.connect(self._on_export_clicked)
-        active_layout.addWidget(self._export_btn)
+        active_layout.addWidget(self._export_btn, alignment=Qt.AlignmentFlag.AlignCenter)
 
         # Feedback label — shows success or error messages after export.
         self._feedback = QLabel("")
         self._feedback.setObjectName("export_feedback")
         self._feedback.setWordWrap(True)
         active_layout.addWidget(self._feedback)
+
+        # Reset button — lets the user clear the current job and return
+        # to the Import view to start a new reconstruction from scratch.
+        self._reset_btn = QPushButton("Reset")
+        self._reset_btn.setObjectName("reset_button")
+        self._reset_btn.setFixedSize(200, 36)
+        self._reset_btn.clicked.connect(lambda: self.reset_requested.emit())
+        active_layout.addWidget(self._reset_btn, alignment=Qt.AlignmentFlag.AlignCenter)
 
         active_layout.addStretch()
         layout.addWidget(self._active_container)

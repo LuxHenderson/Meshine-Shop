@@ -14,7 +14,10 @@ Meshine Shop solves this by unifying the entire pipeline — from photo import (
 |---|---|---|
 | Language | Python 3.11 | Direct access to the ML/CV/3D ecosystem without bridging |
 | Desktop Framework | PySide6 (Qt) | Industry-standard for professional 3D tools (Blender, Maya, Substance use Qt). Native OpenGL support for the 3D viewport |
-| Photogrammetry Engine | COLMAP (via pycolmap) | Best-documented open-source SfM/MVS engine. Python API avoids subprocess overhead |
+| Photogrammetry (macOS) | Apple Object Capture (RealityKit) | Metal-accelerated, ~50K vertices at full detail with PBR textures. Accessed via Swift CLI subprocess |
+| Photogrammetry (Windows) | COLMAP (via pycolmap) | CUDA-accelerated dense reconstruction. Cross-platform fallback on all systems |
+| Swift CLI Bridge | Swift Package Manager | Wraps Apple's PhotogrammetrySession API — a Swift-only API that cannot be accessed via PyObjC |
+| USD Processing | usd-core (Pixar USD) | Reads Object Capture's USDZ output (geometry + PBR textures) for format conversion |
 | Mesh Processing | PyMeshLab, Open3D | Decimation, UV unwrapping, point cloud manipulation — all native Python |
 | UV Unwrapping | xatlas | Battle-tested automatic UV generation used in production pipelines |
 | AI/ML | PyTorch | PBR material estimation (roughness/metallic maps) via local inference |
@@ -33,45 +36,88 @@ Meshine Shop follows a **pipeline architecture** — data flows sequentially thr
 Photos/LiDAR → Ingest → Feature Extraction → Sparse Cloud (SfM) → Dense Cloud → Mesh → Texture → Export
 ```
 
+The application uses an **engine-agnostic design** — a `ReconstructionEngine` abstract base class defines the pipeline interface, and an engine factory auto-detects the best available engine at startup:
+
+| Platform | Engine | Acceleration | Output Quality |
+|---|---|---|---|
+| macOS + Apple Silicon | Apple Object Capture | Metal GPU + Neural Engine | ~50K vertices, PBR textures |
+| Windows + NVIDIA GPU | COLMAP | CUDA | Dense reconstruction, high quality |
+| Any (fallback) | COLMAP | CPU | Sparse reconstruction, lower quality |
+
+Both engines implement the same 6-stage interface, so the worker, processing queue, and export flow are completely engine-agnostic — they don't know or care which engine is running.
+
 The application is structured as a **monorepo** with three top-level directories:
 
 ```
 Meshine Shop/
-├── desktop/              # Python + PySide6 desktop application
-│   ├── meshine_shop/     # Main application package
-│   │   ├── core/         # Pipeline logic, COLMAP integration
-│   │   └── ui/           # Qt widgets, views, styling
-│   └── scripts/          # Development tooling (file watcher)
-├── mobile/               # iOS companion app (Phase 3)
-└── shared-protocols/     # Streaming protocol definitions (Phase 3)
+├── desktop/                    # Python + PySide6 desktop application
+│   ├── meshine_shop/           # Main application package
+│   │   ├── core/               # Pipeline logic, engine implementations
+│   │   │   ├── engine.py       # ReconstructionEngine ABC + COLMAP engine
+│   │   │   ├── apple_engine.py # Apple Object Capture engine
+│   │   │   ├── engine_factory.py # Auto-detects best engine per platform
+│   │   │   ├── worker.py       # QThread background pipeline runner
+│   │   │   ├── pipeline.py     # Stage definitions and constants
+│   │   │   ├── workspace.py    # Workspace directory management
+│   │   │   └── exporter.py     # Mesh format conversion (PLY → OBJ/glTF)
+│   │   └── ui/                 # Qt widgets, views, styling
+│   │       ├── main_window.py  # Import, Process, Export views
+│   │       ├── drop_zone.py    # Drag-and-drop + folder import
+│   │       ├── processing_queue.py # Live pipeline stage display
+│   │       ├── sidebar.py      # Navigation sidebar
+│   │       └── styles.py       # Centralized QSS dark theme
+│   ├── apple_photogrammetry/   # Swift CLI wrapping PhotogrammetrySession
+│   │   ├── Package.swift       # SPM manifest (macOS 14+, RealityKit)
+│   │   └── Sources/main.swift  # CLI: JSON progress protocol over stdout
+│   └── scripts/                # Development tooling (file watcher)
+├── mobile/                     # iOS companion app (Phase 3)
+└── shared-protocols/           # Streaming protocol definitions (Phase 3)
 ```
 
 ### Key Design Decisions
 
 **Python + PySide6 over Electron:** The entire computational backbone — COLMAP, PyTorch, PyMeshLab, Open3D — lives in Python. Electron would require constant IPC bridging between Node.js and Python, adding latency and failure points. PySide6 keeps everything in one process, one language, one ecosystem.
 
-**COLMAP over OpenMVG + OpenMVS:** COLMAP provides a Python API (pycolmap), eliminating subprocess overhead. It's the most documented and widely used open-source photogrammetry engine. The pipeline architecture includes an abstraction layer so alternative engines can be added later without refactoring.
+**Engine-agnostic pipeline:** The `ReconstructionEngine` ABC lets us swap photogrammetry engines without touching the UI, worker, or export code. Apple Object Capture on macOS and COLMAP on Windows both implement the same 6-stage interface. The engine factory picks the best one automatically at startup.
+
+**Swift CLI subprocess for Object Capture:** Apple's `PhotogrammetrySession` is a Swift-only API — it cannot be bridged via PyObjC (which only handles Objective-C). A lightweight Swift CLI tool wraps the API and communicates with the Python app via JSON lines on stdout. This keeps the integration clean and the Python app self-contained.
 
 **QStackedWidget for view management:** Views are swapped instantly via a stacked widget rather than recreated on each navigation event. This gives zero-cost view transitions and allows each view to maintain its state across switches.
 
 **Centralized QSS theming:** All visual styling lives in a single `styles.py` file rather than being scattered across widgets. This makes theme changes trivial and keeps UI code focused on layout and behavior.
 
-## Current Features (Phase 1 — Core Pipeline Complete)
+## Current Features (Phase 1 Complete + Apple Object Capture Integration)
 
-- Desktop application shell with charcoal + crimson dark theme
-- Sidebar navigation (Import / Process / Export views)
-- Drag-and-drop file import zone accepting JPEG, PNG, TIFF, HEIC, and PLY files
-- Automatic HEIC-to-JPEG conversion for iPhone photos (via Pillow + pillow-heif)
-- Full COLMAP photogrammetry pipeline: ingest → feature extraction → sparse reconstruction → dense reconstruction → mesh → texture mapping
+### Reconstruction Engines
+- **Apple Object Capture** (macOS): Metal-accelerated reconstruction producing ~50K vertices with PBR textures (diffuse, normal, roughness, AO) via RealityKit's PhotogrammetrySession API
+- **COLMAP** (cross-platform): Full SfM/MVS pipeline with CUDA acceleration on Windows; CPU fallback on all systems
+- Engine factory auto-detects the best engine at startup — no user configuration needed
+
+### Import
+- Drag-and-drop import accepting individual files or entire folders of photos
+- Browse Folder button for native directory picker as an alternative to drag-and-drop
+- Recursive folder scanning — automatically finds all supported images in nested directories
+- Clear button to reset file selection before processing
+- Supported formats: JPEG, PNG, TIFF, HEIC (automatic HEIC-to-JPEG conversion for iPhone photos)
+
+### Processing
+- Full photogrammetry pipeline: ingest → feature extraction → sparse reconstruction → dense reconstruction → mesh → texture mapping
 - Background processing via QThread — UI stays responsive during pipeline execution
 - Live processing queue with per-stage status indicators (pending / running / done / error)
 - Real-time progress messages in the queue and status bar
-- Poisson surface reconstruction via Open3D with automatic normal estimation
-- Dense reconstruction support on CUDA-enabled systems; graceful fallback to sparse meshing on CPU-only (macOS)
-- Reset button to cancel/clear the pipeline and start a new job — resets all views to clean state
+- USDZ-to-PLY format conversion via Pixar USD library (for Object Capture output)
+
+### Export
 - Mesh export to OBJ (.obj) and glTF Binary (.glb) via trimesh
-- Export view with mesh stats (vertex count, triangle count, file size), format selector, and native save dialog
+- Export view with mesh stats (vertex count, triangle count, file size)
+- Format selector dropdown with native save dialog
 - Auto-transition to Export view after pipeline completes
+- Reset button to clear the job and start a new reconstruction
+
+### UI/UX
+- Charcoal + crimson dark theme with cohesive outlined button styling
+- Sidebar navigation (Import / Process / Export views)
+- Consistent layout across all three views
 - Development file watcher with auto-restart on save
 - Cross-platform targeting (macOS + Windows)
 
@@ -82,6 +128,8 @@ Meshine Shop/
 - [x] 1b — COLMAP photogrammetry engine integration
 - [x] 1c — Processing pipeline with stage-by-stage UI feedback
 - [x] 1d — Basic mesh export (.OBJ / .glTF)
+- [x] 1e — Apple Object Capture integration (macOS high-quality reconstruction)
+- [x] 1f — UI refinements (folder import, browse button, consistent styling)
 
 ### Phase 2: Game-Ready Optimization
 - [ ] 2a — Mesh decimation with quality presets
@@ -109,15 +157,22 @@ Meshine Shop/
 - macOS or Windows
 - Python 3.11
 - Poetry (dependency manager)
-- COLMAP (photogrammetry engine)
+- COLMAP (photogrammetry engine — required on Windows, optional on macOS)
+- Swift toolchain (macOS only — for building the Object Capture CLI)
 
 ### macOS Install
 
 ```bash
-# Install Python 3.11, Poetry, and COLMAP via Homebrew
+# Install Python 3.11 and Poetry via Homebrew
 brew install python@3.11
 brew install poetry
+
+# COLMAP is optional on macOS (Object Capture is preferred)
 brew install colmap
+
+# Build the Apple Object Capture CLI
+cd desktop/apple_photogrammetry
+swift build
 ```
 
 ### Project Setup
@@ -146,14 +201,14 @@ poetry run python scripts/dev.py
 
 ## Known Limitations
 
-- **No GPU acceleration for COLMAP on macOS:** Apple Silicon uses Metal, not CUDA. Dense reconstruction (patch-match stereo) is skipped on macOS; meshing proceeds from the sparse point cloud. Windows with NVIDIA GPUs get full CUDA acceleration.
-- **Sparse-only meshing on macOS:** Without dense reconstruction, the Poisson mesh is built from the sparse point cloud (~17k points for 65 images). Quality is lower than dense-based meshing but the pipeline completes end-to-end.
-- **iPhone photos are HEIC internally:** Even when named `.JPEG`, iPhone photos are HEIC format. The app handles this automatically via Pillow + pillow-heif conversion, but users should be aware of the extra processing step.
+- **Exported models are geometry-only:** The current PLY conversion extracts vertices and triangles from Object Capture's USDZ output but does not carry over the PBR textures. Texture export is planned for Phase 2.
+- **COLMAP on macOS is sparse-only:** Apple Silicon uses Metal, not CUDA. Dense reconstruction is skipped; meshing proceeds from the sparse point cloud. On macOS, Apple Object Capture is strongly preferred and automatically selected.
+- **iPhone photos are HEIC internally:** Even when named `.JPEG`, iPhone photos are HEIC format. The app handles this automatically via Pillow + pillow-heif conversion.
 - **macOS-only testing so far:** Cross-platform support is architected in but Windows testing has not started.
 
 ## Future Improvements
 
-- GPU-accelerated reconstruction via Metal compute shaders (macOS) or CUDA (Windows)
+- PBR texture export from Object Capture's USDZ output (diffuse, normal, roughness, AO maps)
 - Plugin system for custom pipeline stages
 - Cloud processing offload for large datasets
 - Android companion app for LiDAR capture

@@ -174,30 +174,72 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
 }
 
 /* ===== Start Processing Button ===== */
-/* Crimson accent button that stands out against the charcoal theme.
+/* Outlined style matching the Browse Folder button for a cohesive look.
    Disabled state dims the button to signal it's not yet interactive
    (files must be dropped first). */
 QPushButton#start_button {
-    background-color: #dc3545;
-    color: #ffffff;
-    border: none;
+    background-color: transparent;
+    color: #d4d4d4;
+    border: 1px solid #555555;
     border-radius: 8px;
-    font-size: 14px;
-    font-weight: 600;
-    padding: 10px 24px;
+    font-size: 13px;
+    padding: 8px 20px;
 }
 
 QPushButton#start_button:hover {
-    background-color: #c82333;
+    background-color: #3a3a3a;
+    border-color: #dc3545;
+    color: #ffffff;
 }
 
 QPushButton#start_button:pressed {
-    background-color: #a71d2a;
+    background-color: #2d2d2d;
 }
 
 QPushButton#start_button:disabled {
-    background-color: #3a3a3a;
+    background-color: transparent;
     color: #666666;
+    border-color: #3a3a3a;
+}
+
+/* ===== Clear Button ===== */
+/* Small inline button next to the file count label. Same color scheme
+   as other buttons but retains its compact size and position. */
+QPushButton#clear_button {
+    background-color: transparent;
+    color: #d4d4d4;
+    border: 1px solid #555555;
+    border-radius: 4px;
+    font-size: 12px;
+    padding: 4px 12px;
+}
+
+QPushButton#clear_button:hover {
+    background-color: #3a3a3a;
+    border-color: #dc3545;
+    color: #ffffff;
+}
+
+/* ===== Browse Folder Button ===== */
+/* Secondary action button — outlined style so it doesn't compete with
+   the primary crimson Start Processing button for visual attention. */
+QPushButton#browse_button {
+    background-color: transparent;
+    color: #d4d4d4;
+    border: 1px solid #555555;
+    border-radius: 8px;
+    font-size: 13px;
+    padding: 8px 20px;
+}
+
+QPushButton#browse_button:hover {
+    background-color: #3a3a3a;
+    border-color: #dc3545;
+    color: #ffffff;
+}
+
+QPushButton#browse_button:pressed {
+    background-color: #2d2d2d;
 }
 
 /* ===== Pipeline Stage Rows ===== */
@@ -242,44 +284,41 @@ QLabel#stage_message {
 }
 
 /* ===== Reset Button ===== */
-/* Outlined style (no fill) to visually distinguish it from the primary
-   Start Processing button. The border uses a muted gray that brightens
-   on hover to indicate interactivity without competing for attention. */
+/* Same outlined style as all other buttons for visual consistency. */
 QPushButton#reset_button {
     background-color: transparent;
-    color: #999999;
-    border: 1px solid #3a3a3a;
+    color: #d4d4d4;
+    border: 1px solid #555555;
     border-radius: 8px;
     font-size: 13px;
-    font-weight: 500;
     padding: 8px 20px;
 }
 
 QPushButton#reset_button:hover {
-    background-color: #333333;
-    color: #e0e0e0;
-    border-color: #999999;
+    background-color: #3a3a3a;
+    border-color: #dc3545;
+    color: #ffffff;
 }
 
 QPushButton#reset_button:pressed {
-    background-color: #3a3a3a;
+    background-color: #2d2d2d;
 }
 
 /* ===== Export View ===== */
-/* Export button — same crimson accent as the Start Processing button
-   to keep the primary action visually consistent across views. */
+/* Export button — same outlined style as all other buttons. */
 QPushButton#export_button {
-    background-color: #dc3545;
-    color: #ffffff;
-    border: none;
+    background-color: transparent;
+    color: #d4d4d4;
+    border: 1px solid #555555;
     border-radius: 8px;
-    font-size: 14px;
-    font-weight: 600;
-    padding: 10px 24px;
+    font-size: 13px;
+    padding: 8px 20px;
 }
 
 QPushButton#export_button:hover {
-    background-color: #c82333;
+    background-color: #3a3a3a;
+    border-color: #dc3545;
+    color: #ffffff;
 }
 
 QPushButton#export_button:pressed {

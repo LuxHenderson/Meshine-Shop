@@ -50,6 +50,86 @@ class EngineError(Exception):
 
 
 # ---------------------------------------------------------------------------
+# Shared ingest logic
+# ---------------------------------------------------------------------------
+# Both ColmapEngine and AppleObjectCaptureEngine need to validate and convert
+# source images before processing. This shared function keeps that logic in
+# one place so both engines produce identical workspace/images/ directories.
+
+# Extensions we'll attempt to open with Pillow. HEIC/HEIF included
+# because iPhones use this format by default.
+SUPPORTED_IMAGE_EXTENSIONS = {
+    ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".heic", ".heif",
+}
+
+
+def ingest_images(image_paths: list[str], workspace, on_progress) -> None:
+    """
+    Validate source images and copy them into the workspace as JPEG.
+
+    Shared by all engine implementations. Checks that each file exists and
+    has a supported image extension, then converts every image to standard
+    JPEG via Pillow. This handles HEIC/HEIF images (Apple's default format)
+    transparently — iPhones often save HEIC data with .JPEG extensions, so
+    we can't trust the extension alone.
+
+    Files are written (not symlinked) to workspace/images/ so the originals
+    are never modified by any engine.
+
+    Args:
+        image_paths: List of absolute file path strings from the user's drop.
+        workspace:   WorkspacePaths with an images directory to write into.
+        on_progress: Callback for status messages shown in the UI.
+
+    Raises:
+        EngineError: If no valid images are found after filtering.
+    """
+    on_progress("Validating input files...")
+
+    valid_count = 0
+    skipped = []
+
+    for path_str in image_paths:
+        path = Path(path_str)
+
+        # Check the file exists.
+        if not path.is_file():
+            skipped.append(f"{path.name} (not found)")
+            continue
+
+        # Check the file has a supported image extension.
+        if path.suffix.lower() not in SUPPORTED_IMAGE_EXTENSIONS:
+            skipped.append(f"{path.name} (unsupported format)")
+            continue
+
+        # Convert every image to standard JPEG via Pillow. This ensures
+        # any engine receives files it can actually read, regardless of the
+        # source format (HEIC, 16-bit PNG, TIFF, etc.).
+        dest = workspace.images / (path.stem + ".jpg")
+        try:
+            with Image.open(path) as img:
+                # Convert to RGB in case the image has an alpha channel
+                # or is in a color mode JPEG doesn't support (e.g., RGBA, P).
+                rgb_img = img.convert("RGB")
+                rgb_img.save(dest, "JPEG", quality=95)
+            valid_count += 1
+        except Exception as e:
+            skipped.append(f"{path.name} (conversion failed: {e})")
+            continue
+
+    if valid_count == 0:
+        raise EngineError(
+            "No valid images found. Supported formats: "
+            "JPEG, PNG, TIFF, BMP, HEIC. Please check your input files."
+        )
+
+    if skipped:
+        on_progress(f"Imported {valid_count} images, skipped {len(skipped)}: {', '.join(skipped[:3])}")
+    else:
+        on_progress(f"Imported {valid_count} images")
+
+
+# ---------------------------------------------------------------------------
 # Configuration constants for COLMAP
 # ---------------------------------------------------------------------------
 # These are defined at module level so they're easy to find and tweak.
@@ -161,64 +241,11 @@ class ColmapEngine(ReconstructionEngine):
         """
         Validate source images and copy them into the workspace.
 
-        Checks that each file exists and has a supported image extension.
-        All images are converted to standard JPEG via Pillow before saving
-        to the workspace. This handles HEIC/HEIF images (Apple's default
-        format) which COLMAP cannot read natively. iPhones often save HEIC
-        data with .JPEG extensions, so we can't trust the extension alone.
-
-        Files are written (not symlinked) to the workspace/images/ directory
-        so the original files are never modified by COLMAP.
+        Delegates to the shared ingest_images() function which handles
+        format validation, HEIC conversion, and JPEG normalization.
+        See ingest_images() docstring for full details.
         """
-        # Extensions we'll attempt to open with Pillow. HEIC/HEIF included
-        # because iPhones use this format by default.
-        SUPPORTED_EXTENSIONS = {
-            ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".heic", ".heif",
-        }
-
-        on_progress("Validating input files...")
-
-        valid_count = 0
-        skipped = []
-
-        for path_str in image_paths:
-            path = Path(path_str)
-
-            # Check the file exists.
-            if not path.is_file():
-                skipped.append(f"{path.name} (not found)")
-                continue
-
-            # Check the file has a supported image extension.
-            if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
-                skipped.append(f"{path.name} (unsupported format)")
-                continue
-
-            # Convert every image to standard JPEG via Pillow. This ensures
-            # COLMAP receives files it can actually read, regardless of the
-            # source format (HEIC, 16-bit PNG, TIFF, etc.).
-            dest = workspace.images / (path.stem + ".jpg")
-            try:
-                with Image.open(path) as img:
-                    # Convert to RGB in case the image has an alpha channel
-                    # or is in a color mode JPEG doesn't support (e.g., RGBA, P).
-                    rgb_img = img.convert("RGB")
-                    rgb_img.save(dest, "JPEG", quality=95)
-                valid_count += 1
-            except Exception as e:
-                skipped.append(f"{path.name} (conversion failed: {e})")
-                continue
-
-        if valid_count == 0:
-            raise EngineError(
-                "No valid images found. Supported formats: "
-                "JPEG, PNG, TIFF, BMP, HEIC. Please check your input files."
-            )
-
-        if skipped:
-            on_progress(f"Imported {valid_count} images, skipped {len(skipped)}: {', '.join(skipped[:3])}")
-        else:
-            on_progress(f"Imported {valid_count} images")
+        ingest_images(image_paths, workspace, on_progress)
 
     def extract_features(self, workspace, on_progress):
         """

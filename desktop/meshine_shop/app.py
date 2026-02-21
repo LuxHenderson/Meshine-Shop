@@ -26,7 +26,7 @@ from PySide6.QtCore import Qt
 from meshine_shop.ui.sidebar import Sidebar
 from meshine_shop.ui.main_window import MainContent
 from meshine_shop.ui.styles import DARK_THEME
-from meshine_shop.core.engine import ColmapEngine
+from meshine_shop.core.engine_factory import create_best_engine
 from meshine_shop.core.worker import PipelineWorker
 from meshine_shop.core.workspace import create_workspace
 from meshine_shop.core.pipeline import STAGE_DISPLAY_NAMES
@@ -85,9 +85,9 @@ class MeshineShopApp(QMainWindow):
         # orchestration method. This is the entry point for the entire pipeline.
         self.main_content.import_view.start_requested.connect(self._start_pipeline)
 
-        # Connect the Reset button in the processing queue to the reset handler.
-        # This lets the user cancel a running pipeline and return to the Import view.
-        self.main_content.process_view.queue.reset_requested.connect(self._reset_pipeline)
+        # Connect the Reset button in the Export view to the reset handler.
+        # This lets the user clear the current job and return to the Import view.
+        self.main_content.export_view.reset_requested.connect(self._reset_pipeline)
 
         # Connect the Export view's export button to the export handler.
         self.main_content.export_view.export_requested.connect(self._run_export)
@@ -108,10 +108,16 @@ class MeshineShopApp(QMainWindow):
         This method is called when the user clicks "Start Processing" in
         the Import view. It:
         1. Creates a fresh workspace directory for this reconstruction job
-        2. Instantiates the COLMAP engine
+        2. Auto-selects the best available engine for this platform
         3. Creates a PipelineWorker on a background thread
         4. Connects all worker signals to the UI
         5. Starts the worker thread
+
+        The engine factory detects available hardware and picks the best
+        engine automatically:
+            macOS + Apple Silicon → Apple Object Capture (Metal)
+            Windows + NVIDIA     → COLMAP (CUDA)
+            Fallback             → COLMAP (CPU)
 
         The worker runs on a background thread so the UI stays responsive.
         All communication back to the UI happens via Qt signals, which are
@@ -121,10 +127,12 @@ class MeshineShopApp(QMainWindow):
         # view can find the output mesh after the pipeline completes.
         workspace = create_workspace()
         self._workspace = workspace
-        self.statusBar().showMessage(f"Workspace: {workspace.root}")
 
-        # Instantiate the COLMAP engine.
-        engine = ColmapEngine()
+        # Auto-select the best engine for this platform.
+        # The factory returns both the engine instance and a display name
+        # so we can show the user which engine is processing their data.
+        engine, engine_name = create_best_engine()
+        self.statusBar().showMessage(f"Engine: {engine_name} | Workspace: {workspace.root}")
 
         # Create the background worker.
         self._worker = PipelineWorker(engine, image_paths, workspace)
@@ -213,7 +221,6 @@ class MeshineShopApp(QMainWindow):
             return
 
         # Load mesh stats (vertex count, triangle count, file size) for display.
-        from pathlib import Path
         mesh_info = load_mesh_info(mesh_ply)
 
         # Populate the Export view with mesh details and switch to it.

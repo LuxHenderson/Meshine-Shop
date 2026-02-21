@@ -14,6 +14,8 @@ pillow-heif = "^1.2.0"
 pillow = "^12.1.1"
 open3d = "^0.19.0"
 trimesh = "^4.11.2"
+pycollada = "^0.9.3"
+usd-core = "^25.11"
 
 [tool.poetry.group.dev.dependencies]
 watchfiles = "^1.0"

@@ -129,20 +129,16 @@ class ProcessingQueue(QWidget):
         self.setObjectName("queue_panel")
 
         self._layout = QVBoxLayout(self)
-        self._layout.setContentsMargins(24, 24, 24, 24)
+        self._layout.setContentsMargins(0, 0, 0, 0)
         self._layout.setSpacing(8)
 
-        # Section title — always visible.
-        title = QLabel("Processing Queue")
-        title.setObjectName("section_title")
-        self._layout.addWidget(title)
-
-        # Empty state message — shown when no job is running.
+        # Empty state message — shown when no job is running. Matches the
+        # Export view's placeholder style: left-aligned, muted gray text.
         self._empty_msg = QLabel(
-            "No jobs in the queue.\nImport a photo set to get started."
+            "No jobs in the queue. Import a photo set to get started."
         )
-        self._empty_msg.setObjectName("queue_empty")
-        self._empty_msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._empty_msg.setStyleSheet("color: #999999;")
+        self._empty_msg.setWordWrap(True)
         self._layout.addWidget(self._empty_msg)
 
         # Stage rows container — hidden until a pipeline starts.
@@ -171,16 +167,6 @@ class ProcessingQueue(QWidget):
         self._finished_label.hide()
         self._layout.addWidget(self._finished_label)
 
-        # Reset button — allows the user to clear the queue and start fresh
-        # without restarting the app. Hidden until a pipeline has been started.
-        self._reset_btn = QPushButton("Reset")
-        self._reset_btn.setObjectName("reset_button")
-        self._reset_btn.setFixedHeight(36)
-        self._reset_btn.setFixedWidth(120)
-        self._reset_btn.clicked.connect(self._on_reset_clicked)
-        self._reset_btn.hide()
-        self._layout.addWidget(self._reset_btn, alignment=Qt.AlignmentFlag.AlignCenter)
-
         self._layout.addStretch()
 
     def start_pipeline(self):
@@ -188,8 +174,6 @@ class ProcessingQueue(QWidget):
         self._empty_msg.hide()
         self._finished_label.hide()
         self._stages_container.show()
-        # Show the reset button so the user can abort or restart.
-        self._reset_btn.show()
 
         # Reset all rows to pending.
         for row in self._stage_rows.values():
@@ -222,19 +206,14 @@ class ProcessingQueue(QWidget):
     def reset(self):
         """Return the queue to its empty state.
 
-        Hides the stage rows, completion banner, and reset button.
-        Shows the empty state placeholder message. Called by the app
-        layer after cancelling any running worker.
+        Hides the stage rows and completion banner. Shows the empty state
+        placeholder message. Called by the app layer when the user resets
+        from the Export view.
         """
         self._stages_container.hide()
         self._finished_label.hide()
-        self._reset_btn.hide()
         self._empty_msg.show()
 
         # Reset all rows so they're clean for the next pipeline run.
         for row in self._stage_rows.values():
             row.set_pending()
-
-    def _on_reset_clicked(self):
-        """Handle the Reset button click — emit signal for the app layer."""
-        self.reset_requested.emit()
