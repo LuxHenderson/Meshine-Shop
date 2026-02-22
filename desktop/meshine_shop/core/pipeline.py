@@ -18,6 +18,9 @@ The pipeline follows the standard photogrammetry reconstruction sequence:
        mesh surface to create a textured 3D model
     7. Mesh Decimation — Reduce polygon count to match the user's chosen
        quality preset (Mobile / PC / Cinematic)
+    8. UV Unwrapping — Generate non-overlapping UV coordinates for the
+       decimated mesh using xatlas. UV maps are required for texture
+       baking (Phase 2c) and PBR material export to game engines.
 
 The stage constants defined here are used throughout the app to track
 progress, update the UI, and log output consistently.
@@ -39,6 +42,7 @@ class PipelineStage:
     MESH = "mesh_reconstruction"
     TEXTURE = "texture_mapping"
     DECIMATION = "decimation"
+    UV_UNWRAP = "uv_unwrapping"
 
 
 # Ordered list of stages — defines the sequence the pipeline executes.
@@ -52,6 +56,7 @@ STAGE_ORDER = [
     PipelineStage.MESH,
     PipelineStage.TEXTURE,
     PipelineStage.DECIMATION,
+    PipelineStage.UV_UNWRAP,
 ]
 
 # Human-readable display names for each stage, used in the processing
@@ -64,6 +69,7 @@ STAGE_DISPLAY_NAMES = {
     PipelineStage.MESH: "Building Mesh",
     PipelineStage.TEXTURE: "Texture Mapping",
     PipelineStage.DECIMATION: "Mesh Decimation",
+    PipelineStage.UV_UNWRAP: "UV Unwrapping",
 }
 
 # Quality presets for mesh decimation. Each preset maps to a target

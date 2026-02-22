@@ -254,8 +254,9 @@ class ExportView(QWidget):
         5. App layer calls the exporter and reports success/error back
     """
 
-    # Emitted when the user confirms an export. Carries the source PLY path
-    # and the destination path (with the chosen format extension).
+    # Emitted when the user confirms an export. Carries the source mesh path
+    # (OBJ with UVs from Phase 2b, or PLY fallback) and the destination path
+    # (with the chosen format extension).
     export_requested = Signal(str, str)
 
     # Emitted when the user clicks Reset to clear the pipeline and start
@@ -336,17 +337,22 @@ class ExportView(QWidget):
         layout.addWidget(self._reset_btn, alignment=Qt.AlignmentFlag.AlignCenter)
 
         # Feedback label — success or error message after export attempt.
+        # Do NOT pass alignment to addWidget here — combining wordWrap with
+        # addWidget alignment causes Qt to constrain the label to a tiny width
+        # and cut the text off. The label's own setAlignment centers the text.
         self._feedback = QLabel("")
         self._feedback.setObjectName("export_feedback")
         self._feedback.setWordWrap(True)
         self._feedback.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self._feedback, alignment=Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self._feedback)
 
         # Stretch after content — balances the top stretch to keep
         # everything vertically centered on the page.
         layout.addStretch()
 
-        # Store the source PLY path once the pipeline provides it.
+        # Store the source mesh path once the pipeline provides it.
+        # Phase 2b: will be meshed_uv.obj (OBJ with UV coords) if available,
+        # otherwise falls back to meshed.ply (decimated-only PLY).
         self._source_ply: Path | None = None
 
     def set_mesh_ready(self, workspace: WorkspacePaths, mesh_info: dict):
@@ -360,7 +366,11 @@ class ExportView(QWidget):
             workspace: The workspace containing the pipeline output.
             mesh_info: Dict with 'vertices', 'triangles', 'file_size_mb' keys.
         """
-        self._source_ply = workspace.mesh / "meshed.ply"
+        # Prefer the UV-unwrapped OBJ (Phase 2b output) — it carries UV
+        # coordinates needed for texture baking. Fall back to raw PLY.
+        mesh_uv_obj = workspace.mesh / "meshed_uv.obj"
+        mesh_ply = workspace.mesh / "meshed.ply"
+        self._source_ply = mesh_uv_obj if mesh_uv_obj.exists() else mesh_ply
 
         # Populate each stat on its own centered line inside the info panel.
         self._vertices_label.setText(f"Vertices: {mesh_info['vertices']:,}")

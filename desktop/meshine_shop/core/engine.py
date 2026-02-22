@@ -218,6 +218,17 @@ class ReconstructionEngine(ABC):
         """Reduce mesh polygon count to the target triangle budget."""
         ...
 
+    @abstractmethod
+    def unwrap_uv(self, workspace: "WorkspacePaths",
+                  on_progress: Callable[[str], None]) -> None:
+        """Generate UV coordinates for the decimated mesh using xatlas.
+
+        Reads workspace.mesh/meshed.ply and writes workspace.mesh/meshed_uv.obj
+        with UV texture coordinates embedded in OBJ format. The OBJ is the
+        intermediate handoff file for Phase 2c texture baking.
+        """
+        ...
+
 
 # ---------------------------------------------------------------------------
 # COLMAP implementation
@@ -650,3 +661,99 @@ class ColmapEngine(ReconstructionEngine):
             raise
         except Exception as e:
             raise EngineError(f"Mesh decimation failed: {e}")
+
+    def unwrap_uv(self, workspace, on_progress):
+        """
+        Generate non-overlapping UV coordinates for the decimated mesh.
+
+        Uses xatlas — the same UV atlas packer used inside Blender, lightmap
+        tools, and many game studios. xatlas automatically cuts the mesh into
+        UV islands and packs them efficiently into a [0,1]² atlas with no
+        overlaps (a requirement for texture baking).
+
+        UV seam splits: xatlas may introduce additional vertices where it cuts
+        the mesh open to unfold it flat. The output vertex count is therefore
+        >= the input. This is expected and normal.
+
+        Input:  workspace.mesh/meshed.ply  (decimated mesh, no UVs)
+        Output: workspace.mesh/meshed_uv.obj  (UV-mapped mesh, OBJ format)
+
+        OBJ format was chosen because it natively stores UV coordinates as
+        "vt" lines, making it the natural intermediate format for Phase 2c
+        texture baking. Final export format (OBJ or glTF) is still chosen
+        by the user in the Export view.
+        """
+        import numpy as np
+        import xatlas
+        from trimesh.visual.texture import TextureVisuals
+
+        mesh_path = workspace.mesh / "meshed.ply"
+        output_obj = workspace.mesh / "meshed_uv.obj"
+
+        if not mesh_path.exists():
+            raise EngineError(
+                "No mesh file found for UV unwrapping. "
+                "The mesh decimation stage may have failed."
+            )
+
+        on_progress("Loading mesh for UV unwrapping...")
+
+        try:
+            import trimesh as _trimesh
+
+            # Load the decimated PLY mesh via trimesh.
+            source = _trimesh.load(str(mesh_path))
+
+            # xatlas requires float32 positions and uint32 face indices.
+            vertices = np.array(source.vertices, dtype=np.float32)
+            faces = np.array(source.faces, dtype=np.uint32)
+
+            original_vertex_count = len(vertices)
+            original_face_count = len(faces)
+            on_progress(
+                f"Mesh loaded: {original_vertex_count:,} vertices, "
+                f"{original_face_count:,} triangles"
+            )
+
+            on_progress("Running xatlas UV parametrization (this may take a moment)...")
+
+            # xatlas.parametrize generates non-overlapping UV islands.
+            # Returns:
+            #   vmapping:    (N,) int32 — maps each output vertex to its original
+            #   new_indices: (F, 3) int32 — new triangle face connectivity
+            #   uvs:         (N, 2) float32 — UV coordinates in [0, 1]² space
+            vmapping, new_indices, uvs = xatlas.parametrize(vertices, faces)
+
+            # Reconstruct new vertex positions from the vertex mapping.
+            # xatlas may split vertices at UV seam edges (where the surface
+            # is cut open to unfold it flat), so len(vmapping) >= original count.
+            new_positions = vertices[vmapping]
+            new_vertex_count = len(new_positions)
+            seam_splits = new_vertex_count - original_vertex_count
+
+            on_progress(
+                f"UV unwrapping complete: {new_vertex_count:,} vertices "
+                f"(+{seam_splits:,} seam splits), {len(new_indices):,} triangles"
+            )
+
+            # Build a new trimesh with UV texture coordinates attached.
+            # TextureVisuals stores the UV map; trimesh writes it as "vt" lines
+            # in the OBJ file, which is what texture bakers expect.
+            uv_visuals = TextureVisuals(uv=uvs)
+            mesh_with_uvs = _trimesh.Trimesh(
+                vertices=new_positions,
+                faces=new_indices,
+                visual=uv_visuals,
+                # Skip auto-processing — merging vertices would destroy UV seams.
+                process=False,
+            )
+
+            # Export as OBJ. trimesh writes UV coords as "vt" lines and
+            # references them in face definitions (f v1/vt1 v2/vt2 v3/vt3).
+            mesh_with_uvs.export(str(output_obj))
+            on_progress(f"UV mesh saved: {output_obj.name}")
+
+        except EngineError:
+            raise
+        except Exception as e:
+            raise EngineError(f"UV unwrapping failed: {e}")

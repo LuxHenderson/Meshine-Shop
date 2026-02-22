@@ -224,42 +224,56 @@ class MeshineShopApp(QMainWindow):
         """
         Prepare the Export view after the pipeline completes successfully.
 
-        Loads mesh stats from the output PLY file and passes them to the
-        Export view, then auto-switches to the Export tab so the user can
-        export immediately without manually navigating.
+        Loads mesh stats from the pipeline's output mesh and passes them to
+        the Export view, then auto-switches to the Export tab so the user
+        can export immediately without manually navigating.
+
+        Prefers meshed_uv.obj (UV-unwrapped, Phase 2b output) over meshed.ply
+        (decimated-only). The OBJ carries UV coordinates needed for texture
+        baking in Phase 2c. Falls back to meshed.ply if UV unwrapping somehow
+        didn't produce output.
         """
         if self._workspace is None:
             return
 
+        # Prefer the UV-unwrapped OBJ produced by Phase 2b.
+        # Fall back to the raw decimated PLY if the OBJ isn't present.
+        mesh_uv_obj = self._workspace.mesh / "meshed_uv.obj"
         mesh_ply = self._workspace.mesh / "meshed.ply"
-        if not mesh_ply.exists():
+
+        if mesh_uv_obj.exists():
+            mesh_file = mesh_uv_obj
+        elif mesh_ply.exists():
+            mesh_file = mesh_ply
+        else:
             self.statusBar().showMessage("Pipeline complete, but no mesh file found.")
             return
 
         # Load mesh stats (vertex count, triangle count, file size) for display.
-        mesh_info = load_mesh_info(mesh_ply)
+        mesh_info = load_mesh_info(mesh_file)
 
         # Populate the Export view with mesh details and switch to it.
         self.main_content.export_view.set_mesh_ready(self._workspace, mesh_info)
         self.main_content.switch_view(2)
         self.sidebar.button_group.button(2).setChecked(True)
 
-    def _run_export(self, source_ply: str, dest_path: str):
+    def _run_export(self, source_mesh: str, dest_path: str):
         """
         Execute the mesh export when the user clicks Export in the Export view.
 
-        Converts the pipeline's PLY output to the user's chosen format (OBJ or
+        Converts the pipeline's mesh output to the user's chosen format (OBJ or
         glTF Binary) using trimesh, then reports success or failure back to the
-        Export view.
+        Export view. The source may be a UV-unwrapped OBJ (Phase 2b) or a raw
+        PLY — trimesh handles both transparently.
 
         Args:
-            source_ply: Path to the pipeline's output PLY mesh.
-            dest_path:  User-chosen save location with format extension.
+            source_mesh: Path to the pipeline's output mesh (OBJ or PLY).
+            dest_path:   User-chosen save location with format extension.
         """
         from pathlib import Path
 
         try:
-            export_mesh(Path(source_ply), Path(dest_path))
+            export_mesh(Path(source_mesh), Path(dest_path))
             self.main_content.export_view.set_export_success(dest_path)
             self.statusBar().showMessage(f"Exported to: {dest_path}")
         except Exception as e:

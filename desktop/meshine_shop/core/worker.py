@@ -84,6 +84,7 @@ class PipelineWorker(QThread):
         # The ingest stage is special — it also needs the image paths,
         # so it gets a lambda wrapper that includes them. The decimation
         # stage similarly needs the target face count from the quality preset.
+        # All other stages take (workspace, on_progress) directly.
         stage_methods = {
             PipelineStage.INGEST: lambda ws, cb: self._engine.ingest(
                 self._image_paths, ws, cb
@@ -96,6 +97,9 @@ class PipelineWorker(QThread):
             PipelineStage.DECIMATION: lambda ws, cb: self._engine.decimate(
                 ws, cb, self._target_faces
             ),
+            # UV unwrapping reads the decimated PLY and writes meshed_uv.obj
+            # with xatlas UV coordinates. Required for Phase 2c texture baking.
+            PipelineStage.UV_UNWRAP: self._engine.unwrap_uv,
         }
 
         for stage in STAGE_ORDER:
