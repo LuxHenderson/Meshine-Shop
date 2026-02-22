@@ -127,6 +127,9 @@ class ProcessingQueue(QWidget):
     def __init__(self):
         super().__init__()
         self.setObjectName("queue_panel")
+        # Cap width so the queue can be horizontally centered in ProcessView
+        # rather than stretching edge-to-edge across the content area.
+        self.setMaximumWidth(480)
 
         self._layout = QVBoxLayout(self)
         self._layout.setContentsMargins(0, 0, 0, 0)

@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Signal
 from meshine_shop.ui.drop_zone import DropZone, collect_images_from_paths
 from meshine_shop.ui.processing_queue import ProcessingQueue
-from meshine_shop.core.pipeline import EXPORT_FORMATS
+from meshine_shop.core.pipeline import EXPORT_FORMATS, QUALITY_PRESETS
 from meshine_shop.core.workspace import WorkspacePaths
 
 
@@ -45,8 +45,8 @@ class ImportView(QWidget):
     """
 
     # Emitted when the user clicks "Start Processing". Carries the list
-    # of file paths that were dropped into the import zone.
-    start_requested = Signal(list)
+    # of file paths and the selected quality preset string.
+    start_requested = Signal(list, str)
 
     def __init__(self):
         super().__init__()
@@ -76,8 +76,33 @@ class ImportView(QWidget):
         self._browse_btn.clicked.connect(self._on_browse_clicked)
         layout.addWidget(self._browse_btn, alignment=Qt.AlignmentFlag.AlignCenter)
 
+        # Quality preset selector — lets the user choose a target polygon
+        # budget before starting the pipeline. The preset determines how
+        # aggressively the mesh decimation stage reduces triangle count.
+        # Placed directly after Browse Folder for even spacing between buttons.
+        self._quality_combo = QComboBox()
+        self._quality_combo.setObjectName("quality_combo")
+        for label in QUALITY_PRESETS:
+            self._quality_combo.addItem(label)
+        # Default to PC preset (index 1) — the middle-tier option.
+        self._quality_combo.setCurrentIndex(1)
+        self._quality_combo.setFixedWidth(200)
+        layout.addWidget(self._quality_combo, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        # "Start Processing" button — disabled until files are dropped.
+        # Clicking this triggers the full photogrammetry pipeline via
+        # the start_requested signal, which the app layer listens for.
+        self._start_btn = QPushButton("Start Processing")
+        self._start_btn.setObjectName("start_button")
+        self._start_btn.setEnabled(False)
+        self._start_btn.setFixedSize(200, 36)
+        self._start_btn.clicked.connect(self._on_start_clicked)
+        layout.addWidget(self._start_btn, alignment=Qt.AlignmentFlag.AlignCenter)
+
         # File count row — shows how many images are loaded, with a Clear
         # button to reset the selection if the user picked the wrong files.
+        # Positioned below the three main controls (Browse / Quality / Start)
+        # so they remain evenly spaced.
         file_count_row = QWidget()
         file_count_layout = QHBoxLayout(file_count_row)
         file_count_layout.setContentsMargins(0, 0, 0, 0)
@@ -101,16 +126,6 @@ class ImportView(QWidget):
 
         file_count_layout.addStretch()
         layout.addWidget(file_count_row, alignment=Qt.AlignmentFlag.AlignCenter)
-
-        # "Start Processing" button — disabled until files are dropped.
-        # Clicking this triggers the full photogrammetry pipeline via
-        # the start_requested signal, which the app layer listens for.
-        self._start_btn = QPushButton("Start Processing")
-        self._start_btn.setObjectName("start_button")
-        self._start_btn.setEnabled(False)
-        self._start_btn.setFixedSize(200, 36)
-        self._start_btn.clicked.connect(self._on_start_clicked)
-        layout.addWidget(self._start_btn, alignment=Qt.AlignmentFlag.AlignCenter)
 
         # Stretch pushes all content to the top of the view.
         layout.addStretch()
@@ -159,12 +174,15 @@ class ImportView(QWidget):
         self._start_btn.setEnabled(True)
 
     def _on_start_clicked(self):
-        """Emit the start_requested signal with the pending file paths."""
+        """Emit the start_requested signal with paths and quality preset."""
         if self._pending_paths:
             # Disable the button to prevent double-clicks while processing.
             self._start_btn.setEnabled(False)
             self._start_btn.setText("Processing...")
-            self.start_requested.emit(self._pending_paths)
+            # Include the selected quality preset so the worker knows
+            # the target triangle count for the decimation stage.
+            preset = self._quality_combo.currentText()
+            self.start_requested.emit(self._pending_paths, preset)
 
     def reset_start_button(self):
         """Re-enable the Start button after pipeline completes or errors."""
@@ -198,15 +216,22 @@ class ProcessView(QWidget):
         layout.setContentsMargins(32, 32, 32, 32)
         layout.setSpacing(20)
 
-        # Section header — matches the Export view's layout style.
+        # Section header — matches the other views' layout style.
         header = QLabel("Process")
         header.setObjectName("section_title")
         layout.addWidget(header)
 
+        # Stretch before and after the queue — centers it vertically on the
+        # page, matching the Export view's content positioning.
+        layout.addStretch()
+
         # The queue widget manages its own layout and displays
         # real-time pipeline stage progress via signal connections.
+        # AlignHCenter centers it within the content area.
         self.queue = ProcessingQueue()
-        layout.addWidget(self.queue)
+        layout.addWidget(self.queue, alignment=Qt.AlignmentFlag.AlignHCenter)
+
+        layout.addStretch()
 
 
 class ExportView(QWidget):
@@ -249,81 +274,76 @@ class ExportView(QWidget):
         header.setObjectName("section_title")
         layout.addWidget(header)
 
-        # --- Placeholder state ---
-        # Shown when no mesh has been processed yet.
+        # Stretch before content — pushes everything to vertical center,
+        # mirroring how the drop zone fills space on the Import page.
+        layout.addStretch()
+
+        # Placeholder — shown when no mesh has been processed yet.
+        # Do NOT pass alignment to addWidget here — combining wordWrap with
+        # addWidget alignment causes Qt to constrain the label to a tiny width
+        # and cut the text off. Instead, the label fills the available width
+        # and its own AlignCenter centers the text within that space.
         self._placeholder = QLabel(
             "Export settings will appear here once an asset has been processed."
         )
-        self._placeholder.setStyleSheet("color: #999999;")
-        self._placeholder.setWordWrap(True)
+        self._placeholder.setStyleSheet("color: #999999; font-size: 13px;")
+        self._placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self._placeholder)
 
-        # --- Active state container ---
-        # Contains mesh info, format selector, export button, and feedback.
-        # Hidden until set_mesh_ready() is called.
-        self._active_container = QWidget()
-        active_layout = QVBoxLayout(self._active_container)
-        active_layout.setContentsMargins(0, 0, 0, 0)
-        active_layout.setSpacing(16)
+        # Mesh stats — hidden until set_mesh_ready() is called.
+        self._vertices_label = QLabel("")
+        self._vertices_label.setObjectName("mesh_info")
+        self._vertices_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._vertices_label.hide()
+        layout.addWidget(self._vertices_label, alignment=Qt.AlignmentFlag.AlignCenter)
 
-        # Mesh info panel — shows vertex count, triangle count, file size.
-        # Gives the user confidence that the pipeline produced valid output
-        # before they commit to exporting.
-        self._mesh_info = QLabel("")
-        self._mesh_info.setObjectName("mesh_info")
-        self._mesh_info.setWordWrap(True)
-        active_layout.addWidget(self._mesh_info)
+        self._triangles_label = QLabel("")
+        self._triangles_label.setObjectName("mesh_info")
+        self._triangles_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._triangles_label.hide()
+        layout.addWidget(self._triangles_label, alignment=Qt.AlignmentFlag.AlignCenter)
 
-        # Format selector row — dropdown + label on one line.
-        format_row = QWidget()
-        format_layout = QHBoxLayout(format_row)
-        format_layout.setContentsMargins(0, 0, 0, 0)
-        format_layout.setSpacing(12)
+        self._filesize_label = QLabel("")
+        self._filesize_label.setObjectName("mesh_info")
+        self._filesize_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._filesize_label.hide()
+        layout.addWidget(self._filesize_label, alignment=Qt.AlignmentFlag.AlignCenter)
 
-        format_label = QLabel("Format:")
-        format_label.setObjectName("export_label")
-        format_label.setFixedWidth(60)
-        format_layout.addWidget(format_label)
-
-        # QComboBox populated with the export formats defined in pipeline.py.
-        # The user selects a format before clicking Export.
+        # Format selector — centered dropdown without a label, matching
+        # the quality preset dropdown on the Import page.
         self._format_combo = QComboBox()
         self._format_combo.setObjectName("format_combo")
         for label in EXPORT_FORMATS:
             self._format_combo.addItem(label)
         self._format_combo.setFixedWidth(200)
-        format_layout.addWidget(self._format_combo)
+        self._format_combo.hide()
+        layout.addWidget(self._format_combo, alignment=Qt.AlignmentFlag.AlignCenter)
 
-        format_layout.addStretch()
-        active_layout.addWidget(format_row)
-
-        # Export button — opens a save dialog then emits export_requested.
-        # Uses the same crimson accent as the Start Processing button so
-        # the primary action is always visually consistent.
+        # Export button — same fixed size as Start Processing button.
         self._export_btn = QPushButton("Choose Location && Export")
         self._export_btn.setObjectName("export_button")
         self._export_btn.setFixedSize(200, 36)
         self._export_btn.clicked.connect(self._on_export_clicked)
-        active_layout.addWidget(self._export_btn, alignment=Qt.AlignmentFlag.AlignCenter)
+        self._export_btn.hide()
+        layout.addWidget(self._export_btn, alignment=Qt.AlignmentFlag.AlignCenter)
 
-        # Feedback label — shows success or error messages after export.
-        self._feedback = QLabel("")
-        self._feedback.setObjectName("export_feedback")
-        self._feedback.setWordWrap(True)
-        active_layout.addWidget(self._feedback)
-
-        # Reset button — lets the user clear the current job and return
-        # to the Import view to start a new reconstruction from scratch.
+        # Reset button — returns to Import view for a fresh job.
         self._reset_btn = QPushButton("Reset")
         self._reset_btn.setObjectName("reset_button")
         self._reset_btn.setFixedSize(200, 36)
         self._reset_btn.clicked.connect(lambda: self.reset_requested.emit())
-        active_layout.addWidget(self._reset_btn, alignment=Qt.AlignmentFlag.AlignCenter)
+        self._reset_btn.hide()
+        layout.addWidget(self._reset_btn, alignment=Qt.AlignmentFlag.AlignCenter)
 
-        active_layout.addStretch()
-        layout.addWidget(self._active_container)
-        self._active_container.hide()
+        # Feedback label — success or error message after export attempt.
+        self._feedback = QLabel("")
+        self._feedback.setObjectName("export_feedback")
+        self._feedback.setWordWrap(True)
+        self._feedback.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self._feedback, alignment=Qt.AlignmentFlag.AlignCenter)
 
+        # Stretch after content — balances the top stretch to keep
+        # everything vertically centered on the page.
         layout.addStretch()
 
         # Store the source PLY path once the pipeline provides it.
@@ -342,16 +362,20 @@ class ExportView(QWidget):
         """
         self._source_ply = workspace.mesh / "meshed.ply"
 
-        # Format mesh stats into a readable summary.
-        self._mesh_info.setText(
-            f"Vertices: {mesh_info['vertices']:,}    "
-            f"Triangles: {mesh_info['triangles']:,}    "
-            f"File size: {mesh_info['file_size_mb']} MB"
-        )
+        # Populate each stat on its own centered line inside the info panel.
+        self._vertices_label.setText(f"Vertices: {mesh_info['vertices']:,}")
+        self._triangles_label.setText(f"Triangles: {mesh_info['triangles']:,}")
+        self._filesize_label.setText(f"File size: {mesh_info['file_size_mb']} MB")
 
-        # Switch to active state.
+        # Switch from placeholder to active state — show stats in the
+        # panel and reveal the controls below it.
         self._placeholder.hide()
-        self._active_container.show()
+        self._vertices_label.show()
+        self._triangles_label.show()
+        self._filesize_label.show()
+        self._format_combo.show()
+        self._export_btn.show()
+        self._reset_btn.show()
         self._feedback.setText("")
 
     def set_export_success(self, dest_path: str):
@@ -367,7 +391,12 @@ class ExportView(QWidget):
     def reset(self):
         """Return to placeholder state. Called when the pipeline is reset."""
         self._source_ply = None
-        self._active_container.hide()
+        self._vertices_label.hide()
+        self._triangles_label.hide()
+        self._filesize_label.hide()
+        self._format_combo.hide()
+        self._export_btn.hide()
+        self._reset_btn.hide()
         self._placeholder.show()
         self._feedback.setText("")
 

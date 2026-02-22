@@ -21,7 +21,7 @@ layer and makes the worker testable with mock engines.
 from pathlib import Path
 from PySide6.QtCore import QThread, Signal
 
-from meshine_shop.core.pipeline import PipelineStage, STAGE_ORDER
+from meshine_shop.core.pipeline import PipelineStage, STAGE_ORDER, QUALITY_PRESETS
 from meshine_shop.core.engine import ReconstructionEngine
 from meshine_shop.core.workspace import WorkspacePaths
 
@@ -49,11 +49,16 @@ class PipelineWorker(QThread):
     pipeline_finished = Signal()
 
     def __init__(self, engine: ReconstructionEngine,
-                 image_paths: list[str], workspace: WorkspacePaths):
+                 image_paths: list[str], workspace: WorkspacePaths,
+                 quality_preset: str = "PC (25K triangles)"):
         super().__init__()
         self._engine = engine
         self._image_paths = image_paths
         self._workspace = workspace
+
+        # Look up the target triangle count from the quality preset.
+        # This value is passed to the engine's decimate() method.
+        self._target_faces = QUALITY_PRESETS.get(quality_preset, 25_000)
 
         # Cooperative cancellation flag. Checked between stages (not mid-stage).
         # Python's GIL makes single boolean reads/writes thread-safe, so no
@@ -77,7 +82,8 @@ class PipelineWorker(QThread):
         """
         # Map each stage constant to its corresponding engine method.
         # The ingest stage is special — it also needs the image paths,
-        # so it gets a lambda wrapper that includes them.
+        # so it gets a lambda wrapper that includes them. The decimation
+        # stage similarly needs the target face count from the quality preset.
         stage_methods = {
             PipelineStage.INGEST: lambda ws, cb: self._engine.ingest(
                 self._image_paths, ws, cb
@@ -87,6 +93,9 @@ class PipelineWorker(QThread):
             PipelineStage.DENSE: self._engine.dense_reconstruct,
             PipelineStage.MESH: self._engine.mesh_reconstruct,
             PipelineStage.TEXTURE: self._engine.texture_map,
+            PipelineStage.DECIMATION: lambda ws, cb: self._engine.decimate(
+                ws, cb, self._target_faces
+            ),
         }
 
         for stage in STAGE_ORDER:

@@ -15,7 +15,7 @@ of the stacked widget in MainContent.
 """
 
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QLabel, QPushButton, QButtonGroup,
+    QWidget, QVBoxLayout, QLabel, QPushButton, QButtonGroup, QFrame,
 )
 from PySide6.QtCore import Signal, Qt
 
@@ -51,11 +51,23 @@ class Sidebar(QWidget):
         # App branding — displayed at the top of the sidebar in crimson
         # with letter-spacing for a clean, logo-like appearance.
         title = QLabel("MESHINE SHOP")
-        title.setStyleSheet(
-            "color: #dc3545; font-size: 16px; font-weight: 700; "
-            "letter-spacing: 2px; padding: 0 8px 20px 8px;"
-        )
+        title.setObjectName("sidebar_title")
         layout.addWidget(title)
+
+        # Horizontal rule below the branding — visually separates the app
+        # title from the navigation items, reinforcing the menu structure.
+        title_divider = QFrame()
+        title_divider.setObjectName("sidebar_divider")
+        title_divider.setFrameShape(QFrame.Shape.HLine)
+        title_divider.setFrameShadow(QFrame.Shadow.Plain)
+        title_divider.setFixedHeight(1)
+        layout.addWidget(title_divider)
+
+        # "NAVIGATION" section label — provides context for the buttons
+        # below it, making the sidebar read clearly as a structured menu.
+        nav_label = QLabel("NAVIGATION")
+        nav_label.setObjectName("nav_section_label")
+        layout.addWidget(nav_label)
 
         # QButtonGroup enforces mutual exclusivity — clicking one button
         # automatically unchecks the others. Each button is assigned an
@@ -68,7 +80,7 @@ class Sidebar(QWidget):
             # Object name allows QSS to style all nav buttons uniformly.
             btn.setObjectName("nav_button")
             # Checkable buttons maintain a pressed/active state, which
-            # QSS uses to apply the :checked style (crimson text).
+            # QSS uses to apply the :checked style (crimson left accent).
             btn.setCheckable(True)
             btn.setToolTip(_tooltip)
             self.button_group.addButton(btn, i)

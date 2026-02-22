@@ -16,8 +16,9 @@ The pipeline follows the standard photogrammetry reconstruction sequence:
        triangulated surface mesh
     6. Texture Mapping — Project the original photo colors onto the
        mesh surface to create a textured 3D model
+    7. Mesh Decimation — Reduce polygon count to match the user's chosen
+       quality preset (Mobile / PC / Cinematic)
 
-COLMAP (via pycolmap) will be the engine executing these stages.
 The stage constants defined here are used throughout the app to track
 progress, update the UI, and log output consistently.
 """
@@ -37,6 +38,7 @@ class PipelineStage:
     DENSE = "dense_reconstruction"
     MESH = "mesh_reconstruction"
     TEXTURE = "texture_mapping"
+    DECIMATION = "decimation"
 
 
 # Ordered list of stages — defines the sequence the pipeline executes.
@@ -49,6 +51,7 @@ STAGE_ORDER = [
     PipelineStage.DENSE,
     PipelineStage.MESH,
     PipelineStage.TEXTURE,
+    PipelineStage.DECIMATION,
 ]
 
 # Human-readable display names for each stage, used in the processing
@@ -60,6 +63,16 @@ STAGE_DISPLAY_NAMES = {
     PipelineStage.DENSE: "Dense Reconstruction",
     PipelineStage.MESH: "Building Mesh",
     PipelineStage.TEXTURE: "Texture Mapping",
+    PipelineStage.DECIMATION: "Mesh Decimation",
+}
+
+# Quality presets for mesh decimation. Each preset maps to a target
+# triangle count appropriate for the target platform. The decimation
+# stage uses these to determine how aggressively to reduce the mesh.
+QUALITY_PRESETS = {
+    "Mobile (5K triangles)": 5_000,
+    "PC (25K triangles)": 25_000,
+    "Cinematic (100K triangles)": 100_000,
 }
 
 # Export format options presented to the user in the Export view.

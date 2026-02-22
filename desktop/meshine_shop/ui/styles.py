@@ -37,21 +37,54 @@ QWidget {
 }
 
 /* ===== Sidebar ===== */
-/* The sidebar sits on the left edge of the window. It uses a slightly
-   darker background than the main canvas to create visual separation,
-   with a subtle border on its right edge. */
+/* The sidebar sits on the left edge of the window. Slightly darker
+   background than the main canvas to distinguish the menu zone. The
+   right border is now handled by a dedicated QFrame separator widget
+   in app.py for precise 1px rendering. */
 QWidget#sidebar {
     background-color: #252525;
-    border-right: 1px solid #3a3a3a;
 }
 
-/* Navigation buttons in the sidebar — transparent by default so they
-   blend into the sidebar background. Muted text color keeps inactive
-   items visually quiet. */
+/* App title at the top of the sidebar. */
+QLabel#sidebar_title {
+    color: #dc3545;
+    font-size: 16px;
+    font-weight: 700;
+    letter-spacing: 2px;
+    padding: 0 8px 16px 8px;
+}
+
+/* Horizontal rule below the sidebar title — visually separates branding
+   from the navigation items. */
+QFrame#sidebar_divider {
+    background-color: #3a3a3a;
+    border: none;
+}
+
+/* "NAVIGATION" section label — small all-caps label that groups the
+   nav buttons and makes the sidebar read as a structured menu. */
+QLabel#nav_section_label {
+    color: #4a5568;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 1.5px;
+    padding: 12px 8px 4px 8px;
+}
+
+/* Vertical separator line between sidebar and main content. */
+QFrame#sidebar_separator {
+    background-color: #3a3a3a;
+    border: none;
+}
+
+/* Navigation buttons — transparent by default so they blend into the
+   sidebar. Muted text keeps inactive items visually quiet. A left border
+   is reserved for the active state indicator. */
 QPushButton#nav_button {
     background-color: transparent;
     border: none;
-    border-radius: 8px;
+    border-left: 3px solid transparent;
+    border-radius: 0px;
     color: #999999;
     font-size: 13px;
     font-weight: 500;
@@ -59,19 +92,19 @@ QPushButton#nav_button {
     text-align: left;
 }
 
-/* Hover state — subtle background lift and brighter text to indicate
-   the button is interactive. */
+/* Hover state — subtle background lift and brighter text. */
 QPushButton#nav_button:hover {
     background-color: #333333;
     color: #d4d4d4;
+    border-left: 3px solid #555555;
 }
 
-/* Checked/active state — the currently selected nav item gets a visible
-   background and the crimson accent color to clearly show which view
-   the user is on. */
+/* Checked/active state — crimson left accent bar clearly marks the
+   current view, a standard navigation pattern in sidebar menus. */
 QPushButton#nav_button:checked {
-    background-color: #3a3a3a;
+    background-color: #2d2d2d;
     color: #dc3545;
+    border-left: 3px solid #dc3545;
 }
 
 /* ===== Drop Zone ===== */
@@ -339,6 +372,12 @@ QLabel#export_label {
     font-size: 13px;
 }
 
+/* Quality label next to the preset dropdown on the Import page. */
+QLabel#quality_label {
+    color: #d4d4d4;
+    font-size: 13px;
+}
+
 /* Format dropdown — dark surface with subtle border to match the
    overall theme. The drop-down arrow area gets a slightly different
    background for visual separation. */
@@ -362,6 +401,35 @@ QComboBox#format_combo::drop-down {
 
 /* Dropdown list styling — matches the dark surface palette. */
 QComboBox#format_combo QAbstractItemView {
+    background-color: #252525;
+    color: #e0e0e0;
+    border: 1px solid #3a3a3a;
+    selection-background-color: #3a3a3a;
+    selection-color: #dc3545;
+}
+
+/* ===== Quality Preset Dropdown ===== */
+/* Matches the format dropdown styling for visual consistency across
+   both the Import and Export views. */
+QComboBox#quality_combo {
+    background-color: #252525;
+    color: #e0e0e0;
+    border: 1px solid #3a3a3a;
+    border-radius: 6px;
+    padding: 8px 12px;
+    font-size: 13px;
+}
+
+QComboBox#quality_combo:hover {
+    border-color: #999999;
+}
+
+QComboBox#quality_combo::drop-down {
+    border: none;
+    width: 28px;
+}
+
+QComboBox#quality_combo QAbstractItemView {
     background-color: #252525;
     color: #e0e0e0;
     border: 1px solid #3a3a3a;

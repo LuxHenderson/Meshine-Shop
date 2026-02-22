@@ -20,7 +20,7 @@ all visual design centralized in one place (styles.py) and makes
 future theme changes trivial.
 """
 
-from PySide6.QtWidgets import QMainWindow, QHBoxLayout, QWidget, QStatusBar
+from PySide6.QtWidgets import QMainWindow, QHBoxLayout, QWidget, QStatusBar, QFrame
 from PySide6.QtCore import Qt
 
 from meshine_shop.ui.sidebar import Sidebar
@@ -65,9 +65,19 @@ class MeshineShopApp(QMainWindow):
         # MainContent uses a QStackedWidget to swap between Import/Process/Export.
         self.main_content = MainContent()
 
+        # Vertical separator — a 1px QFrame line that visually divides the
+        # sidebar menu from the main content area. More reliable than the CSS
+        # border-right approach because QFrame always renders at exactly 1px.
+        separator = QFrame()
+        separator.setObjectName("sidebar_separator")
+        separator.setFrameShape(QFrame.Shape.VLine)
+        separator.setFrameShadow(QFrame.Shadow.Plain)
+        separator.setFixedWidth(1)
+
         # The sidebar is fixed-width (220px); the main content stretches to
         # fill remaining space (stretch factor of 1).
         layout.addWidget(self.sidebar)
+        layout.addWidget(separator)
         layout.addWidget(self.main_content, 1)
 
         # Connect sidebar navigation clicks to the main content view switcher.
@@ -101,7 +111,8 @@ class MeshineShopApp(QMainWindow):
         # can locate the output mesh after the pipeline completes.
         self._workspace = None
 
-    def _start_pipeline(self, image_paths: list[str]):
+    def _start_pipeline(self, image_paths: list[str],
+                        quality_preset: str = "PC (25K triangles)"):
         """
         Create a workspace, engine, and worker, then start the pipeline.
 
@@ -122,6 +133,10 @@ class MeshineShopApp(QMainWindow):
         The worker runs on a background thread so the UI stays responsive.
         All communication back to the UI happens via Qt signals, which are
         automatically marshaled to the main thread.
+
+        Args:
+            image_paths:    List of absolute file path strings to process.
+            quality_preset: Selected quality preset label from the Import view.
         """
         # Create a fresh workspace for this job and store it so the Export
         # view can find the output mesh after the pipeline completes.
@@ -134,8 +149,9 @@ class MeshineShopApp(QMainWindow):
         engine, engine_name = create_best_engine()
         self.statusBar().showMessage(f"Engine: {engine_name} | Workspace: {workspace.root}")
 
-        # Create the background worker.
-        self._worker = PipelineWorker(engine, image_paths, workspace)
+        # Create the background worker with the user's quality preset.
+        # The preset determines the target triangle count for decimation.
+        self._worker = PipelineWorker(engine, image_paths, workspace, quality_preset)
 
         # Get a reference to the processing queue for signal connections.
         queue = self.main_content.process_view.queue

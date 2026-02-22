@@ -384,3 +384,73 @@ class AppleObjectCaptureEngine(ReconstructionEngine):
         AO texture maps. No separate texturing step is needed.
         """
         on_progress("Textures baked by Object Capture (PBR maps included)")
+
+    def decimate(self, workspace, on_progress, target_faces=25_000):
+        """
+        Reduce mesh polygon count using quadric edge collapse decimation.
+
+        Uses PyMeshLab's simplification_quadric_edge_collapse_decimation.
+        Object Capture typically produces ~100K triangles at 'full' detail,
+        so this stage is important for mobile and PC quality presets.
+
+        If the mesh already has fewer triangles than the target (e.g.,
+        Cinematic preset with a small dataset), decimation is skipped.
+
+        Args:
+            workspace:    WorkspacePaths containing the mesh to decimate.
+            on_progress:  Callback for status messages shown in the UI.
+            target_faces: Target triangle count from the quality preset.
+        """
+        import pymeshlab
+
+        mesh_path = workspace.mesh / "meshed.ply"
+
+        if not mesh_path.exists():
+            raise EngineError(
+                "No mesh file found for decimation. "
+                "The mesh reconstruction stage may have failed."
+            )
+
+        on_progress("Loading mesh for decimation...")
+
+        try:
+            ms = pymeshlab.MeshSet()
+            ms.load_new_mesh(str(mesh_path))
+
+            # Get the current triangle count to decide if decimation is needed.
+            current_faces = ms.current_mesh().face_number()
+
+            if current_faces <= target_faces:
+                on_progress(
+                    f"Mesh already has {current_faces:,} triangles "
+                    f"(target: {target_faces:,}) — skipping decimation"
+                )
+                return
+
+            on_progress(
+                f"Decimating from {current_faces:,} to {target_faces:,} triangles..."
+            )
+
+            # Quadric edge collapse decimation — iteratively collapses edges
+            # with the lowest quadric error metric until the target face count
+            # is reached. This preserves geometric detail where it matters most.
+            ms.meshing_decimation_quadric_edge_collapse(
+                targetfacenum=target_faces,
+                preservenormal=True,
+            )
+
+            final_faces = ms.current_mesh().face_number()
+            final_verts = ms.current_mesh().vertex_number()
+
+            # Overwrite the original mesh with the decimated version.
+            ms.save_current_mesh(str(mesh_path))
+
+            on_progress(
+                f"Decimation complete: {final_verts:,} vertices, "
+                f"{final_faces:,} triangles"
+            )
+
+        except EngineError:
+            raise
+        except Exception as e:
+            raise EngineError(f"Mesh decimation failed: {e}")

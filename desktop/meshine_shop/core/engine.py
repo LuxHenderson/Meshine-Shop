@@ -211,6 +211,13 @@ class ReconstructionEngine(ABC):
         """Project source photo colors onto the mesh surface."""
         ...
 
+    @abstractmethod
+    def decimate(self, workspace: "WorkspacePaths",
+                 on_progress: Callable[[str], None],
+                 target_faces: int = 25_000) -> None:
+        """Reduce mesh polygon count to the target triangle budget."""
+        ...
+
 
 # ---------------------------------------------------------------------------
 # COLMAP implementation
@@ -572,3 +579,74 @@ class ColmapEngine(ReconstructionEngine):
             on_progress("Texture mapping timed out. Mesh exported without texture.")
         except Exception as e:
             on_progress(f"Texture mapping failed: {e}. Mesh exported without texture.")
+
+    def decimate(self, workspace, on_progress, target_faces=25_000):
+        """
+        Reduce mesh polygon count using quadric edge collapse decimation.
+
+        Uses PyMeshLab's simplification_quadric_edge_collapse_decimation —
+        the industry-standard algorithm for game asset optimization. If the
+        source mesh already has fewer triangles than the target, decimation
+        is skipped to avoid unnecessary processing or upscaling artifacts.
+
+        The decimated mesh overwrites the original meshed.ply so the export
+        pipeline always reads the final optimized version.
+
+        Args:
+            workspace:    WorkspacePaths containing the mesh to decimate.
+            on_progress:  Callback for status messages shown in the UI.
+            target_faces: Target triangle count from the quality preset.
+        """
+        import pymeshlab
+
+        mesh_path = workspace.mesh / "meshed.ply"
+
+        if not mesh_path.exists():
+            raise EngineError(
+                "No mesh file found for decimation. "
+                "The mesh reconstruction stage may have failed."
+            )
+
+        on_progress("Loading mesh for decimation...")
+
+        try:
+            ms = pymeshlab.MeshSet()
+            ms.load_new_mesh(str(mesh_path))
+
+            # Get the current triangle count to decide if decimation is needed.
+            current_faces = ms.current_mesh().face_number()
+
+            if current_faces <= target_faces:
+                on_progress(
+                    f"Mesh already has {current_faces:,} triangles "
+                    f"(target: {target_faces:,}) — skipping decimation"
+                )
+                return
+
+            on_progress(
+                f"Decimating from {current_faces:,} to {target_faces:,} triangles..."
+            )
+
+            # Quadric edge collapse decimation — iteratively collapses edges
+            # with the lowest quadric error metric until the target face count
+            # is reached. This preserves geometric detail where it matters most.
+            ms.meshing_decimation_quadric_edge_collapse(
+                targetfacenum=target_faces,
+                preservenormal=True,
+            )
+
+            final_faces = ms.current_mesh().face_number()
+            final_verts = ms.current_mesh().vertex_number()
+
+            # Overwrite the original mesh with the decimated version.
+            ms.save_current_mesh(str(mesh_path))
+
+            on_progress(
+                f"Decimation complete: {final_verts:,} vertices, "
+                f"{final_faces:,} triangles"
+            )
+
+        except EngineError:
+            raise
+        except Exception as e:
+            raise EngineError(f"Mesh decimation failed: {e}")
