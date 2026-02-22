@@ -33,7 +33,7 @@ Meshine Shop solves this by unifying the entire pipeline — from photo import (
 Meshine Shop follows a **pipeline architecture** — data flows sequentially through discrete, logged stages:
 
 ```
-Photos/LiDAR → Ingest → Feature Extraction → Sparse Cloud (SfM) → Dense Cloud → Mesh → Texture → Export
+Photos/LiDAR → Ingest → Feature Extraction → Sparse Cloud (SfM) → Dense Cloud → Mesh → Texture → Decimation → UV Unwrap → Export
 ```
 
 The application uses an **engine-agnostic design** — a `ReconstructionEngine` abstract base class defines the pipeline interface, and an engine factory auto-detects the best available engine at startup:
@@ -44,7 +44,7 @@ The application uses an **engine-agnostic design** — a `ReconstructionEngine` 
 | Windows + NVIDIA GPU | COLMAP | CUDA | Dense reconstruction, high quality |
 | Any (fallback) | COLMAP | CPU | Sparse reconstruction, lower quality |
 
-Both engines implement the same 6-stage interface, so the worker, processing queue, and export flow are completely engine-agnostic — they don't know or care which engine is running.
+Both engines implement the same 8-stage interface, so the worker, processing queue, and export flow are completely engine-agnostic — they don't know or care which engine is running.
 
 The application is structured as a **monorepo** with three top-level directories:
 
@@ -78,7 +78,7 @@ Meshine Shop/
 
 **Python + PySide6 over Electron:** The entire computational backbone — COLMAP, PyTorch, PyMeshLab, Open3D — lives in Python. Electron would require constant IPC bridging between Node.js and Python, adding latency and failure points. PySide6 keeps everything in one process, one language, one ecosystem.
 
-**Engine-agnostic pipeline:** The `ReconstructionEngine` ABC lets us swap photogrammetry engines without touching the UI, worker, or export code. Apple Object Capture on macOS and COLMAP on Windows both implement the same 6-stage interface. The engine factory picks the best one automatically at startup.
+**Engine-agnostic pipeline:** The `ReconstructionEngine` ABC lets us swap photogrammetry engines without touching the UI, worker, or export code. Apple Object Capture on macOS and COLMAP on Windows both implement the same 8-stage interface. The engine factory picks the best one automatically at startup.
 
 **Swift CLI subprocess for Object Capture:** Apple's `PhotogrammetrySession` is a Swift-only API — it cannot be bridged via PyObjC (which only handles Objective-C). A lightweight Swift CLI tool wraps the API and communicates with the Python app via JSON lines on stdout. This keeps the integration clean and the Python app self-contained.
 
@@ -86,7 +86,7 @@ Meshine Shop/
 
 **Centralized QSS theming:** All visual styling lives in a single `styles.py` file rather than being scattered across widgets. This makes theme changes trivial and keeps UI code focused on layout and behavior.
 
-## Current Features (Phase 1 Complete + Apple Object Capture Integration)
+## Current Features (Phase 1 + Phase 2a–2b Complete)
 
 ### Reconstruction Engines
 - **Apple Object Capture** (macOS): Metal-accelerated reconstruction producing ~50K vertices with PBR textures (diffuse, normal, roughness, AO) via RealityKit's PhotogrammetrySession API
@@ -98,17 +98,21 @@ Meshine Shop/
 - Browse Folder button for native directory picker as an alternative to drag-and-drop
 - Recursive folder scanning — automatically finds all supported images in nested directories
 - Clear button to reset file selection before processing
+- Quality preset selector (Mobile / PC / Cinematic) to choose target polygon budget before processing
 - Supported formats: JPEG, PNG, TIFF, HEIC (automatic HEIC-to-JPEG conversion for iPhone photos)
 
 ### Processing
-- Full photogrammetry pipeline: ingest → feature extraction → sparse reconstruction → dense reconstruction → mesh → texture mapping
+- Full photogrammetry pipeline: ingest → feature extraction → sparse reconstruction → dense reconstruction → mesh → texture mapping → decimation → UV unwrapping
 - Background processing via QThread — UI stays responsive during pipeline execution
 - Live processing queue with per-stage status indicators (pending / running / done / error)
 - Real-time progress messages in the queue and status bar
 - USDZ-to-PLY format conversion via Pixar USD library (for Object Capture output)
+- **Mesh decimation** (Phase 2a): PyMeshLab quadric edge collapse to Mobile (5K), PC (25K), or Cinematic (100K) triangle targets
+- **UV unwrapping** (Phase 2b): xatlas automatic UV atlas generation — non-overlapping islands packed into [0,1]² space; output is OBJ with embedded UV coordinates, ready for Phase 2c texture baking
 
 ### Export
 - Mesh export to OBJ (.obj) and glTF Binary (.glb) via trimesh
+- Source mesh is the UV-mapped OBJ (Phase 2b output) — UV coordinates are preserved in both export formats
 - Export view with mesh stats (vertex count, triangle count, file size)
 - Format selector dropdown with native save dialog
 - Auto-transition to Export view after pipeline completes
@@ -116,8 +120,9 @@ Meshine Shop/
 
 ### UI/UX
 - Charcoal + crimson dark theme with cohesive outlined button styling
-- Sidebar navigation (Import / Process / Export views)
-- Consistent layout across all three views
+- Sidebar navigation with crimson left-accent active indicator and vertical separator
+- Import / Process / Export views — all content vertically and horizontally centered
+- Quality preset dropdown on Import page; format dropdown on Export page
 - Development file watcher with auto-restart on save
 - Cross-platform targeting (macOS + Windows)
 
@@ -132,8 +137,8 @@ Meshine Shop/
 - [x] 1f — UI refinements (folder import, browse button, consistent styling)
 
 ### Phase 2: Game-Ready Optimization
-- [ ] 2a — Mesh decimation with quality presets
-- [ ] 2b — Automatic UV unwrapping (xatlas)
+- [x] 2a — Mesh decimation with quality presets
+- [x] 2b — Automatic UV unwrapping (xatlas)
 - [ ] 2c — Texture baking (albedo, normals, AO)
 - [ ] 2d — AI-driven PBR material estimation
 - [ ] 2e — .FBX and .glTF export with material definitions
@@ -201,7 +206,7 @@ poetry run python scripts/dev.py
 
 ## Known Limitations
 
-- **Exported models are geometry-only:** The current PLY conversion extracts vertices and triangles from Object Capture's USDZ output but does not carry over the PBR textures. Texture export is planned for Phase 2.
+- **Exported models have no textures yet:** Meshes are exported with full UV coordinates (Phase 2b complete), but texture baking — projecting the source photo colors onto the UV map — is Phase 2c. The exported OBJ and glTF are correctly UV-mapped and ready to receive textures, but they render as untextured geometry until Phase 2c is implemented.
 - **COLMAP on macOS is sparse-only:** Apple Silicon uses Metal, not CUDA. Dense reconstruction is skipped; meshing proceeds from the sparse point cloud. On macOS, Apple Object Capture is strongly preferred and automatically selected.
 - **iPhone photos are HEIC internally:** Even when named `.JPEG`, iPhone photos are HEIC format. The app handles this automatically via Pillow + pillow-heif conversion.
 - **macOS-only testing so far:** Cross-platform support is architected in but Windows testing has not started.

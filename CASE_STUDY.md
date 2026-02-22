@@ -127,7 +127,23 @@ All visual styling is defined in a single `styles.py` file using Qt Style Sheets
 
 **Lesson:** Format conversion between proprietary and open formats is often the hardest part of integrating platform-specific APIs. The reconstruction itself was easy — Apple's API is excellent. Getting the output into a format the rest of the pipeline could use required a separate library and a custom conversion step.
 
-*More challenges will be documented as development progresses through Phases 2–4.*
+### Challenge: PyMeshLab's API is not PyPI-documented
+
+**Problem:** PyMeshLab wraps MeshLab's filter system — a C++ application where filters are discovered at runtime and called by name string. There is no autocomplete, no type hints, and the Python docs are sparse. Finding the correct filter name (`meshing_decimation_quadric_edge_collapse`) and its parameter names (`targetfacenum`, `preservenormal`, `preservetopology`, `optimalplacement`) required cross-referencing the MeshLab C++ source and community forum posts. An incorrect filter name raises a generic runtime error with no suggestion of what went wrong.
+
+**Solution:** Treated PyMeshLab like an undocumented runtime API and verified each call against MeshLab's filter documentation directly. The key insight is that `ms.apply_filter("filter_name", **params)` takes keyword arguments that map exactly to the filter's XML-defined parameter names — once you find those names in the source, the API is predictable. The working call was documented thoroughly in the codebase so future filter additions don't require the same research.
+
+**Lesson:** When wrapping a C++ application's plugin system in Python, expect a discovery gap. Plan for time to dig through source code or community resources rather than relying on the Python wrapper's documentation alone.
+
+### Challenge: xatlas splits mesh vertices at UV seams
+
+**Problem:** UV unwrapping requires cutting the 3D mesh surface along seam edges to flatten it into 2D. xatlas performs these cuts, which introduces additional vertices — a single vertex in the input mesh may become two or more vertices in the UV-mapped output (one per UV island boundary). The output vertex count is always >= the input. This was initially confusing: after running xatlas, the mesh appeared to have more vertices than after decimation, seemingly undoing optimization work.
+
+**Solution:** Documented and exposed the seam-split count in the pipeline progress message (`+N seam splits`). The vertex increase is expected behavior — it's geometrically equivalent to the original mesh, just with UV coordinates attached. The new vertex positions are correctly reconstructed using xatlas's `vmapping` output array: `new_positions = vertices[vmapping]` maps each output vertex back to its original input vertex. Setting `process=False` on the trimesh constructor is required to prevent trimesh from re-merging duplicate vertices, which would corrupt the UV layout.
+
+**Lesson:** xatlas's output format (`vmapping`, `new_indices`, `uvs`) is a remapping, not a new mesh from scratch. Understanding that `vmapping[i]` gives the original vertex index for output vertex `i` makes the reconstruction straightforward — but the API documentation doesn't make this obvious.
+
+*More challenges will be documented as development progresses through Phases 2c–4.*
 
 ## Results and Impact
 
@@ -170,6 +186,22 @@ All visual styling is defined in a single `styles.py` file using Qt Style Sheets
 - Consistent layout: all views share the same header + content pattern
 - Reset button moved from Process to Export page for logical workflow placement
 - Phase 1 goal achieved: photos in → standard 3D mesh out, end-to-end in one application
+
+### Phase 2a Complete — Mesh Decimation
+- PyMeshLab quadric edge collapse decimation with three quality presets: Mobile (5K), PC (25K), Cinematic (100K triangles)
+- Preset selected on the Import page before processing — no post-processing decision required
+- Decimation runs as pipeline stage 7, taking the reconstructed mesh and reducing it to the target polygon budget
+- Both COLMAP and Apple Object Capture engines share the same decimation implementation (engine-agnostic)
+- Mesh stats in the Export view reflect the decimated count, confirming the target was hit
+- Unlocks practical game-engine import: raw reconstruction meshes (200K–1M+ triangles) are too heavy for real-time rendering; decimated meshes are game-ready
+
+### Phase 2b Complete — Automatic UV Unwrapping
+- xatlas automatic UV atlas generation added as pipeline stage 8 (after decimation)
+- Non-overlapping UV islands packed into [0,1]² space — the standard UV layout expected by game engines and texture bakers
+- Handles vertex splitting at UV seams automatically: where xatlas cuts the mesh surface to unfold it, new vertices are introduced at seam edges. This is normal UV behavior and is tracked in the pipeline progress message
+- Output saved as `meshed_uv.obj` in the workspace — OBJ format chosen because it natively stores UV coordinates as `vt` lines in the face definitions
+- Export view now sources from the UV-mapped OBJ instead of the raw PLY, so UV coordinates are present in all exported files (OBJ and glTF Binary)
+- Establishes the foundation for Phase 2c: the UV map defines how photo color data will be projected onto the mesh surface during texture baking
 
 ## What I'd Improve
 
