@@ -100,6 +100,10 @@ class PipelineWorker(QThread):
             # UV unwrapping reads the decimated PLY and writes meshed_uv.obj
             # with xatlas UV coordinates. Required for Phase 2c texture baking.
             PipelineStage.UV_UNWRAP: self._engine.unwrap_uv,
+            # Texture baking reads meshed_uv.obj and writes albedo.png,
+            # normal.png, ao.png to workspace.textures/. Non-fatal: the
+            # engine implementation logs a warning and continues on failure.
+            PipelineStage.TEXTURE_BAKE: self._engine.bake_textures,
         }
 
         for stage in STAGE_ORDER:

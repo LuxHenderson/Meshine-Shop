@@ -11,7 +11,8 @@ by default. Each workspace contains:
     images/   — source photos (copied or symlinked from the user's originals)
     sparse/   — sparse reconstruction output (camera poses, sparse point cloud)
     dense/    — dense reconstruction output (depth maps, fused point cloud)
-    mesh/     — final mesh and texture files
+    mesh/     — mesh files (meshed.ply, meshed_uv.obj, USDZ extraction)
+    textures/ — baked PBR textures (Phase 2c): albedo.png, normal.png, ao.png
     database.db — COLMAP's SQLite database (features, matches, etc.)
 
 Using a dedicated workspace per job keeps reconstructions isolated and
@@ -38,6 +39,7 @@ class WorkspacePaths:
     sparse: Path     # Sparse reconstruction output directory
     dense: Path      # Dense reconstruction output directory
     mesh: Path       # Mesh and texture output directory
+    textures: Path   # Baked texture maps (Phase 2c) — albedo.png, normal.png, ao.png
 
 
 def create_workspace(base_dir: Path | None = None) -> WorkspacePaths:
@@ -69,6 +71,8 @@ def create_workspace(base_dir: Path | None = None) -> WorkspacePaths:
         sparse=root / "sparse",
         dense=root / "dense",
         mesh=root / "mesh",
+        # Phase 2c: baked texture maps live here, separate from raw mesh files.
+        textures=root / "textures",
     )
 
     # Create all directories. parents=True creates the full path including
@@ -78,5 +82,6 @@ def create_workspace(base_dir: Path | None = None) -> WorkspacePaths:
     paths.sparse.mkdir(parents=True, exist_ok=True)
     paths.dense.mkdir(parents=True, exist_ok=True)
     paths.mesh.mkdir(parents=True, exist_ok=True)
+    paths.textures.mkdir(parents=True, exist_ok=True)
 
     return paths

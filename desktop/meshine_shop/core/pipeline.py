@@ -21,6 +21,9 @@ The pipeline follows the standard photogrammetry reconstruction sequence:
     8. UV Unwrapping — Generate non-overlapping UV coordinates for the
        decimated mesh using xatlas. UV maps are required for texture
        baking (Phase 2c) and PBR material export to game engines.
+    9. Texture Baking — Project reconstruction colors onto the UV-mapped
+       mesh to produce diffuse (albedo), tangent-space normal map, and
+       ambient occlusion textures saved as 2048×2048 PNG files.
 
 The stage constants defined here are used throughout the app to track
 progress, update the UI, and log output consistently.
@@ -43,6 +46,7 @@ class PipelineStage:
     TEXTURE = "texture_mapping"
     DECIMATION = "decimation"
     UV_UNWRAP = "uv_unwrapping"
+    TEXTURE_BAKE = "texture_baking"
 
 
 # Ordered list of stages — defines the sequence the pipeline executes.
@@ -57,6 +61,8 @@ STAGE_ORDER = [
     PipelineStage.TEXTURE,
     PipelineStage.DECIMATION,
     PipelineStage.UV_UNWRAP,
+    # Phase 2c: bake PBR textures (albedo, normal, AO) onto the UV-mapped mesh.
+    PipelineStage.TEXTURE_BAKE,
 ]
 
 # Human-readable display names for each stage, used in the processing
@@ -70,6 +76,7 @@ STAGE_DISPLAY_NAMES = {
     PipelineStage.TEXTURE: "Texture Mapping",
     PipelineStage.DECIMATION: "Mesh Decimation",
     PipelineStage.UV_UNWRAP: "UV Unwrapping",
+    PipelineStage.TEXTURE_BAKE: "Texture Baking",
 }
 
 # Quality presets for mesh decimation. Each preset maps to a target

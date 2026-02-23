@@ -17,14 +17,16 @@ Objective-C). The Swift CLI tool (apple-photogrammetry) outputs JSON lines to
 stdout, which this engine parses for real-time progress updates.
 
 Stage mapping:
-    Ingest      → Shared ingest_images() — same as COLMAP
-    Features    → Runs the full Object Capture session (reports combined progress)
-    Sparse      → Auto-completes (handled by Object Capture internally)
-    Dense       → Auto-completes (handled by Object Capture internally)
-    Mesh        → Converts Object Capture output to PLY for the export pipeline
-    Texture     → Auto-completes (Object Capture bakes textures automatically)
-    Decimation  → Shared PyMeshLab decimation — same as COLMAP
-    UV Unwrap   → Shared xatlas UV parametrization — same as COLMAP
+    Ingest        → Shared ingest_images() — same as COLMAP
+    Features      → Runs the full Object Capture session (reports combined progress)
+    Sparse        → Auto-completes (handled by Object Capture internally)
+    Dense         → Auto-completes (handled by Object Capture internally)
+    Mesh          → Converts Object Capture output to PLY for the export pipeline
+    Texture       → Auto-completes (Object Capture bakes textures automatically)
+    Decimation    → Shared PyMeshLab decimation — same as COLMAP
+    UV Unwrap     → Shared xatlas UV parametrization — same as COLMAP
+    Texture Bake  → Extracts diffuse texture from USDZ, transfers colors to
+                    decimated mesh via KD-tree, bakes albedo/normal/AO textures
 """
 
 import json
@@ -539,3 +541,99 @@ class AppleObjectCaptureEngine(ReconstructionEngine):
             raise
         except Exception as e:
             raise EngineError(f"UV unwrapping failed: {e}")
+
+    def bake_textures(self, workspace, on_progress):
+        """
+        Bake albedo, normal map, and AO textures using the Object Capture USDZ.
+
+        Apple Object Capture already produced a PBR-textured USDZ file during
+        the reconstruction stage. The USDZ archive was extracted to
+        workspace/mesh/usdz_extracted/ during mesh_reconstruct(). This stage:
+
+        1. Finds the diffuse texture image in that extraction directory
+        2. Loads the original full-resolution USD mesh with its UV coordinates
+        3. For each vertex in the decimated mesh, finds the nearest original
+           vertex (via Open3D KDTreeFlann) and samples the diffuse texture
+           at that vertex's UV position
+        4. Rasterizes the transferred per-vertex colors to a 2048×2048 albedo
+        5. Bakes normal map and AO from the decimated mesh geometry (same as COLMAP)
+
+        Non-fatal: if USDZ extraction was not run or fails, baking is skipped
+        with a warning and the pipeline continues with an untextured mesh.
+        """
+        from meshine_shop.core.texture_baker import (
+            bake_albedo_from_usdz,
+            vertex_colors_to_texture,
+            bake_normal_map,
+            bake_ao,
+        )
+
+        uv_obj = workspace.mesh / "meshed_uv.obj"
+        if not uv_obj.exists():
+            on_progress(
+                "Texture baking skipped (meshed_uv.obj not found). "
+                "UV unwrapping may have failed."
+            )
+            return
+
+        # Load the UV-mapped decimated mesh.
+        on_progress("Loading UV-mapped mesh for texture baking...")
+        try:
+            mesh = trimesh.load(str(uv_obj), process=False)
+        except Exception as e:
+            on_progress(f"Texture baking skipped: could not load mesh ({e})")
+            return
+
+        if not hasattr(mesh.visual, "uv") or mesh.visual.uv is None:
+            on_progress("Texture baking skipped: mesh has no UV coordinates")
+            return
+
+        import numpy as np
+        uvs = np.array(mesh.visual.uv, dtype=np.float32)
+        faces = np.array(mesh.faces, dtype=np.int32)
+
+        # --- Albedo: extract from Object Capture's USDZ textures ---
+        # The USDZ was extracted during mesh_reconstruct() to this directory.
+        usdz_extract_dir = workspace.mesh / "usdz_extracted"
+
+        if usdz_extract_dir.exists():
+            on_progress("Transferring USDZ diffuse texture to decimated mesh...")
+            vertex_colors = bake_albedo_from_usdz(
+                mesh, usdz_extract_dir, on_progress
+            )
+        else:
+            on_progress(
+                "USDZ extraction directory not found — albedo baking skipped."
+            )
+            vertex_colors = None
+
+        if vertex_colors is not None:
+            try:
+                on_progress("Rasterizing albedo to texture (this may take a moment)...")
+                albedo_img = vertex_colors_to_texture(uvs, faces, vertex_colors)
+                albedo_img.save(str(workspace.textures / "albedo.png"))
+                on_progress("Albedo texture saved: albedo.png")
+            except Exception as e:
+                on_progress(f"Albedo baking failed: {e}")
+
+        # --- Normal map: from mesh vertex normals (same as COLMAP path) ---
+        try:
+            on_progress("Baking tangent-space normal map...")
+            normal_img = bake_normal_map(mesh)
+            normal_img.save(str(workspace.textures / "normal.png"))
+            on_progress("Normal map saved: normal.png")
+        except Exception as e:
+            on_progress(f"Normal map baking failed: {e}")
+
+        # --- AO: hemisphere ray casting via Open3D (same as COLMAP path) ---
+        try:
+            ao_img = bake_ao(mesh, num_rays=64, on_progress=on_progress)
+            ao_img.save(str(workspace.textures / "ao.png"))
+            on_progress("AO map saved: ao.png")
+        except Exception as e:
+            on_progress(f"AO baking failed: {e}")
+
+        on_progress(
+            "Texture baking complete. "
+            "Textures saved to workspace/textures/"
+        )

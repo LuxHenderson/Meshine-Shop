@@ -229,6 +229,26 @@ class ReconstructionEngine(ABC):
         """
         ...
 
+    @abstractmethod
+    def bake_textures(self, workspace: "WorkspacePaths",
+                      on_progress: Callable[[str], None]) -> None:
+        """Bake PBR texture maps onto the UV-mapped decimated mesh.
+
+        Reads workspace.mesh/meshed_uv.obj (produced by Phase 2b UV unwrapping)
+        and writes three texture images to workspace.textures/:
+            albedo.png  — diffuse/base color from the reconstruction source
+            normal.png  — tangent-space normal map from mesh vertex normals
+            ao.png      — ambient occlusion from hemisphere ray casting
+
+        The color source differs by engine:
+            COLMAP:  colored dense or sparse point cloud
+            Apple:   diffuse texture extracted from object_capture_output.usdz
+
+        This stage is non-fatal: if baking fails for any reason, the pipeline
+        continues with an untextured mesh (same pattern as the texture_map stage).
+        """
+        ...
+
 
 # ---------------------------------------------------------------------------
 # COLMAP implementation
@@ -757,3 +777,116 @@ class ColmapEngine(ReconstructionEngine):
             raise
         except Exception as e:
             raise EngineError(f"UV unwrapping failed: {e}")
+
+    def bake_textures(self, workspace, on_progress):
+        """
+        Bake albedo, normal map, and AO textures from the COLMAP reconstruction.
+
+        Color source priority:
+        1. workspace.dense/fused.ply — colored dense point cloud (requires CUDA)
+        2. workspace.sparse/0/points3D.ply — sparse colored points (always present)
+
+        Each point in the COLMAP reconstruction carries an RGB color taken from
+        the source photos during feature matching. We project those colors onto
+        the decimated mesh by finding the nearest source point for each vertex.
+
+        Output files written to workspace.textures/:
+            albedo.png — diffuse color from point cloud nearest-neighbour
+            normal.png — tangent-space normals from mesh vertex normals
+            ao.png     — ambient occlusion from Open3D hemisphere ray casting
+
+        Non-fatal: logs a warning and continues if baking fails at any step.
+        Subsequent stages (export) will still work — the mesh just won't
+        carry texture data.
+        """
+        import trimesh as _trimesh
+        from meshine_shop.core.texture_baker import (
+            bake_albedo_from_pointcloud,
+            vertex_colors_to_texture,
+            bake_normal_map,
+            bake_ao,
+        )
+
+        uv_obj = workspace.mesh / "meshed_uv.obj"
+        if not uv_obj.exists():
+            on_progress(
+                "Texture baking skipped (meshed_uv.obj not found). "
+                "UV unwrapping may have failed."
+            )
+            return
+
+        # Load the UV-mapped decimated mesh — the target for all baking.
+        on_progress("Loading UV-mapped mesh for texture baking...")
+        try:
+            mesh = _trimesh.load(str(uv_obj), process=False)
+        except Exception as e:
+            on_progress(f"Texture baking skipped: could not load mesh ({e})")
+            return
+
+        # Verify the mesh has UV coordinates (required for rasterization).
+        if not hasattr(mesh.visual, "uv") or mesh.visual.uv is None:
+            on_progress("Texture baking skipped: mesh has no UV coordinates")
+            return
+
+        import numpy as np
+
+        uvs = np.array(mesh.visual.uv, dtype=np.float32)
+        faces = np.array(mesh.faces, dtype=np.int32)
+
+        # --- Albedo: find the best colored point cloud source ---
+        vertex_colors = None
+
+        # Try dense point cloud first (higher density, better quality).
+        dense_pcd = workspace.dense / "fused.ply"
+        if dense_pcd.exists():
+            on_progress("Using dense point cloud for albedo colors...")
+            vertex_colors = bake_albedo_from_pointcloud(mesh, dense_pcd, on_progress)
+
+        # Fall back to sparse points (always produced by COLMAP).
+        if vertex_colors is None:
+            sparse_subdirs = sorted(workspace.sparse.iterdir())
+            if sparse_subdirs:
+                # COLMAP exports sparse points as points3D.ply in the model directory.
+                sparse_pcd = sparse_subdirs[0] / "points3D.ply"
+                if sparse_pcd.exists():
+                    on_progress("Using sparse point cloud for albedo colors...")
+                    vertex_colors = bake_albedo_from_pointcloud(
+                        mesh, sparse_pcd, on_progress
+                    )
+
+        # If we have vertex colors, rasterize them to a texture.
+        if vertex_colors is not None:
+            try:
+                on_progress("Rasterizing albedo to texture (this may take a moment)...")
+                albedo_img = vertex_colors_to_texture(uvs, faces, vertex_colors)
+                albedo_img.save(str(workspace.textures / "albedo.png"))
+                on_progress("Albedo texture saved: albedo.png")
+            except Exception as e:
+                on_progress(f"Albedo baking failed: {e}")
+        else:
+            on_progress(
+                "No colored point cloud found — albedo baking skipped. "
+                "The mesh will export without color texture."
+            )
+
+        # --- Normal map: always available from mesh vertex normals ---
+        try:
+            on_progress("Baking tangent-space normal map...")
+            normal_img = bake_normal_map(mesh)
+            normal_img.save(str(workspace.textures / "normal.png"))
+            on_progress("Normal map saved: normal.png")
+        except Exception as e:
+            on_progress(f"Normal map baking failed: {e}")
+
+        # --- AO: hemisphere ray casting via Open3D ---
+        try:
+            ao_img = bake_ao(mesh, num_rays=64, on_progress=on_progress)
+            ao_img.save(str(workspace.textures / "ao.png"))
+            on_progress("AO map saved: ao.png")
+        except Exception as e:
+            on_progress(f"AO baking failed: {e}")
+
+        on_progress(
+            "Texture baking complete. "
+            "Textures saved to workspace/textures/"
+        )

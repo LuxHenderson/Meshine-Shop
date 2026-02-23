@@ -310,6 +310,14 @@ class ExportView(QWidget):
         self._filesize_label.hide()
         layout.addWidget(self._filesize_label, alignment=Qt.AlignmentFlag.AlignCenter)
 
+        # Texture availability indicator — shows which PBR maps were baked
+        # during Phase 2c. Hidden until set_mesh_ready() confirms they exist.
+        self._textures_label = QLabel("")
+        self._textures_label.setObjectName("mesh_info")
+        self._textures_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._textures_label.hide()
+        layout.addWidget(self._textures_label, alignment=Qt.AlignmentFlag.AlignCenter)
+
         # Format selector — centered dropdown without a label, matching
         # the quality preset dropdown on the Import page.
         self._format_combo = QComboBox()
@@ -377,6 +385,28 @@ class ExportView(QWidget):
         self._triangles_label.setText(f"Triangles: {mesh_info['triangles']:,}")
         self._filesize_label.setText(f"File size: {mesh_info['file_size_mb']} MB")
 
+        # Check which PBR texture maps were baked during Phase 2c.
+        # Report which maps are present so the user knows the export will
+        # be textured (or untextured if baking failed/was skipped).
+        if hasattr(workspace, "textures"):
+            baked_maps = []
+            if (workspace.textures / "albedo.png").exists():
+                baked_maps.append("Albedo")
+            if (workspace.textures / "normal.png").exists():
+                baked_maps.append("Normal")
+            if (workspace.textures / "ao.png").exists():
+                baked_maps.append("AO")
+
+            if baked_maps:
+                self._textures_label.setText(
+                    f"Textures: {', '.join(baked_maps)}"
+                )
+                self._textures_label.show()
+            else:
+                self._textures_label.hide()
+        else:
+            self._textures_label.hide()
+
         # Switch from placeholder to active state — show stats in the
         # panel and reveal the controls below it.
         self._placeholder.hide()
@@ -404,6 +434,7 @@ class ExportView(QWidget):
         self._vertices_label.hide()
         self._triangles_label.hide()
         self._filesize_label.hide()
+        self._textures_label.hide()
         self._format_combo.hide()
         self._export_btn.hide()
         self._reset_btn.hide()

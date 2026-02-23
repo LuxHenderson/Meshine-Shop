@@ -33,7 +33,7 @@ Meshine Shop solves this by unifying the entire pipeline — from photo import (
 Meshine Shop follows a **pipeline architecture** — data flows sequentially through discrete, logged stages:
 
 ```
-Photos/LiDAR → Ingest → Feature Extraction → Sparse Cloud (SfM) → Dense Cloud → Mesh → Texture → Decimation → UV Unwrap → Export
+Photos/LiDAR → Ingest → Feature Extraction → Sparse Cloud (SfM) → Dense Cloud → Mesh → Texture → Decimation → UV Unwrap → Texture Baking → Export
 ```
 
 The application uses an **engine-agnostic design** — a `ReconstructionEngine` abstract base class defines the pipeline interface, and an engine factory auto-detects the best available engine at startup:
@@ -44,7 +44,7 @@ The application uses an **engine-agnostic design** — a `ReconstructionEngine` 
 | Windows + NVIDIA GPU | COLMAP | CUDA | Dense reconstruction, high quality |
 | Any (fallback) | COLMAP | CPU | Sparse reconstruction, lower quality |
 
-Both engines implement the same 8-stage interface, so the worker, processing queue, and export flow are completely engine-agnostic — they don't know or care which engine is running.
+Both engines implement the same 9-stage interface, so the worker, processing queue, and export flow are completely engine-agnostic — they don't know or care which engine is running.
 
 The application is structured as a **monorepo** with three top-level directories:
 
@@ -59,7 +59,8 @@ Meshine Shop/
 │   │   │   ├── worker.py       # QThread background pipeline runner
 │   │   │   ├── pipeline.py     # Stage definitions and constants
 │   │   │   ├── workspace.py    # Workspace directory management
-│   │   │   └── exporter.py     # Mesh format conversion (PLY → OBJ/glTF)
+│   │   │   ├── exporter.py     # Mesh format conversion + texture embedding
+│   │   │   └── texture_baker.py # PBR texture baking (albedo, normal, AO)
 │   │   └── ui/                 # Qt widgets, views, styling
 │   │       ├── main_window.py  # Import, Process, Export views
 │   │       ├── drop_zone.py    # Drag-and-drop + folder import
@@ -86,7 +87,7 @@ Meshine Shop/
 
 **Centralized QSS theming:** All visual styling lives in a single `styles.py` file rather than being scattered across widgets. This makes theme changes trivial and keeps UI code focused on layout and behavior.
 
-## Current Features (Phase 1 + Phase 2a–2b Complete)
+## Current Features (Phase 1 + Phase 2a–2c Complete)
 
 ### Reconstruction Engines
 - **Apple Object Capture** (macOS): Metal-accelerated reconstruction producing ~50K vertices with PBR textures (diffuse, normal, roughness, AO) via RealityKit's PhotogrammetrySession API
@@ -102,18 +103,20 @@ Meshine Shop/
 - Supported formats: JPEG, PNG, TIFF, HEIC (automatic HEIC-to-JPEG conversion for iPhone photos)
 
 ### Processing
-- Full photogrammetry pipeline: ingest → feature extraction → sparse reconstruction → dense reconstruction → mesh → texture mapping → decimation → UV unwrapping
+- Full 9-stage photogrammetry pipeline: ingest → feature extraction → sparse reconstruction → dense reconstruction → mesh → texture mapping → decimation → UV unwrapping → texture baking
 - Background processing via QThread — UI stays responsive during pipeline execution
 - Live processing queue with per-stage status indicators (pending / running / done / error)
 - Real-time progress messages in the queue and status bar
 - USDZ-to-PLY format conversion via Pixar USD library (for Object Capture output)
 - **Mesh decimation** (Phase 2a): PyMeshLab quadric edge collapse to Mobile (5K), PC (25K), or Cinematic (100K) triangle targets
-- **UV unwrapping** (Phase 2b): xatlas automatic UV atlas generation — non-overlapping islands packed into [0,1]² space; output is OBJ with embedded UV coordinates, ready for Phase 2c texture baking
+- **UV unwrapping** (Phase 2b): xatlas automatic UV atlas generation — non-overlapping islands packed into [0,1]² space; output is OBJ with embedded UV coordinates
+- **Texture baking** (Phase 2c): three PBR maps baked onto the UV-mapped mesh — albedo (diffuse color from USDZ textures or COLMAP point cloud), tangent-space normal map (from mesh vertex normals), and ambient occlusion (hemisphere ray casting via Open3D). All three saved as 2048×2048 PNGs to workspace/textures/
 
 ### Export
 - Mesh export to OBJ (.obj) and glTF Binary (.glb) via trimesh
-- Source mesh is the UV-mapped OBJ (Phase 2b output) — UV coordinates are preserved in both export formats
-- Export view with mesh stats (vertex count, triangle count, file size)
+- Source mesh is the UV-mapped OBJ (Phase 2b output) — UV coordinates preserved in all exports
+- **Textured export** (Phase 2c): when baked textures are present, they are embedded in the export — GLB receives a self-contained PBR material (baseColorTexture, normalTexture, occlusionTexture); OBJ exports are bundled into a subfolder with the MTL and texture PNGs alongside the mesh file
+- Export view shows mesh stats and which PBR maps are available (Albedo, Normal, AO) before exporting
 - Format selector dropdown with native save dialog
 - Auto-transition to Export view after pipeline completes
 - Reset button to clear the job and start a new reconstruction
@@ -139,7 +142,7 @@ Meshine Shop/
 ### Phase 2: Game-Ready Optimization
 - [x] 2a — Mesh decimation with quality presets
 - [x] 2b — Automatic UV unwrapping (xatlas)
-- [ ] 2c — Texture baking (albedo, normals, AO)
+- [x] 2c — Texture baking (albedo, normals, AO)
 - [ ] 2d — AI-driven PBR material estimation
 - [ ] 2e — .FBX and .glTF export with material definitions
 
@@ -206,14 +209,13 @@ poetry run python scripts/dev.py
 
 ## Known Limitations
 
-- **Exported models have no textures yet:** Meshes are exported with full UV coordinates (Phase 2b complete), but texture baking — projecting the source photo colors onto the UV map — is Phase 2c. The exported OBJ and glTF are correctly UV-mapped and ready to receive textures, but they render as untextured geometry until Phase 2c is implemented.
 - **COLMAP on macOS is sparse-only:** Apple Silicon uses Metal, not CUDA. Dense reconstruction is skipped; meshing proceeds from the sparse point cloud. On macOS, Apple Object Capture is strongly preferred and automatically selected.
 - **iPhone photos are HEIC internally:** Even when named `.JPEG`, iPhone photos are HEIC format. The app handles this automatically via Pillow + pillow-heif conversion.
 - **macOS-only testing so far:** Cross-platform support is architected in but Windows testing has not started.
 
 ## Future Improvements
 
-- PBR texture export from Object Capture's USDZ output (diffuse, normal, roughness, AO maps)
+- Roughness and metallic map baking (currently albedo/normal/AO only — roughness and metallic are present in Object Capture's USDZ but not yet extracted)
 - Plugin system for custom pipeline stages
 - Cloud processing offload for large datasets
 - Android companion app for LiDAR capture

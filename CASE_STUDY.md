@@ -143,7 +143,23 @@ All visual styling is defined in a single `styles.py` file using Qt Style Sheets
 
 **Lesson:** xatlas's output format (`vmapping`, `new_indices`, `uvs`) is a remapping, not a new mesh from scratch. Understanding that `vmapping[i]` gives the original vertex index for output vertex `i` makes the reconstruction straightforward — but the API documentation doesn't make this obvious.
 
-*More challenges will be documented as development progresses through Phases 2c–4.*
+### Challenge: Apple's USDZ archive has a non-obvious directory structure
+
+**Problem:** Apple Object Capture packages its reconstruction output as a USDZ file — a ZIP archive containing a `.usdc` geometry file and PNG texture images. The `mesh_reconstruct` stage extracts this archive to `workspace/mesh/usdz_extracted/`. During Phase 2c texture baking, `bake_albedo_from_usdz()` searched for the diffuse texture using `glob("*.png")` at the root of the extracted directory. This found nothing — because Object Capture places texture images in a numbered subdirectory inside the archive (`usdz_extracted/0/baked_mesh_*_tex0.png`), not at the archive root. The `.usdc` geometry file sits at the root, but the textures are one level deeper.
+
+**Solution:** Changed all texture searches in `bake_albedo_from_usdz()` from `glob()` to `rglob()` so the search recurses into subdirectories. Also added `"tex"` to the diffuse texture name pattern list — Apple names its diffuse map `*_tex0.png`, while the other PBR maps use `_ao0`, `_norm0`, `_roughness0` suffixes. Adding a non-diffuse exclusion filter (`_ao`, `_norm`, `_rough`, `_metal`, `_disp`) ensures the diffuse map is selected correctly even when the `rglob` finds all five texture types.
+
+**Lesson:** Archive extraction preserves internal directory structure. `usdz_extracted/` is not flat — it mirrors the archive's internal layout. Never assume extracted archives place all files at the top level; always use recursive search or inspect the archive structure first.
+
+### Challenge: OBJ format requires multiple files but users expected one
+
+**Problem:** After implementing Phase 2c texture baking, the OBJ export path correctly bundled the geometry, MTL material file, and three texture PNGs. But users were surprised to see five separate files appear in their destination folder instead of a single file. OBJ format is fundamentally multi-file — the geometry references an `.mtl` file which in turn references texture image paths — but this is not obvious if you're coming from GLB (which is self-contained binary).
+
+**Solution:** Changed the OBJ export path to create a named bundle folder (`dest_path.parent/dest_path.stem/`) and write all five files inside it: `mesh.obj`, `mesh.mtl`, `albedo.png`, `normal.png`, `ao.png`. The `export_mesh()` function now returns the actual output path — the bundle folder for OBJ, the file itself for GLB — so the success message can show the user exactly where to find their export. The Export view's success message now reads "Exported to: ~/Desktop/mesh/" (the folder) rather than pointing to a specific file that may contain a relative MTL reference.
+
+**Lesson:** File format choices have UX implications that aren't immediately obvious from the technical spec. When a format requires multiple files to function, the application should manage that complexity for the user rather than exposing it as scattered files in their destination folder.
+
+*More challenges will be documented as development progresses through Phases 2d–4.*
 
 ## Results and Impact
 
@@ -203,13 +219,23 @@ All visual styling is defined in a single `styles.py` file using Qt Style Sheets
 - Export view now sources from the UV-mapped OBJ instead of the raw PLY, so UV coordinates are present in all exported files (OBJ and glTF Binary)
 - Establishes the foundation for Phase 2c: the UV map defines how photo color data will be projected onto the mesh surface during texture baking
 
+### Phase 2c Complete — PBR Texture Baking
+- Three PBR texture maps baked onto the UV-mapped decimated mesh as pipeline stage 9
+- **Albedo**: color source differs by engine — Apple path extracts the diffuse PNG from the USDZ archive and transfers colors via Open3D KDTreeFlann nearest-neighbor lookup from original mesh vertices to decimated vertices; COLMAP path samples the colored dense or sparse point cloud. Both rasterize to a 2048×2048 RGB texture via UV-space barycentric scan-fill
+- **Normal map**: tangent-space normals computed from the mesh's own vertex normals — TBN matrix built per vertex from UV edge gradients (accumulated per face, Gram-Schmidt orthogonalized), world-space normals transformed to tangent space, encoded as RGB PNG
+- **AO**: Open3D `RaycastingScene` hemisphere ray casting — 64 cosine-weighted rays per vertex, all submitted in one batch call, `AO = 1 - mean(hits > 0)`. Runs on the C++ BVH with SIMD acceleration
+- All three maps written to `workspace/textures/albedo.png`, `normal.png`, `ao.png`
+- Export view shows which PBR maps are present before the user exports (Textures: Albedo, Normal, AO)
+- GLB exports embed all three textures as a `PBRMaterial` (self-contained, no external files); OBJ exports bundle the mesh + MTL + textures into a named subfolder
+- Non-fatal design: if baking fails at any step, the pipeline continues with untextured geometry rather than failing the entire job
+
 ## What I'd Improve
 
 *This section will be updated as development reveals areas for iteration.*
 
 - **Initial consideration:** Evaluate whether a hybrid approach (Rust core + Python bindings) would yield better performance for the compute-heavy pipeline stages, while maintaining the Python UI layer.
 - **Image conversion overhead:** Converting every image through Pillow adds processing time at ingest. A smarter approach would detect the actual format first (via file magic bytes) and only convert when necessary.
-- **Texture carry-over from USDZ:** Object Capture produces PBR textures (diffuse, normal, roughness, AO) inside its USDZ output, but the current PLY conversion extracts geometry only. Carrying those textures through to the final export would deliver fully textured models without the Phase 2 texture baking step.
+- **Roughness and metallic map extraction:** Object Capture produces roughness and metallic PBR maps inside its USDZ output (`*_roughness0.png`). These are present in the archive but not yet extracted during Phase 2c baking. Adding them to the export would complete the full PBR material set expected by game engines.
 - **COLMAP on macOS is still sparse-only:** Apple Object Capture solved the macOS quality problem, but COLMAP remains the only option on Windows. Ensuring COLMAP's CUDA path is thoroughly tested on Windows hardware is a priority before Phase 2.
 
 ## What This Proves
