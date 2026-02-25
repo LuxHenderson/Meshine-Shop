@@ -272,17 +272,22 @@ class MeshineShopApp(QMainWindow):
         """
         from pathlib import Path
 
+        from PySide6.QtWidgets import QMessageBox
+
         try:
             # Pass the workspace so the exporter can locate baked textures
             # (workspace/textures/albedo.png etc.) and embed them in the export.
             # export_mesh returns the actual output path — for GLB this is
-            # dest_path itself; for OBJ with textures it's the bundle folder.
+            # dest_path itself; for OBJ/FBX with textures it's the bundle folder.
             output_path = export_mesh(Path(source_mesh), Path(dest_path), self._workspace)
             self.main_content.export_view.set_export_success(str(output_path))
             self.statusBar().showMessage(f"Exported to: {output_path}")
         except Exception as e:
+            # Show the full error in an unmissable dialog as well as the
+            # inline feedback label. This makes export failures easy to debug.
             self.main_content.export_view.set_export_error(str(e))
             self.statusBar().showMessage(f"Export failed: {e}")
+            QMessageBox.critical(self, "Export Failed", str(e))
 
     def _reset_pipeline(self):
         """

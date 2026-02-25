@@ -91,7 +91,9 @@ QUALITY_PRESETS = {
 # Export format options presented to the user in the Export view.
 # Keys are human-readable labels; values are file extensions used by
 # trimesh to determine the output format.
+# FBX requires the Assimp system library (macOS: brew install assimp).
 EXPORT_FORMATS = {
-    "OBJ (.obj)": ".obj",
+    "OBJ (.obj)":         ".obj",
     "glTF Binary (.glb)": ".glb",
+    "FBX (.fbx)":         ".fbx",
 }

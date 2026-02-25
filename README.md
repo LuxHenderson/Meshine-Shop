@@ -18,11 +18,10 @@ Meshine Shop solves this by unifying the entire pipeline — from photo import (
 | Photogrammetry (Windows) | COLMAP (via pycolmap) | CUDA-accelerated dense reconstruction. Cross-platform fallback on all systems |
 | Swift CLI Bridge | Swift Package Manager | Wraps Apple's PhotogrammetrySession API — a Swift-only API that cannot be accessed via PyObjC |
 | USD Processing | usd-core (Pixar USD) | Reads Object Capture's USDZ output (geometry + PBR textures) for format conversion |
-| Mesh Processing | PyMeshLab, Open3D | Decimation, UV unwrapping, point cloud manipulation — all native Python |
+| Mesh Processing | Open3D | Decimation (QEM), point cloud manipulation, AO ray casting — MIT licensed, fully commercial-friendly |
 | UV Unwrapping | xatlas | Battle-tested automatic UV generation used in production pipelines |
-| AI/ML | PyTorch | PBR material estimation (roughness/metallic maps) via local inference |
 | 3D Viewport | Qt OpenGL widget + Open3D | GPU-accelerated rendering without browser overhead |
-| Export | trimesh, pygltflib | Native Python .glTF and .FBX writing |
+| Export | trimesh + Assimp CLI | OBJ/GLB via trimesh; FBX via the Assimp CLI (OBJ → FBX conversion) |
 | Mobile Companion | Swift + ARKit (iOS) | LiDAR live capture streaming to desktop (Phase 3) |
 | Streaming Protocol | WebSocket or gRPC | Real-time depth/RGB/pose data from phone to desktop |
 | Dependency Management | Poetry | Clean dependency resolution, virtual environments, and lock files |
@@ -77,7 +76,7 @@ Meshine Shop/
 
 ### Key Design Decisions
 
-**Python + PySide6 over Electron:** The entire computational backbone — COLMAP, PyTorch, PyMeshLab, Open3D — lives in Python. Electron would require constant IPC bridging between Node.js and Python, adding latency and failure points. PySide6 keeps everything in one process, one language, one ecosystem.
+**Python + PySide6 over Electron:** The entire computational backbone — COLMAP, Open3D, trimesh — lives in Python. Electron would require constant IPC bridging between Node.js and Python, adding latency and failure points. PySide6 keeps everything in one process, one language, one ecosystem.
 
 **Engine-agnostic pipeline:** The `ReconstructionEngine` ABC lets us swap photogrammetry engines without touching the UI, worker, or export code. Apple Object Capture on macOS and COLMAP on Windows both implement the same 8-stage interface. The engine factory picks the best one automatically at startup.
 
@@ -87,7 +86,7 @@ Meshine Shop/
 
 **Centralized QSS theming:** All visual styling lives in a single `styles.py` file rather than being scattered across widgets. This makes theme changes trivial and keeps UI code focused on layout and behavior.
 
-## Current Features (Phase 1 + Phase 2a–2c Complete)
+## Current Features (Phase 1 + Phase 2a–2e Complete)
 
 ### Reconstruction Engines
 - **Apple Object Capture** (macOS): Metal-accelerated reconstruction producing ~50K vertices with PBR textures (diffuse, normal, roughness, AO) via RealityKit's PhotogrammetrySession API
@@ -108,15 +107,19 @@ Meshine Shop/
 - Live processing queue with per-stage status indicators (pending / running / done / error)
 - Real-time progress messages in the queue and status bar
 - USDZ-to-PLY format conversion via Pixar USD library (for Object Capture output)
-- **Mesh decimation** (Phase 2a): PyMeshLab quadric edge collapse to Mobile (5K), PC (25K), or Cinematic (100K) triangle targets
+- **Mesh decimation** (Phase 2a): Open3D quadric error metrics (QEM) decimation to Mobile (5K), PC (25K), or Cinematic (100K) triangle targets — MIT licensed, production-safe
 - **UV unwrapping** (Phase 2b): xatlas automatic UV atlas generation — non-overlapping islands packed into [0,1]² space; output is OBJ with embedded UV coordinates
 - **Texture baking** (Phase 2c): three PBR maps baked onto the UV-mapped mesh — albedo (diffuse color from USDZ textures or COLMAP point cloud), tangent-space normal map (from mesh vertex normals), and ambient occlusion (hemisphere ray casting via Open3D). All three saved as 2048×2048 PNGs to workspace/textures/
+- **PBR material estimation** (Phase 2d): roughness and metallic maps derived from image-space HSV analysis of the baked albedo. Roughness: `specularity = V × (1 − S)`, blended with AO crevice factor. Metallic: soft threshold on desaturated high-value pixels. Both maps added to workspace/textures/ and included in all exports
 
 ### Export
-- Mesh export to OBJ (.obj) and glTF Binary (.glb) via trimesh
+- Mesh export to OBJ (.obj), glTF Binary (.glb), and FBX (.fbx)
 - Source mesh is the UV-mapped OBJ (Phase 2b output) — UV coordinates preserved in all exports
-- **Textured export** (Phase 2c): when baked textures are present, they are embedded in the export — GLB receives a self-contained PBR material (baseColorTexture, normalTexture, occlusionTexture); OBJ exports are bundled into a subfolder with the MTL and texture PNGs alongside the mesh file
-- Export view shows mesh stats and which PBR maps are available (Albedo, Normal, AO) before exporting
+- **Full PBR export** (Phase 2c–2d): all five maps (albedo, normal, AO, roughness, metallic) included when present
+  - **GLB**: all textures embedded as a self-contained PBR material per the glTF 2.0 spec — roughness and metallic packed into a single `metallicRoughnessTexture` (G=roughness, B=metallic)
+  - **OBJ**: bundle folder with `.obj`, `.mtl` (using `map_Pr`/`map_Pm` PBR extension directives), and all five PNG maps
+  - **FBX** (Phase 2e): bundle folder with `mesh.fbx` + all five PNG maps — textures delivered externally per Unreal Engine and Maya convention. Requires `assimp` CLI on PATH (`brew install assimp`)
+- Export view shows mesh stats and which PBR maps are available before exporting
 - Format selector dropdown with native save dialog
 - Auto-transition to Export view after pipeline completes
 - Reset button to clear the job and start a new reconstruction
@@ -143,8 +146,8 @@ Meshine Shop/
 - [x] 2a — Mesh decimation with quality presets
 - [x] 2b — Automatic UV unwrapping (xatlas)
 - [x] 2c — Texture baking (albedo, normals, AO)
-- [ ] 2d — AI-driven PBR material estimation
-- [ ] 2e — .FBX and .glTF export with material definitions
+- [x] 2d — PBR material estimation (roughness + metallic from image-space HSV analysis)
+- [x] 2e — FBX export with texture bundle (via Assimp CLI)
 
 ### Phase 3: LiDAR Live Capture
 - [ ] 3a — iOS companion app (ARKit + LiDAR)
@@ -177,6 +180,9 @@ brew install poetry
 
 # COLMAP is optional on macOS (Object Capture is preferred)
 brew install colmap
+
+# Assimp is required for FBX export
+brew install assimp
 
 # Build the Apple Object Capture CLI
 cd desktop/apple_photogrammetry
@@ -215,8 +221,8 @@ poetry run python scripts/dev.py
 
 ## Future Improvements
 
-- Roughness and metallic map baking (currently albedo/normal/AO only — roughness and metallic are present in Object Capture's USDZ but not yet extracted)
 - Plugin system for custom pipeline stages
 - Cloud processing offload for large datasets
 - Android companion app for LiDAR capture
 - Real-time collaborative scanning (multiple phones contributing to one reconstruction)
+- Performance optimization: Apple Object Capture detail level control, COLMAP sequential/vocab-tree matching for large datasets, image preprocessing (auto-resize inputs)

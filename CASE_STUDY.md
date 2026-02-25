@@ -19,7 +19,7 @@ Each tool has its own interface, its own file formats, its own quirks. Intermedi
 ## Constraints
 
 - **Solo developer.** Every architectural decision has to be practical for one person to build, maintain, and extend.
-- **No budget for commercial tools.** The entire stack is built on open-source technology — COLMAP, PyMeshLab, xatlas, PyTorch — to eliminate licensing costs and ensure the tool can be freely distributed.
+- **No budget for commercial tools.** The entire stack is built on open-source technology — COLMAP, Open3D, xatlas, trimesh — to eliminate licensing costs and ensure the tool can be freely distributed commercially.
 - **Cross-platform from day one.** The app must work on macOS and Windows without maintaining two separate codebases.
 - **Portfolio flagship.** This isn't a weekend project — it's designed to demonstrate full-stack systems thinking, from GPU-bound compute pipelines to polished UI/UX.
 
@@ -103,6 +103,24 @@ All visual styling is defined in a single `styles.py` file using Qt Style Sheets
 
 **Lesson:** "End-to-end" means end-to-end. A pipeline that produces output in an intermediate format isn't complete — it needs to deliver files in the formats the user's downstream tools actually consume.
 
+### Challenge: PyMeshLab is GPL — a commercial distribution blocker
+
+**Problem:** PyMeshLab (used for QEM decimation in Phase 2a) is licensed under GPL v3. GPL is a copyleft license: any software that uses a GPL library must itself be distributed under GPL. This is fine for open-source tools, but incompatible with the goal of eventually monetizing Meshine Shop. Identifying the licensing status of every dependency before building a commercial product is a requirement, not an afterthought.
+
+**Solution:** Swapped PyMeshLab out for Open3D (MIT licensed), which was already in the dependency stack for AO ray casting. Open3D's `mesh.simplify_quadric_decimation(target_faces)` uses the same QEM algorithm as PyMeshLab — the quality is identical and the API is cleaner. UV coordinates are not affected by the swap because UVs are generated after decimation (by xatlas in Phase 2b), not before. The removal dropped the only GPL dependency from the project; the entire stack is now MIT/BSD/Apache/LGPL, which is compatible with commercial distribution.
+
+**Lesson:** Dependency licensing is not a legal formality — it's a build constraint. GPL in any runtime dependency closes the commercial distribution path. Audit the full dependency tree against your intended licensing model before committing to a library, especially for libraries that do heavy lifting (mesh processing, image codecs, ML frameworks).
+
+### Challenge: pyassimp can't find the Assimp library on macOS
+
+**Problem:** Phase 2e required FBX export. trimesh has no native FBX exporter — calling `mesh.export("*.fbx")` raises a `ValueError`. The intended solution was `pyassimp`, Python bindings for the Assimp format conversion library. `brew install assimp` was run, `pyassimp` was added via Poetry, and `pyassimp.export(scene, path, 'fbx')` was called. Every attempt raised `AssimpError: assimp library not found`.
+
+The root cause: `pyassimp`'s library discovery code reads `additional_dirs` at module import time — hardcoded to `/usr/lib/`, `/usr/local/lib/`, and `LD_LIBRARY_PATH`. Homebrew on Apple Silicon installs to `/opt/homebrew/lib/`, which is not on this list and is not automatically added to `LD_LIBRARY_PATH`. The Python package couldn't load its own C backend even though the system library was correctly installed.
+
+**Solution:** Abandoned `pyassimp` entirely and replaced it with a `subprocess` call to the Assimp CLI tool. `brew install assimp` installs both the shared library and the `assimp` CLI binary at `/opt/homebrew/bin/assimp`. The FBX conversion pipeline became: trimesh → temp OBJ → `assimp export <in> <out>` → FBX binary → delete temp. `shutil.which("assimp")` locates the binary on PATH, and a `subprocess.run()` call handles the conversion. `pyassimp` was removed from `pyproject.toml` entirely.
+
+**Lesson:** Python bindings for system C/C++ libraries often have fragile dynamic library discovery. On macOS with Homebrew, assume the default search paths will not include `/opt/homebrew/lib/` unless you explicitly configure them. When a library ships a CLI tool alongside its Python bindings, the CLI is often the more reliable integration point — it handles its own library loading, doesn't require Python ctypes path manipulation, and produces the same output.
+
 ### Challenge: Apple's PhotogrammetrySession is Swift-only
 
 **Problem:** Apple's Object Capture API (`PhotogrammetrySession` in RealityKit) produces dramatically better results than COLMAP on macOS — ~50K vertices with PBR textures vs. ~5,800 sparse vertices. But the API is Swift-only. It cannot be accessed via PyObjC (which only bridges Objective-C), and there is no Python binding. The entire desktop app is Python + PySide6, so calling this API directly from the application was impossible.
@@ -159,7 +177,7 @@ All visual styling is defined in a single `styles.py` file using Qt Style Sheets
 
 **Lesson:** File format choices have UX implications that aren't immediately obvious from the technical spec. When a format requires multiple files to function, the application should manage that complexity for the user rather than exposing it as scattered files in their destination folder.
 
-*More challenges will be documented as development progresses through Phases 2d–4.*
+*More challenges will be documented as development progresses through Phase 3.*
 
 ## Results and Impact
 
@@ -229,14 +247,30 @@ All visual styling is defined in a single `styles.py` file using Qt Style Sheets
 - GLB exports embed all three textures as a `PBRMaterial` (self-contained, no external files); OBJ exports bundle the mesh + MTL + textures into a named subfolder
 - Non-fatal design: if baking fails at any step, the pipeline continues with untextured geometry rather than failing the entire job
 
+### Phase 2d Complete — PBR Material Estimation (Roughness + Metallic)
+- Two additional PBR maps derived from image-space analysis of the baked albedo — no additional geometry passes required
+- **Roughness**: `specularity = Value × (1 − Saturation)` in HSV space — bright, desaturated pixels are specular/glossy (low roughness); saturated or dark pixels are rough. Blended with AO crevice factor: crevices get a +15% roughness boost. Clamped to [0.2, 1.0] to prevent unphysical perfect-mirror values
+- **Metallic**: `score = (1 − S) × V` with a soft threshold at 0.7 (ramp to 1.0 at 0.9) — highly desaturated, high-value pixels are treated as metallic. Conservative threshold avoids false positives on light-colored diffuse surfaces; most surfaces will correctly produce near-zero metallic values
+- Both maps saved as grayscale 2048×2048 PNGs to `workspace/textures/roughness.png` and `metallic.png`
+- GLB: packed into a single `metallicRoughnessTexture` per the glTF 2.0 specification (G channel = roughness, B channel = metallic)
+- OBJ: `map_Pr` (roughness) and `map_Pm` (metallic) directives added to the MTL file — supported by Blender, Substance Painter, and most current game engine importers
+- Export view now shows all five maps: "Textures: Albedo, Normal, AO, Roughness, Metallic"
+
+### Phase 2e Complete — FBX Export
+- FBX added as a third export format alongside OBJ and GLB
+- Conversion pipeline: trimesh exports the UV-mapped mesh to a temporary OBJ → the Assimp CLI (`assimp export <in> <out>`) converts it to FBX binary → temp files deleted
+- Bundle folder output matches OBJ convention: `mesh/mesh.fbx` + all five texture PNGs in the same folder. Unreal Engine, Maya, and 3ds Max all expect FBX assets delivered this way — geometry in the FBX, textures assigned manually via the DCC tool's material editor
+- Requires `brew install assimp` (macOS) — the CLI tool is the integration point rather than the `pyassimp` Python bindings, which have fragile dynamic library discovery on macOS (see challenge above)
+- Graceful failure: if the `assimp` binary is not on PATH, a clear error dialog appears with installation instructions rather than a silent failure or crash
+
 ## What I'd Improve
 
 *This section will be updated as development reveals areas for iteration.*
 
-- **Initial consideration:** Evaluate whether a hybrid approach (Rust core + Python bindings) would yield better performance for the compute-heavy pipeline stages, while maintaining the Python UI layer.
 - **Image conversion overhead:** Converting every image through Pillow adds processing time at ingest. A smarter approach would detect the actual format first (via file magic bytes) and only convert when necessary.
-- **Roughness and metallic map extraction:** Object Capture produces roughness and metallic PBR maps inside its USDZ output (`*_roughness0.png`). These are present in the archive but not yet extracted during Phase 2c baking. Adding them to the export would complete the full PBR material set expected by game engines.
-- **COLMAP on macOS is still sparse-only:** Apple Object Capture solved the macOS quality problem, but COLMAP remains the only option on Windows. Ensuring COLMAP's CUDA path is thoroughly tested on Windows hardware is a priority before Phase 2.
+- **COLMAP on macOS is still sparse-only:** Apple Object Capture solved the macOS quality problem, but COLMAP remains the only option on Windows. Ensuring COLMAP's CUDA path is thoroughly tested on Windows hardware is a priority before Phase 3.
+- **Heuristic PBR maps vs. extracted maps:** Phase 2d derives roughness and metallic via image-space HSV analysis — fast and effective for v1.0. Apple Object Capture's USDZ output includes actual roughness and metallic PBR maps (`*_roughness0.png`, `*_metalness0.png`). Extracting these directly from the USDZ archive (as is already done for albedo in Phase 2c) would give ground-truth PBR values on macOS rather than estimates. This is a clear v1.1 target.
+- **Performance optimization for large datasets:** COLMAP sequential matching, Apple Object Capture detail level control, and image downscaling at ingest are all deferred to post-v1.0.
 
 ## What This Proves
 

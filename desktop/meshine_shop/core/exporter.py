@@ -12,6 +12,8 @@ Source mesh formats supported (all loaded via trimesh):
 Supported export formats:
     - OBJ (.obj)         — Universal format, widest compatibility
     - glTF Binary (.glb) — Modern standard, preferred by web and game engines
+    - FBX (.fbx)         — Autodesk format, primary for Unreal Engine and DCC tools
+                           Requires Assimp CLI on PATH: macOS: brew install assimp
 
 When Phase 2c + 2d texture baking has run, the workspace will contain up to
 five PBR maps in workspace/textures/. These are embedded into exports:
@@ -124,7 +126,7 @@ def export_mesh(source_mesh: Path, dest_path: Path, workspace=None) -> Path:
         ValueError: If the destination extension isn't a supported format.
         FileNotFoundError: If the source mesh doesn't exist.
     """
-    supported = {".obj", ".glb"}
+    supported = {".obj", ".glb", ".fbx"}
 
     if not source_mesh.exists():
         raise FileNotFoundError(f"Source mesh not found: {source_mesh}")
@@ -235,6 +237,16 @@ def export_mesh(source_mesh: Path, dest_path: Path, workspace=None) -> Path:
         # _export_obj_with_textures bundles them into a subfolder to keep the
         # user's destination directory tidy. Returns the bundle folder path.
         return _export_obj_with_textures(
+            mesh, dest_path,
+            albedo_path, normal_path, ao_path,
+            roughness_path, metallic_path,
+        )
+
+    elif extension == ".fbx":
+        # FBX export: geometry-only FBX (no embedded PBR material) bundled
+        # with texture PNGs. DCC tools and Unreal Engine expect textures
+        # delivered alongside the FBX and assigned via their own material editors.
+        return _export_fbx(
             mesh, dest_path,
             albedo_path, normal_path, ao_path,
             roughness_path, metallic_path,
@@ -368,4 +380,121 @@ def _export_obj_with_textures(mesh, dest_path, albedo_path, normal_path, ao_path
         pass
 
     # Return the bundle folder path so the app can display it in the success message.
+    return bundle_dir
+
+
+def _export_fbx(mesh, dest_path, albedo_path, normal_path, ao_path,
+                roughness_path=None, metallic_path=None) -> Path:
+    """
+    Export mesh as FBX and bundle texture files in a subfolder.
+
+    trimesh has no native FBX exporter. The conversion pipeline is:
+        1. Write mesh to a temporary OBJ (trimesh handles this natively).
+        2. Call the assimp CLI ('assimp export <in> <out>') to convert OBJ → FBX.
+        3. Delete the temp directory.
+
+    The assimp CLI is part of the standard assimp package:
+        macOS:   brew install assimp
+        Windows: download from https://github.com/assimp/assimp/releases
+                 and add the bin directory to PATH.
+
+    Textures are NOT embedded in the FBX binary — they are delivered as
+    separate PNGs in the bundle folder. This matches how Unreal Engine, Maya,
+    and 3ds Max expect FBX assets: geometry in the FBX, textures assigned
+    manually via the DCC tool's material editor.
+
+    Example output for ~/Desktop/mesh.fbx:
+        ~/Desktop/mesh/
+            mesh.fbx         — geometry with UV coordinates
+            albedo.png       — PBR base colour
+            normal.png       — tangent-space normal map
+            ao.png           — ambient occlusion
+            roughness.png    — surface roughness (Phase 2d)
+            metallic.png     — metallic mask (Phase 2d)
+
+    Args:
+        mesh:           trimesh.Trimesh to export.
+        dest_path:      Path the user chose (e.g. ~/Desktop/mesh.fbx).
+        albedo_path:    Path to albedo.png (or None).
+        normal_path:    Path to normal.png (or None).
+        ao_path:        Path to ao.png (or None).
+        roughness_path: Path to roughness.png (or None).
+        metallic_path:  Path to metallic.png (or None).
+
+    Returns:
+        Path — the bundle folder containing the FBX and texture files.
+
+    Raises:
+        RuntimeError: If the assimp CLI is not on PATH, or if conversion fails.
+    """
+    import subprocess
+    import tempfile
+
+    # Guard: the assimp CLI must be available on PATH.
+    # 'brew install assimp' on macOS installs both the shared library and the
+    # CLI tool. We use the CLI here because pyassimp's library discovery does
+    # not search Homebrew paths on macOS.
+    assimp_bin = shutil.which("assimp")
+    if not assimp_bin:
+        raise RuntimeError(
+            "FBX export requires the Assimp CLI tool ('assimp' on PATH).\n"
+            "macOS:   brew install assimp\n"
+            "Windows: download from https://github.com/assimp/assimp/releases\n"
+            "         and add the bin directory to your PATH."
+        )
+
+    # Create the bundle folder for the FBX and its texture companions.
+    stem = dest_path.stem
+    bundle_dir = dest_path.parent / stem
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+
+    actual_fbx = bundle_dir / dest_path.name
+
+    # Export geometry via trimesh → temp OBJ → assimp CLI → FBX binary.
+    #
+    # trimesh OBJ export preserves UV coordinates from Phase 2b (xatlas).
+    # assimp derives the output format from the .fbx extension automatically.
+    temp_dir = Path(tempfile.mkdtemp())
+    temp_obj = temp_dir / "temp_mesh.obj"
+    try:
+        # Step 1: write geometry to a temporary OBJ.
+        # trimesh may also write a companion .mtl — both land in temp_dir.
+        mesh.export(str(temp_obj))
+
+        # Step 2: invoke the assimp CLI to convert OBJ → FBX binary.
+        result = subprocess.run(
+            [assimp_bin, "export", str(temp_obj), str(actual_fbx)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        cli_output = result.stdout + result.stderr
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"assimp CLI failed (exit {result.returncode}).\n{cli_output}"
+            )
+        # Sanity-check: assimp may exit 0 yet still fail to write the file.
+        if not actual_fbx.exists():
+            raise RuntimeError(
+                f"assimp reported success but produced no output file.\n{cli_output}"
+            )
+    finally:
+        # Step 3: clean up the temp directory regardless of success or failure.
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+    # Copy all available PBR texture maps into the bundle folder.
+    # Users can drag the entire folder into Unreal Engine, Maya, or Blender
+    # and assign each map to the corresponding material slot.
+    texture_sources = [
+        (albedo_path,    "albedo.png"),
+        (normal_path,    "normal.png"),
+        (ao_path,        "ao.png"),
+        (roughness_path, "roughness.png"),
+        (metallic_path,  "metallic.png"),
+    ]
+    for src, name in texture_sources:
+        if src and Path(src).exists():
+            shutil.copy(src, bundle_dir / name)
+
+    # Return the bundle folder so the app can surface the path to the user.
     return bundle_dir
