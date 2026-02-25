@@ -13,15 +13,16 @@ Supported export formats:
     - OBJ (.obj)         — Universal format, widest compatibility
     - glTF Binary (.glb) — Modern standard, preferred by web and game engines
 
-When Phase 2c texture baking has run, the workspace will contain
-workspace/textures/albedo.png, normal.png, and ao.png. These are
-embedded into exports as follows:
-    - glTF Binary (.glb): textures are embedded directly in the .glb file as a
-      PBR material (baseColorTexture, normalTexture, occlusionTexture).
-      The file is self-contained — no external PNG files needed.
+When Phase 2c + 2d texture baking has run, the workspace will contain up to
+five PBR maps in workspace/textures/. These are embedded into exports:
+    - glTF Binary (.glb): all textures embedded as a PBR material — fully
+      self-contained, no external PNG files needed. Roughness and metallic are
+      packed into a single metallicRoughnessTexture (G=roughness, B=metallic)
+      per the glTF 2.0 specification.
     - OBJ (.obj): a bundle folder is created at dest_path.parent/dest_path.stem/,
-      containing the .obj, an .mtl file, and all texture PNGs. This keeps the
-      export self-contained in one place rather than scattering files.
+      containing the .obj, an .mtl file, and all available texture PNGs. The MTL
+      uses standard PBR extension directives (map_Pr, map_Pm) for roughness and
+      metallic so the bundle loads correctly in Blender and similar tools.
 
 Uses trimesh for format conversion and PBR material attachment.
 """
@@ -99,11 +100,13 @@ def export_mesh(source_mesh: Path, dest_path: Path, workspace=None) -> Path:
     are preserved in the export.
 
     If workspace is provided and workspace.textures/ contains baked textures
-    (albedo.png, normal.png, ao.png from Phase 2c), they are included:
-        - glTF Binary (.glb): textures embedded as PBR material — fully
-          self-contained, no separate PNG files needed.
-        - OBJ (.obj): all files (mesh.obj, mesh.mtl, albedo.png, normal.png,
-          ao.png) are written into a bundle folder at dest_path.parent/stem/.
+    (albedo.png, normal.png, ao.png, roughness.png, metallic.png), they are
+    included:
+        - glTF Binary (.glb): all textures embedded as PBR material. Roughness
+          and metallic are packed into metallicRoughnessTexture (G/B channels)
+          per glTF 2.0 spec. Fully self-contained, no separate PNG files needed.
+        - OBJ (.obj): all files written into a bundle folder at
+          dest_path.parent/stem/. MTL uses map_Pr/map_Pm for roughness/metallic.
 
     Args:
         source_mesh: Path to the pipeline's output mesh (OBJ or PLY).
@@ -138,15 +141,19 @@ def export_mesh(source_mesh: Path, dest_path: Path, workspace=None) -> Path:
     mesh = _load_trimesh(source_mesh, process=False)
 
     # --- Detect available baked textures ---
-    # Check whether Phase 2c produced texture files in the workspace.
+    # Check whether Phase 2c + 2d produced texture files in the workspace.
     albedo_path = None
     normal_path = None
     ao_path = None
+    roughness_path = None
+    metallic_path = None
 
     if workspace is not None:
-        albedo_candidate = workspace.textures / "albedo.png"
-        normal_candidate = workspace.textures / "normal.png"
-        ao_candidate = workspace.textures / "ao.png"
+        albedo_candidate   = workspace.textures / "albedo.png"
+        normal_candidate   = workspace.textures / "normal.png"
+        ao_candidate       = workspace.textures / "ao.png"
+        roughness_candidate = workspace.textures / "roughness.png"
+        metallic_candidate  = workspace.textures / "metallic.png"
 
         if albedo_candidate.exists():
             albedo_path = albedo_candidate
@@ -154,6 +161,10 @@ def export_mesh(source_mesh: Path, dest_path: Path, workspace=None) -> Path:
             normal_path = normal_candidate
         if ao_candidate.exists():
             ao_path = ao_candidate
+        if roughness_candidate.exists():
+            roughness_path = roughness_candidate
+        if metallic_candidate.exists():
+            metallic_path = metallic_candidate
 
     has_textures = albedo_path is not None or normal_path is not None
 
@@ -165,21 +176,38 @@ def export_mesh(source_mesh: Path, dest_path: Path, workspace=None) -> Path:
 
         # Load texture images as PIL Images.
         # PBRMaterial accepts PIL Images and handles encoding for glTF export.
-        albedo_img = Image.open(albedo_path) if albedo_path else None
-        normal_img = Image.open(normal_path) if normal_path else None
-        ao_img = Image.open(ao_path) if ao_path else None
+        albedo_img    = Image.open(albedo_path)    if albedo_path    else None
+        normal_img    = Image.open(normal_path)    if normal_path    else None
+        ao_img        = Image.open(ao_path)        if ao_path        else None
+        roughness_img = Image.open(roughness_path) if roughness_path else None
+        metallic_img  = Image.open(metallic_path)  if metallic_path  else None
 
         # Build a PBR material with the available textures.
         # PBRMaterial maps to glTF's pbrMetallicRoughness extension.
         material_kwargs = {}
+
         if albedo_img:
             material_kwargs["baseColorTexture"] = albedo_img
+
         if normal_img:
             material_kwargs["normalTexture"] = normal_img
+
         if ao_img:
             # glTF uses the R channel of occlusionTexture for AO.
             # Convert greyscale AO to RGB so trimesh encodes it correctly.
             material_kwargs["occlusionTexture"] = ao_img.convert("RGB")
+
+        if roughness_img or metallic_img:
+            # glTF 2.0 spec: metallicRoughnessTexture packs roughness in the
+            # G channel and metallic in the B channel of a single RGB image.
+            # Build the combined texture from the available greyscale maps.
+            ref_img = roughness_img if roughness_img else metallic_img
+            size = ref_img.size  # (width, height)
+            r_ch = Image.new("L", size, 0)   # R channel — unused (kept at 0)
+            g_ch = roughness_img.convert("L") if roughness_img else Image.new("L", size, 128)
+            b_ch = metallic_img.convert("L")  if metallic_img  else Image.new("L", size, 0)
+            mr_texture = Image.merge("RGB", (r_ch, g_ch, b_ch))
+            material_kwargs["metallicRoughnessTexture"] = mr_texture
 
         material = PBRMaterial(**material_kwargs)
 
@@ -206,13 +234,18 @@ def export_mesh(source_mesh: Path, dest_path: Path, workspace=None) -> Path:
         # OBJ export: the format requires multiple files (geometry + MTL + PNGs).
         # _export_obj_with_textures bundles them into a subfolder to keep the
         # user's destination directory tidy. Returns the bundle folder path.
-        return _export_obj_with_textures(mesh, dest_path, albedo_path, normal_path, ao_path)
+        return _export_obj_with_textures(
+            mesh, dest_path,
+            albedo_path, normal_path, ao_path,
+            roughness_path, metallic_path,
+        )
 
     # Should never be reached given the supported check above.
     return dest_path
 
 
-def _export_obj_with_textures(mesh, dest_path, albedo_path, normal_path, ao_path) -> Path:
+def _export_obj_with_textures(mesh, dest_path, albedo_path, normal_path, ao_path,
+                              roughness_path=None, metallic_path=None) -> Path:
     """
     Export mesh as OBJ and bundle the texture files + MTL in a subfolder.
 
@@ -227,16 +260,20 @@ def _export_obj_with_textures(mesh, dest_path, albedo_path, normal_path, ao_path
             albedo.png       — copied from workspace.textures/
             normal.png       — copied from workspace.textures/
             ao.png           — copied from workspace.textures/
+            roughness.png    — copied from workspace.textures/ (Phase 2d)
+            metallic.png     — copied from workspace.textures/ (Phase 2d)
 
     If no textures are available, the .obj is written directly to dest_path
     (single file, no subfolder needed).
 
     Args:
-        mesh:        trimesh.Trimesh to export.
-        dest_path:   Path the user chose (e.g. ~/Desktop/mesh.obj).
-        albedo_path: Path to albedo.png (or None).
-        normal_path: Path to normal.png (or None).
-        ao_path:     Path to ao.png (or None).
+        mesh:          trimesh.Trimesh to export.
+        dest_path:     Path the user chose (e.g. ~/Desktop/mesh.obj).
+        albedo_path:   Path to albedo.png (or None).
+        normal_path:   Path to normal.png (or None).
+        ao_path:       Path to ao.png (or None).
+        roughness_path: Path to roughness.png (or None).
+        metallic_path:  Path to metallic.png (or None).
 
     Returns:
         Path — bundle folder (if textures were written) or the OBJ file path.
@@ -250,6 +287,10 @@ def _export_obj_with_textures(mesh, dest_path, albedo_path, normal_path, ao_path
         texture_names["normal"] = "normal.png"
     if ao_path and ao_path.exists():
         texture_names["ao"] = "ao.png"
+    if roughness_path and roughness_path.exists():
+        texture_names["roughness"] = "roughness.png"
+    if metallic_path and metallic_path.exists():
+        texture_names["metallic"] = "metallic.png"
 
     if not texture_names:
         # No textures — write the OBJ directly to the user's chosen path.
@@ -271,15 +312,19 @@ def _export_obj_with_textures(mesh, dest_path, albedo_path, normal_path, ao_path
     # Copy texture images into the bundle folder.
     if albedo_path and albedo_path.exists():
         shutil.copy(albedo_path, bundle_dir / "albedo.png")
-
     if normal_path and normal_path.exists():
         shutil.copy(normal_path, bundle_dir / "normal.png")
-
     if ao_path and ao_path.exists():
         shutil.copy(ao_path, bundle_dir / "ao.png")
+    if roughness_path and roughness_path.exists():
+        shutil.copy(roughness_path, bundle_dir / "roughness.png")
+    if metallic_path and metallic_path.exists():
+        shutil.copy(metallic_path, bundle_dir / "metallic.png")
 
     # Write the MTL file referencing all available maps.
-    # Standard OBJ material format: map_Kd = diffuse, map_bump = normal, map_Ka = AO.
+    # Uses standard OBJ PBR extension directives supported by Blender and
+    # most game engine importers: map_Kd (diffuse), map_bump (normal),
+    # map_Ka (AO), map_Pr (roughness), map_Pm (metallic).
     with open(mtl_path, "w") as f:
         f.write("# Generated by Meshine Shop\n")
         f.write(f"newmtl {stem}_material\n")
@@ -294,6 +339,14 @@ def _export_obj_with_textures(mesh, dest_path, albedo_path, normal_path, ao_path
         if "ao" in texture_names:
             # map_Ka is ambient — the closest standard OBJ channel for AO.
             f.write(f"map_Ka {texture_names['ao']}\n")
+
+        if "roughness" in texture_names:
+            # map_Pr is the OBJ PBR extension roughness directive.
+            f.write(f"map_Pr {texture_names['roughness']}\n")
+
+        if "metallic" in texture_names:
+            # map_Pm is the OBJ PBR extension metallic directive.
+            f.write(f"map_Pm {texture_names['metallic']}\n")
 
     # Ensure the OBJ file references our MTL file.
     # trimesh may have already written a 'mtllib' line from its own material —

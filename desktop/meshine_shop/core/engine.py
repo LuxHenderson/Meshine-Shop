@@ -778,7 +778,7 @@ class ColmapEngine(ReconstructionEngine):
 
     def bake_textures(self, workspace, on_progress):
         """
-        Bake albedo, normal map, and AO textures from the COLMAP reconstruction.
+        Bake albedo, normal, AO, roughness, and metallic textures from COLMAP.
 
         Color source priority:
         1. workspace.dense/fused.ply — colored dense point cloud (requires CUDA)
@@ -789,9 +789,11 @@ class ColmapEngine(ReconstructionEngine):
         the decimated mesh by finding the nearest source point for each vertex.
 
         Output files written to workspace.textures/:
-            albedo.png — diffuse color from point cloud nearest-neighbour
-            normal.png — tangent-space normals from mesh vertex normals
-            ao.png     — ambient occlusion from Open3D hemisphere ray casting
+            albedo.png    — diffuse color from point cloud nearest-neighbour
+            normal.png    — tangent-space normals from mesh vertex normals
+            ao.png        — ambient occlusion from Open3D hemisphere ray casting
+            roughness.png — surface roughness estimated from albedo HSV + AO
+            metallic.png  — metallic/non-metallic estimated from albedo saturation
 
         Non-fatal: logs a warning and continues if baking fails at any step.
         Subsequent stages (export) will still work — the mesh just won't
@@ -803,6 +805,8 @@ class ColmapEngine(ReconstructionEngine):
             vertex_colors_to_texture,
             bake_normal_map,
             bake_ao,
+            bake_roughness_map,
+            bake_metallic_map,
         )
 
         uv_obj = workspace.mesh / "meshed_uv.obj"
@@ -883,6 +887,34 @@ class ColmapEngine(ReconstructionEngine):
             on_progress("AO map saved: ao.png")
         except Exception as e:
             on_progress(f"AO baking failed: {e}")
+
+        # --- Roughness: image-space HSV analysis of albedo + AO blend ---
+        # Requires albedo.png to exist — only runs if albedo baking succeeded.
+        albedo_path = workspace.textures / "albedo.png"
+        ao_path = workspace.textures / "ao.png"
+        if albedo_path.exists():
+            try:
+                on_progress("Estimating roughness map from albedo...")
+                bake_roughness_map(
+                    albedo_path,
+                    ao_path,
+                    workspace.textures / "roughness.png",
+                )
+                on_progress("Roughness map saved: roughness.png")
+            except Exception as e:
+                on_progress(f"Roughness estimation failed: {e}")
+
+        # --- Metallic: image-space saturation-based detection from albedo ---
+        if albedo_path.exists():
+            try:
+                on_progress("Estimating metallic map from albedo...")
+                bake_metallic_map(
+                    albedo_path,
+                    workspace.textures / "metallic.png",
+                )
+                on_progress("Metallic map saved: metallic.png")
+            except Exception as e:
+                on_progress(f"Metallic estimation failed: {e}")
 
         on_progress(
             "Texture baking complete. "

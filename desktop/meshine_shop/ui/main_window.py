@@ -385,7 +385,7 @@ class ExportView(QWidget):
         self._triangles_label.setText(f"Triangles: {mesh_info['triangles']:,}")
         self._filesize_label.setText(f"File size: {mesh_info['file_size_mb']} MB")
 
-        # Check which PBR texture maps were baked during Phase 2c.
+        # Check which PBR texture maps were baked during Phase 2c + 2d.
         # Report which maps are present so the user knows the export will
         # be textured (or untextured if baking failed/was skipped).
         if hasattr(workspace, "textures"):
@@ -396,6 +396,10 @@ class ExportView(QWidget):
                 baked_maps.append("Normal")
             if (workspace.textures / "ao.png").exists():
                 baked_maps.append("AO")
+            if (workspace.textures / "roughness.png").exists():
+                baked_maps.append("Roughness")
+            if (workspace.textures / "metallic.png").exists():
+                baked_maps.append("Metallic")
 
             if baked_maps:
                 self._textures_label.setText(

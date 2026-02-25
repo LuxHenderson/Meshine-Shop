@@ -542,7 +542,7 @@ class AppleObjectCaptureEngine(ReconstructionEngine):
 
     def bake_textures(self, workspace, on_progress):
         """
-        Bake albedo, normal map, and AO textures using the Object Capture USDZ.
+        Bake albedo, normal, AO, roughness, and metallic textures from USDZ.
 
         Apple Object Capture already produced a PBR-textured USDZ file during
         the reconstruction stage. The USDZ archive was extracted to
@@ -555,6 +555,8 @@ class AppleObjectCaptureEngine(ReconstructionEngine):
            at that vertex's UV position
         4. Rasterizes the transferred per-vertex colors to a 2048×2048 albedo
         5. Bakes normal map and AO from the decimated mesh geometry (same as COLMAP)
+        6. Estimates roughness from albedo HSV analysis + AO crevice blend
+        7. Estimates metallic map from albedo saturation (conservative threshold)
 
         Non-fatal: if USDZ extraction was not run or fails, baking is skipped
         with a warning and the pipeline continues with an untextured mesh.
@@ -564,6 +566,8 @@ class AppleObjectCaptureEngine(ReconstructionEngine):
             vertex_colors_to_texture,
             bake_normal_map,
             bake_ao,
+            bake_roughness_map,
+            bake_metallic_map,
         )
 
         uv_obj = workspace.mesh / "meshed_uv.obj"
@@ -630,6 +634,34 @@ class AppleObjectCaptureEngine(ReconstructionEngine):
             on_progress("AO map saved: ao.png")
         except Exception as e:
             on_progress(f"AO baking failed: {e}")
+
+        # --- Roughness: image-space HSV analysis of albedo + AO blend ---
+        # Requires albedo.png to exist — only runs if albedo baking succeeded.
+        albedo_path = workspace.textures / "albedo.png"
+        ao_path = workspace.textures / "ao.png"
+        if albedo_path.exists():
+            try:
+                on_progress("Estimating roughness map from albedo...")
+                bake_roughness_map(
+                    albedo_path,
+                    ao_path,
+                    workspace.textures / "roughness.png",
+                )
+                on_progress("Roughness map saved: roughness.png")
+            except Exception as e:
+                on_progress(f"Roughness estimation failed: {e}")
+
+        # --- Metallic: image-space saturation-based detection from albedo ---
+        if albedo_path.exists():
+            try:
+                on_progress("Estimating metallic map from albedo...")
+                bake_metallic_map(
+                    albedo_path,
+                    workspace.textures / "metallic.png",
+                )
+                on_progress("Metallic map saved: metallic.png")
+            except Exception as e:
+                on_progress(f"Metallic estimation failed: {e}")
 
         on_progress(
             "Texture baking complete. "
