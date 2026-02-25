@@ -615,10 +615,11 @@ class ColmapEngine(ReconstructionEngine):
         """
         Reduce mesh polygon count using quadric edge collapse decimation.
 
-        Uses PyMeshLab's simplification_quadric_edge_collapse_decimation —
-        the industry-standard algorithm for game asset optimization. If the
-        source mesh already has fewer triangles than the target, decimation
-        is skipped to avoid unnecessary processing or upscaling artifacts.
+        Uses Open3D's simplify_quadric_decimation — the same QEM algorithm
+        as PyMeshLab but MIT-licensed, commercial-friendly, and already a
+        core dependency for AO baking. If the source mesh already has fewer
+        triangles than the target, decimation is skipped to avoid unnecessary
+        processing or upscaling artifacts.
 
         The decimated mesh overwrites the original meshed.ply so the export
         pipeline always reads the final optimized version.
@@ -628,7 +629,7 @@ class ColmapEngine(ReconstructionEngine):
             on_progress:  Callback for status messages shown in the UI.
             target_faces: Target triangle count from the quality preset.
         """
-        import pymeshlab
+        import open3d as o3d
 
         mesh_path = workspace.mesh / "meshed.ply"
 
@@ -641,11 +642,11 @@ class ColmapEngine(ReconstructionEngine):
         on_progress("Loading mesh for decimation...")
 
         try:
-            ms = pymeshlab.MeshSet()
-            ms.load_new_mesh(str(mesh_path))
+            # Load the PLY mesh into Open3D.
+            mesh = o3d.io.read_triangle_mesh(str(mesh_path))
 
             # Get the current triangle count to decide if decimation is needed.
-            current_faces = ms.current_mesh().face_number()
+            current_faces = len(mesh.triangles)
 
             if current_faces <= target_faces:
                 on_progress(
@@ -658,19 +659,16 @@ class ColmapEngine(ReconstructionEngine):
                 f"Decimating from {current_faces:,} to {target_faces:,} triangles..."
             )
 
-            # Quadric edge collapse decimation — iteratively collapses edges
-            # with the lowest quadric error metric until the target face count
-            # is reached. This preserves geometric detail where it matters most.
-            ms.meshing_decimation_quadric_edge_collapse(
-                targetfacenum=target_faces,
-                preservenormal=True,
-            )
+            # Quadric error metrics decimation — iteratively collapses edges
+            # with the lowest quadric error until the target face count is
+            # reached. Preserves geometric detail where it matters most.
+            mesh = mesh.simplify_quadric_decimation(target_faces)
 
-            final_faces = ms.current_mesh().face_number()
-            final_verts = ms.current_mesh().vertex_number()
+            final_faces = len(mesh.triangles)
+            final_verts = len(mesh.vertices)
 
             # Overwrite the original mesh with the decimated version.
-            ms.save_current_mesh(str(mesh_path))
+            o3d.io.write_triangle_mesh(str(mesh_path), mesh)
 
             on_progress(
                 f"Decimation complete: {final_verts:,} vertices, "
