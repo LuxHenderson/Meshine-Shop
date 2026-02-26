@@ -267,13 +267,17 @@ class ColmapEngine(ReconstructionEngine):
     quality is lower but the pipeline still completes end-to-end.
     """
 
-    def __init__(self):
+    def __init__(self, texture_size: int = 2048):
         # Check for CUDA availability at construction time.
         # This determines whether we can run dense reconstruction.
         self._has_cuda = pycolmap.has_cuda
 
         # Locate the CLI binary for fallback operations.
         self._cli_path = _find_colmap_cli()
+
+        # Texture baking resolution — set by the engine factory based on
+        # the user's quality preset (Mobile→1024, PC→2048, Cinematic→4096).
+        self._texture_size = texture_size
 
     def ingest(self, image_paths: list[str], workspace, on_progress):
         """
@@ -642,6 +646,8 @@ class ColmapEngine(ReconstructionEngine):
         on_progress("Loading mesh for decimation...")
 
         try:
+            import numpy as np
+
             # Load the PLY mesh into Open3D.
             mesh = o3d.io.read_triangle_mesh(str(mesh_path))
 
@@ -655,6 +661,38 @@ class ColmapEngine(ReconstructionEngine):
                 )
                 return
 
+            # --- Remove isolated floating fragments ---
+            # COLMAP reconstruction often produces disconnected debris clouds
+            # (small triangle islands floating near the main model). These
+            # waste polygon budget, distort decimation quality, and produce
+            # ugly artifacts in the final mesh. cluster_connected_triangles
+            # finds all connected components; we keep only the largest one.
+            triangle_clusters, cluster_n_triangles, _ = (
+                mesh.cluster_connected_triangles()
+            )
+            if len(cluster_n_triangles) > 1:
+                triangle_clusters_np = np.asarray(triangle_clusters)
+                largest_cluster_idx = int(np.argmax(cluster_n_triangles))
+                triangles_to_remove = triangle_clusters_np != largest_cluster_idx
+                mesh.remove_triangles_by_mask(triangles_to_remove)
+                mesh.remove_unreferenced_vertices()
+                removed = int(triangles_to_remove.sum())
+                on_progress(
+                    f"Removed {removed:,} isolated triangles "
+                    f"({len(cluster_n_triangles) - 1} floating fragment(s))"
+                )
+
+            # --- Pre-decimation Laplacian smoothing ---
+            # Sparse point cloud reconstruction introduces high-frequency noise:
+            # jittery vertices, zipper-like edge artefacts, and surface roughness
+            # that QEM decimation then bakes in. Light Laplacian smoothing (5
+            # iterations) removes this noise while preserving large-scale geometry.
+            # Applying it before decimation means QEM sees a cleaner surface and
+            # produces far better results with the same polygon budget.
+            on_progress("Smoothing mesh to reduce reconstruction noise...")
+            mesh = mesh.filter_smooth_laplacian(number_of_iterations=5)
+
+            current_faces = len(mesh.triangles)
             on_progress(
                 f"Decimating from {current_faces:,} to {target_faces:,} triangles..."
             )
@@ -857,10 +895,13 @@ class ColmapEngine(ReconstructionEngine):
                     )
 
         # If we have vertex colors, rasterize them to a texture.
+        # texture_size scales with quality preset for finer detail at higher tiers.
         if vertex_colors is not None:
             try:
                 on_progress("Rasterizing albedo to texture (this may take a moment)...")
-                albedo_img = vertex_colors_to_texture(uvs, faces, vertex_colors)
+                albedo_img = vertex_colors_to_texture(
+                    uvs, faces, vertex_colors, image_size=self._texture_size
+                )
                 albedo_img.save(str(workspace.textures / "albedo.png"))
                 on_progress("Albedo texture saved: albedo.png")
             except Exception as e:
@@ -874,7 +915,7 @@ class ColmapEngine(ReconstructionEngine):
         # --- Normal map: always available from mesh vertex normals ---
         try:
             on_progress("Baking tangent-space normal map...")
-            normal_img = bake_normal_map(mesh)
+            normal_img = bake_normal_map(mesh, image_size=self._texture_size)
             normal_img.save(str(workspace.textures / "normal.png"))
             on_progress("Normal map saved: normal.png")
         except Exception as e:
@@ -882,7 +923,10 @@ class ColmapEngine(ReconstructionEngine):
 
         # --- AO: hemisphere ray casting via Open3D ---
         try:
-            ao_img = bake_ao(mesh, num_rays=64, on_progress=on_progress)
+            ao_img = bake_ao(
+                mesh, num_rays=64, on_progress=on_progress,
+                image_size=self._texture_size
+            )
             ao_img.save(str(workspace.textures / "ao.png"))
             on_progress("AO map saved: ao.png")
         except Exception as e:
@@ -899,6 +943,7 @@ class ColmapEngine(ReconstructionEngine):
                     albedo_path,
                     ao_path,
                     workspace.textures / "roughness.png",
+                    image_size=self._texture_size,
                 )
                 on_progress("Roughness map saved: roughness.png")
             except Exception as e:
@@ -911,6 +956,7 @@ class ColmapEngine(ReconstructionEngine):
                 bake_metallic_map(
                     albedo_path,
                     workspace.textures / "metallic.png",
+                    image_size=self._texture_size,
                 )
                 on_progress("Metallic map saved: metallic.png")
             except Exception as e:

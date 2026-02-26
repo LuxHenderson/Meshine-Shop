@@ -23,7 +23,8 @@ The pipeline follows the standard photogrammetry reconstruction sequence:
        baking (Phase 2c) and PBR material export to game engines.
     9. Texture Baking — Project reconstruction colors onto the UV-mapped
        mesh to produce diffuse (albedo), tangent-space normal map, and
-       ambient occlusion textures saved as 2048×2048 PNG files.
+       ambient occlusion textures. Resolution scales with quality preset:
+       Mobile → 1024×1024, PC → 2048×2048, Cinematic → 4096×4096.
 
 The stage constants defined here are used throughout the app to track
 progress, update the UI, and log output consistently.
@@ -82,10 +83,19 @@ STAGE_DISPLAY_NAMES = {
 # Quality presets for mesh decimation. Each preset maps to a target
 # triangle count appropriate for the target platform. The decimation
 # stage uses these to determine how aggressively to reduce the mesh.
+#
+# Budgets are set to preserve meaningful detail at each tier:
+#   Mobile  — 15K triangles: enough for detailed mobile assets while
+#             fitting within typical mobile draw-call budgets.
+#   PC      — 65K triangles: matches the polygon count of typical
+#             game-ready hero props in AAA PC titles.
+#   Cinematic — 200K triangles: near-full detail; suitable for
+#               cinematics, close-up stills, and game engine hero assets
+#               where frame-rate budget is generous.
 QUALITY_PRESETS = {
-    "Mobile (5K triangles)": 5_000,
-    "PC (25K triangles)": 25_000,
-    "Cinematic (100K triangles)": 100_000,
+    "Mobile (15K triangles)": 15_000,
+    "PC (65K triangles)": 65_000,
+    "Cinematic (200K triangles)": 200_000,
 }
 
 # Export format options presented to the user in the Export view.

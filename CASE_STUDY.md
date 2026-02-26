@@ -177,6 +177,23 @@ The root cause: `pyassimp`'s library discovery code reads `additional_dirs` at m
 
 **Lesson:** File format choices have UX implications that aren't immediately obvious from the technical spec. When a format requires multiple files to function, the application should manage that complexity for the user rather than exposing it as scattered files in their destination folder.
 
+### Challenge: Vertex-space texture sampling loses 99% of texture detail
+
+**Problem:** After implementing Phase 2c texture baking, the exported meshes had noticeably blurry, low-detail textures despite the source USDZ textures being sharp. The visual quality gap between Meshine Shop's output and what game artists expect was significant.
+
+Diagnosing the cause required understanding the full baking pipeline: the Phase 2c approach sampled the original USDZ texture at each decimated mesh vertex (~25K–200K points), then interpolated those per-vertex colors across the 2048×2048 output texture using barycentric scan-fill. With a PC preset mesh at 65K triangles and ~70K vertices, the output texture's 4,194,304 pixels were all interpolated from 70K samples — 98% of the original texture's per-texel variation was lost to this coarse sampling.
+
+**Solution:** Rewrote the entire albedo baking path (and extended it to all 5 PBR maps) to use texel-space projection (Phase 2g). Instead of sampling per-vertex and interpolating, the pipeline now:
+1. Rasterizes the output UV atlas to get a 3D world position at every filled texel (re-uses the existing barycentric rasterizer with 3D positions as the interpolated data)
+2. Gathers all filled texels as a (M, 3) array of 3D world positions (~2M points for a typical mesh)
+3. Runs a batch KD-tree query against the original 250K USDZ mesh vertices using scipy's parallel KDTree (`workers=-1`) — takes 5–30 seconds with all CPU cores
+4. Reads the original USDZ UV at each texel's nearest vertex and samples the source texture directly
+5. Writes the color to the output atlas at full 2048×2048 resolution
+
+The quality difference is the same as the difference between a 70K-sample texture and a 4M-sample texture. All five USDZ PBR maps are extracted and rebaked this way in a single pass (the KD-tree projection is computed once, shared for all maps).
+
+**Lesson:** Vertex-space interpolation for texture baking is fundamentally a different technique from texel-space sampling, and produces qualitatively inferior results no matter how fine the mesh is. If the goal is to preserve the full resolution of a high-quality source texture, you must sample per-texel, not per-vertex. The distinction matters most when the source texture has high-frequency detail that isn't correlated with mesh geometry — which is nearly always the case for photographic textures.
+
 *More challenges will be documented as development progresses through Phase 3.*
 
 ## Results and Impact
@@ -263,14 +280,49 @@ The root cause: `pyassimp`'s library discovery code reads `additional_dirs` at m
 - Requires `brew install assimp` (macOS) — the CLI tool is the integration point rather than the `pyassimp` Python bindings, which have fragile dynamic library discovery on macOS (see challenge above)
 - Graceful failure: if the `assimp` binary is not on PATH, a clear error dialog appears with installation instructions rather than a silent failure or crash
 
+### Phase 2f Complete — Mesh Geometry Quality
+- Polygon budgets raised to match real game asset standards: Mobile 5K→15K, PC 25K→65K, Cinematic 100K→200K. Previous budgets were too conservative — 25K triangles for PC removes 90% of the geometry from a ~250K Object Capture mesh, destroying fine surface detail
+- Pre-decimation Laplacian smoothing: 5 iterations for COLMAP (higher noise), 3 for Apple (cleaner source). Applied before QEM decimation so the edge-collapse algorithm sees clean surface boundaries rather than noise-driven micro-edges — produces dramatically better results at the same polygon count
+- Isolated fragment removal: connected component analysis (`cluster_connected_triangles`) before decimation identifies and removes floating debris islands (reconstruction artefacts from background geometry, specular reflections, or misregistered cameras). Keeps polygon budget focused on the main subject
+
+### Phase 2g Complete — Texel-Space PBR Baking (Biggest Quality Leap)
+- **Root cause of bad texture quality identified:** The Phase 2c vertex-space approach sampled the original USDZ texture at each of the ~25K–200K decimated vertex positions, then interpolated vertex colors across UV triangles. This lost ~99% of texture detail — the 4,194,304 pixels in a 2048×2048 output texture were all interpolated from a handful of vertex samples
+- **Texel-space projection implemented:** For each output texel (2048×2048 = 4M pixels), the 3D world-space position is computed via barycentric interpolation of the UV triangle's 3D vertices. A scipy parallel KDTree query (`workers=-1`, all CPU cores) finds the nearest vertex in the original 250K-vertex USDZ mesh for all filled texels in a single batch call. The original USDZ texture is sampled at that vertex's UV coordinates and written directly to the output atlas — recovering full photographic detail at every pixel
+- **All 5 USDZ PBR maps extracted and rebaked:** Apple Object Capture's USDZ archive contains `*_tex0.png` (albedo), `*_norm0.png` (normal), `*_ao0.png` (AO), `*_roughness0.png` (roughness), and `*_metalness0.png` (metallic). Previously only albedo was extracted (vertex-space), and normal/AO/roughness/metallic were computed from scratch via heuristics. All five maps are now rebaked at full texel-space resolution. Heuristic fallbacks remain for COLMAP and edge cases where USDZ map extraction fails
+- **Texture dilation (4px):** After UV island rasterization, pixels just outside island boundaries remain black. Game engine mipmapping blends these black pixels into visible dark seams. scipy's `distance_transform_edt` expands each island outward by 4 pixels using the nearest island color — seams disappear at all mip levels. Applied to all five PBR maps
+
+### Phase 2h Complete — Apple Object Capture Quality Control
+- Quality preset now controls the Apple Object Capture detail level, not just the decimation triangle target
+- Mobile preset → `reduced` detail (Apple produces ~25K source polygons, fast processing suitable for mobile iteration)
+- PC/Cinematic presets → `full` detail (Apple produces ~250K source polygons, maximum quality before decimation)
+- Engine factory (`create_best_engine()`) accepts `quality_preset` argument; `app.py` passes the user's selection through. Display name in status bar now shows the active detail level: "Apple Object Capture (full)"
+
+### Phase 2i Complete — Vertex Tangent Embedding (GLB Normal Map Fix)
+- **Root cause identified via glTF validator:** Running the exported GLB through the Khronos glTF Validator returned `MESH_PRIMITIVE_GENERATED_TANGENT_SPACE` — the material references a normal map (normalTexture) but the mesh primitive has no TANGENT vertex attribute. This is a spec violation that causes every viewer to guess at tangent generation using its own algorithm
+- **Why it matters:** Normal maps are encoded relative to a tangent-space coordinate frame (TBN matrix: Tangent, Bitangent, Normal). Without pre-computed tangents, every viewer independently derives them at runtime. three.js, Babylon.js, Blender, Unity, and Unreal all implement this derivation slightly differently — the same GLB file renders with correct surface detail in one viewer and flat/incorrectly lit in another
+- **Solution:** Added `_compute_vertex_tangents()` to `exporter.py` — a fully vectorized numpy implementation of the MikkTSpace-compatible UV partial derivatives algorithm. For each triangle: computes 3D tangent (T) and bitangent (B) from the ratio of 3D edge vectors to UV edge vectors; accumulates per-vertex via `np.add.at`; Gram-Schmidt orthogonalizes against vertex normal; encodes handedness as the w component (±1, where B = w × (N × T)). Result is a (N, 4) float32 TANGENT accessor embedded in the GLB, eliminating the validator warning and guaranteeing spec-compliant normal map rendering
+- All-numpy, fully vectorized: no Python loops over vertices or faces
+
+### Voronoi Mosaic Fix — BVH Surface Proximity + Barycentric UV Interpolation
+- **Root cause of the mosaic artifact:** User shared a screenshot showing the exported model covered in large flat-coloured polygon patches. The pattern followed mesh triangle boundaries exactly — a Voronoi-cell coloring effect. Diagnosed as the fundamental sampling algorithm in `bake_usdz_maps_texelspace`: the function did a nearest-*vertex* KD-tree lookup to determine each texel's source UV. Every texel whose closest USDZ vertex was V got V's averaged UV → same source pixel → the same flat colour filling V's entire Voronoi region. The higher the texture resolution, the more visible and objectionable the artifact became
+- **Why the vertex UV average was also wrong:** The USDZ mesh stores UVs as *face-varying* primvars — seam vertices have one UV per UV island they border (not one UV per vertex). Averaging those gives a UV that doesn't actually exist in the source texture atlas. This compounded the artifact
+- **Solution:** Replaced nearest-vertex KD-tree with trimesh BVH surface proximity + Cramér's-rule barycentric UV interpolation. For each output texel: (1) find the nearest point on the USDZ surface (not just nearest vertex) via `trimesh.proximity.ProximityQuery.on_surface()`; (2) compute barycentric coordinates of that surface point within its USDZ triangle using vectorised Cramér's rule; (3) interpolate the per-face-vertex USDZ UV at those barycentric weights; (4) sample the USDZ texture at the interpolated UV. Each texel now gets a unique, smoothly varying UV → photographic-quality albedo with no polygon boundary artifacts. Chunked 100K queries at a time for memory safety at 4096×4096
+- **UV decode also fixed:** Changed from per-vertex UV averaging to per-face UV arrays (F×3×2). Fast vectorised path for all-triangle meshes (numpy fancy indexing); slow fan-triangulation path for n-gon fallback
+
+### Phase 2j Complete — Preset-Scaled Texture Resolution (Skin Detail Fix)
+- **Root cause identified from user testing:** After Phase 2i produced a spec-compliant GLB, the user's feedback was "the skin of the model is not detailed — I feel like the actual detail of the model's skin could be far better." Shape and overall texture were in order; the issue was specifically fine surface microdetail
+- **Why it happened:** Texture resolution was hardcoded at 2048×2048 for all three quality presets. For a Cinematic export with 200K triangles, that gives approximately 20 texels per triangle on average — nowhere near enough to represent skin pores, fine wrinkles, or surface microstructure. Even with texel-space baking (Phase 2g) correctly recovering full photographic data from the original USDZ maps, the output atlas simply lacked enough pixels to represent fine detail
+- **The math:** 2048×2048 = 4,194,304 pixels ÷ 200,000 triangles ≈ 21 pixels per triangle. The UV atlas has significant empty space between islands, so many triangles in high-detail regions like skin have only a handful of texels. 4096×4096 = 16,777,216 pixels — 4× the density — bringing the average above 80 pixels per triangle and enabling sub-millimeter surface detail to be represented
+- **Solution:** Scaled the output texture resolution with the quality preset. Engine factory computes `texture_size` from the preset label (Mobile→1024, PC→2048, Cinematic→4096) and passes it to both `AppleObjectCaptureEngine` and `ColmapEngine` via constructor. Both engines store `self._texture_size` and pass `image_size=self._texture_size` to every baking function call — `bake_usdz_maps_texelspace()`, `vertex_colors_to_texture()`, `bake_normal_map()`, `bake_ao()`, `bake_roughness_map()`, and `bake_metallic_map()`
+- **No interface changes needed:** All `texture_baker.py` functions already accepted `image_size` as a keyword argument with `DEFAULT_TEXTURE_SIZE` as the default. The fix was purely in the engine layer — adding the preset-to-size mapping and wiring it through
+
 ## What I'd Improve
 
 *This section will be updated as development reveals areas for iteration.*
 
 - **Image conversion overhead:** Converting every image through Pillow adds processing time at ingest. A smarter approach would detect the actual format first (via file magic bytes) and only convert when necessary.
 - **COLMAP on macOS is still sparse-only:** Apple Object Capture solved the macOS quality problem, but COLMAP remains the only option on Windows. Ensuring COLMAP's CUDA path is thoroughly tested on Windows hardware is a priority before Phase 3.
-- **Heuristic PBR maps vs. extracted maps:** Phase 2d derives roughness and metallic via image-space HSV analysis — fast and effective for v1.0. Apple Object Capture's USDZ output includes actual roughness and metallic PBR maps (`*_roughness0.png`, `*_metalness0.png`). Extracting these directly from the USDZ archive (as is already done for albedo in Phase 2c) would give ground-truth PBR values on macOS rather than estimates. This is a clear v1.1 target.
-- **Performance optimization for large datasets:** COLMAP sequential matching, Apple Object Capture detail level control, and image downscaling at ingest are all deferred to post-v1.0.
+- **Performance optimization for large datasets:** COLMAP sequential matching and image downscaling at ingest are deferred to post-v1.0. The texel-space BVH proximity bake takes 30–120 seconds on large datasets at Cinematic resolution — a future optimization is to cache the face-ID and barycentric weights between runs on the same mesh/UV, since they're deterministic.
 
 ## What This Proves
 

@@ -20,7 +20,9 @@ five PBR maps in workspace/textures/. These are embedded into exports:
     - glTF Binary (.glb): all textures embedded as a PBR material — fully
       self-contained, no external PNG files needed. Roughness and metallic are
       packed into a single metallicRoughnessTexture (G=roughness, B=metallic)
-      per the glTF 2.0 specification.
+      per the glTF 2.0 specification. Vertex tangents (TANGENT attribute) are
+      pre-computed and embedded so all glTF viewers decode normal maps correctly
+      without runtime approximation. This is Phase 2i.
     - OBJ (.obj): a bundle folder is created at dest_path.parent/dest_path.stem/,
       containing the .obj, an .mtl file, and all available texture PNGs. The MTL
       uses standard PBR extension directives (map_Pr, map_Pm) for roughness and
@@ -32,7 +34,307 @@ Uses trimesh for format conversion and PBR material attachment.
 import shutil
 from pathlib import Path
 
+import numpy as np
 import trimesh
+
+
+# ---------------------------------------------------------------------------
+# Vertex tangent computation — Phase 2i
+# ---------------------------------------------------------------------------
+
+def _compute_vertex_tangents(mesh: trimesh.Trimesh) -> np.ndarray | None:
+    """
+    Compute per-vertex tangent vectors for correct normal map rendering in glTF.
+
+    The glTF 2.0 spec requires a TANGENT vertex attribute for any material that
+    uses a normal map (normalTexture). Without it, viewers must generate tangents
+    at runtime — but different implementations (three.js, Babylon.js, Blender,
+    Unity, Unreal) use slightly different tangent generation algorithms, causing
+    inconsistent and often incorrect normal map rendering.
+
+    Pre-computing tangents using the standard MikkTSpace-compatible algorithm
+    and embedding them in the GLB guarantees that every compliant viewer will
+    decode the normal map identically, no matter where the file is opened.
+
+    Algorithm — UV partial derivatives method:
+        For each triangle, the tangent T and bitangent B are the 3D vectors that
+        align with the U and V axes of the UV mapping respectively. They are
+        derived from the ratio of 3D edge vectors to UV edge vectors:
+
+            r = 1 / (dU1*dV2 - dU2*dV1)     # UV signed area reciprocal
+            T = (dV2 * edge1 - dV1 * edge2) * r
+            B = (dU1 * edge2 - dU2 * edge1) * r
+
+        Per-vertex tangents are the area-weighted sum of adjacent face tangents,
+        Gram-Schmidt orthogonalized against the vertex normal. The w component
+        encodes tangent basis handedness (±1), telling the shader which direction
+        to derive the bitangent: B = w * (N × T).
+
+    Args:
+        mesh: trimesh.Trimesh with UV coordinates in mesh.visual.uv.
+
+    Returns:
+        (N, 4) float32 array — (Tx, Ty, Tz, Tw) per vertex, or None if the mesh
+        has no UV coordinates or tangent computation fails.
+    """
+    # Guard: UV coordinates are required for tangent computation.
+    if not hasattr(mesh.visual, "uv") or mesh.visual.uv is None:
+        return None
+
+    uvs = np.array(mesh.visual.uv, dtype=np.float64)
+    vertices = np.array(mesh.vertices, dtype=np.float64)
+    faces = np.array(mesh.faces, dtype=np.int64)
+
+    # Guard: UV count must match vertex count for consistent indexing.
+    if len(uvs) != len(vertices) or len(faces) == 0:
+        return None
+
+    # Vertex normals are needed for Gram-Schmidt orthogonalization.
+    # trimesh auto-computes them from face normals if not stored explicitly.
+    normals = np.array(mesh.vertex_normals, dtype=np.float64)
+
+    n_verts = len(vertices)
+
+    # Accumulators for per-vertex tangent and bitangent sums.
+    # Using float64 throughout to avoid precision loss in the accumulation step.
+    tan1 = np.zeros((n_verts, 3), dtype=np.float64)  # tangent accumulator
+    tan2 = np.zeros((n_verts, 3), dtype=np.float64)  # bitangent accumulator
+
+    # --- Step 1: Compute per-triangle tangent and bitangent ---
+    # Index into vertex positions and UVs for all three corners at once.
+    v0 = vertices[faces[:, 0]]   # (F, 3)
+    v1 = vertices[faces[:, 1]]
+    v2 = vertices[faces[:, 2]]
+
+    uv0 = uvs[faces[:, 0]]      # (F, 2)
+    uv1 = uvs[faces[:, 1]]
+    uv2 = uvs[faces[:, 2]]
+
+    # 3D edge vectors along the triangle sides.
+    edge1 = v1 - v0              # (F, 3)
+    edge2 = v2 - v0
+
+    # UV edge vectors (differences in the texture domain).
+    duv1 = uv1 - uv0            # (F, 2)
+    duv2 = uv2 - uv0
+
+    # Denominator: signed area of the UV triangle.
+    # Non-zero only for non-degenerate UV triangles.
+    denom = duv1[:, 0] * duv2[:, 1] - duv2[:, 0] * duv1[:, 1]  # (F,)
+    valid = np.abs(denom) > 1e-8
+
+    # Safe reciprocal — degenerate triangles contribute zero tangent/bitangent.
+    r = np.where(valid, 1.0 / np.where(valid, denom, 1.0), 0.0)  # (F,)
+    r3 = r[:, np.newaxis]                                          # (F, 1)
+
+    # Per-face tangent: the 3D direction that aligns with the U axis of the UV.
+    tang  = (duv2[:, 1:2] * edge1 - duv1[:, 1:2] * edge2) * r3   # (F, 3)
+
+    # Per-face bitangent: the 3D direction that aligns with the V axis of the UV.
+    bitan = (duv1[:, 0:1] * edge2 - duv2[:, 0:1] * edge1) * r3   # (F, 3)
+
+    # --- Step 2: Accumulate per-triangle contributions into per-vertex sums ---
+    # Each vertex accumulates the tangent from all triangles that share it.
+    # np.add.at is the correct tool here (regular indexing doesn't accumulate).
+    np.add.at(tan1, faces[:, 0], tang)
+    np.add.at(tan1, faces[:, 1], tang)
+    np.add.at(tan1, faces[:, 2], tang)
+
+    np.add.at(tan2, faces[:, 0], bitan)
+    np.add.at(tan2, faces[:, 1], bitan)
+    np.add.at(tan2, faces[:, 2], bitan)
+
+    # --- Step 3: Gram-Schmidt orthogonalize tangent against vertex normal ---
+    # The accumulated tangent may not be perfectly perpendicular to the normal
+    # (due to UV seams and averaging). Gram-Schmidt projects the tangent onto
+    # the plane perpendicular to the normal, then normalizes.
+    dot = np.sum(normals * tan1, axis=1, keepdims=True)  # N·T per vertex
+    tangents = tan1 - normals * dot                       # T - N*(N·T)
+
+    norms = np.linalg.norm(tangents, axis=1, keepdims=True)  # |T|
+
+    # Normalize. For degenerate tangents (|T| ≈ 0), fall back to a stable
+    # perpendicular: prefer [1,0,0] unless the normal is nearly parallel to it,
+    # in which case use [0,1,0]. This keeps the tangent space well-formed.
+    degenerate = norms[:, 0] <= 1e-8
+    safe_norms = np.where(norms > 1e-8, norms, 1.0)
+    tangents = tangents / safe_norms
+
+    if degenerate.any():
+        # Compute a stable fallback for each degenerate vertex individually.
+        # Vectorized: pick [1,0,0] when N is not nearly parallel to X-axis,
+        # else use [0,1,0].
+        parallel_to_x = np.abs(normals[:, 0]) >= 0.9
+        fallback = np.where(
+            parallel_to_x[:, np.newaxis],
+            np.array([[0.0, 1.0, 0.0]]),
+            np.array([[1.0, 0.0, 0.0]]),
+        )
+        dot_fb = np.sum(normals * fallback, axis=1, keepdims=True)
+        fb_tang = fallback - normals * dot_fb
+        fb_norm = np.linalg.norm(fb_tang, axis=1, keepdims=True)
+        fb_safe = np.where(fb_norm > 1e-8, fb_norm, 1.0)
+        fb_tang = fb_tang / fb_safe
+        tangents[degenerate] = fb_tang[degenerate]
+
+    # --- Step 4: Compute handedness (w component) ---
+    # w = sign(N × T · B): +1 if the tangent-bitangent-normal basis is
+    # right-handed, -1 if it's mirrored (common at UV seams and flipped UVs).
+    # The shader uses: B = w * (N × T)  — so w must be preserved in the export.
+    cross = np.cross(normals, tangents)               # N × T
+    handedness = np.sign(np.sum(cross * tan2, axis=1))
+    handedness = np.where(handedness == 0, 1.0, handedness)  # default +1
+
+    # Pack tangent (xyz) + handedness (w) into the required (N, 4) layout.
+    result = np.concatenate(
+        [tangents, handedness[:, np.newaxis]], axis=1
+    )
+
+    return result.astype(np.float32)
+
+
+def _fix_glb_tangent_attribute(glb_path: Path) -> None:
+    """
+    Post-process a GLB file to fix two trimesh output issues in one JSON pass.
+
+    Fix 1 — TANGENT attribute name:
+        trimesh prefixes all vertex_attributes entries with '_' (treating them
+        as application-specific custom attributes per glTF spec). TANGENT is a
+        standard glTF 2.0 attribute and must NOT have the underscore prefix —
+        viewers look for exactly 'TANGENT', not '_TANGENT'.
+        Without this: MESH_PRIMITIVE_GENERATED_TANGENT_SPACE warning.
+        With this: viewers use the embedded tangents for correct normal maps.
+
+    Fix 2 — bufferView.target missing:
+        trimesh omits the optional 'target' field on glTF bufferViews.
+        The glTF spec recommends setting it so the GPU driver knows the intended
+        use before any mesh is instantiated:
+            34962 (GL_ARRAY_BUFFER)         — vertex attribute data
+            34963 (GL_ELEMENT_ARRAY_BUFFER) — index data
+        Without this: BUFFER_VIEW_TARGET_MISSING hints from the validator.
+        With this: the file passes the validator hint-free.
+
+    GLB format (glTF 2.0 spec §5.1):
+        Bytes 0–11:    header (magic "glTF", version=2, total_length)
+        Bytes 12+:     JSON chunk (4-byte length, 4-byte type "JSON", data)
+        After JSON:    BIN  chunk (4-byte length, 4-byte type "BIN\\0", data)
+
+    JSON data is padded to 4-byte boundary with trailing spaces (0x20).
+    The chunk length field includes the padding. BIN chunk is never touched.
+
+    Args:
+        glb_path: Path to the GLB file to fix (modified in-place).
+    """
+    import json
+    import struct
+
+    with open(glb_path, "rb") as f:
+        data = bytearray(f.read())
+
+    # Validate GLB magic and version.
+    if len(data) < 20 or data[:4] != b"glTF":
+        return  # Not a GLB, skip silently.
+
+    version = struct.unpack_from("<I", data, 4)[0]
+    if version != 2:
+        return  # Only glTF 2.0 is supported.
+
+    # JSON chunk starts at byte 12.
+    json_chunk_length = struct.unpack_from("<I", data, 12)[0]  # incl. padding
+    json_chunk_type = data[16:20]
+
+    if json_chunk_type != b"JSON":
+        return  # Unexpected chunk order, don't touch the file.
+
+    # Extract and parse JSON (strip trailing space/null padding first).
+    json_raw = data[20 : 20 + json_chunk_length]
+    json_str = json_raw.rstrip(b" ").rstrip(b"\x00").decode("utf-8")
+
+    try:
+        gltf = json.loads(json_str)
+    except json.JSONDecodeError:
+        return  # Malformed JSON, don't touch the file.
+
+    modified = False
+
+    # --- Fix 1: rename '_TANGENT' → 'TANGENT' in mesh primitive attributes ---
+    for mesh in gltf.get("meshes", []):
+        for prim in mesh.get("primitives", []):
+            attrs = prim.get("attributes", {})
+            if "_TANGENT" in attrs:
+                # Preserve the accessor index — only the key name changes.
+                # The binary vertex data is unaffected.
+                attrs["TANGENT"] = attrs.pop("_TANGENT")
+                modified = True
+
+    # --- Fix 2: add bufferView.target for vertex and index buffer views ---
+    # Build a mapping: bufferView index → intended GL target constant.
+    # We walk every mesh primitive to find which accessors are used as
+    # indices (target=34963) and which are used as vertex attributes (34962).
+    # An accessor's bufferView gets the target implied by its first reference
+    # (a bufferView should be used for only one purpose).
+    GL_ARRAY_BUFFER         = 34962  # vertex attribute data
+    GL_ELEMENT_ARRAY_BUFFER = 34963  # index / element data
+
+    bv_targets: dict[int, int] = {}  # bufferView index → GL target
+
+    accessors = gltf.get("accessors", [])
+
+    for mesh in gltf.get("meshes", []):
+        for prim in mesh.get("primitives", []):
+            # Indices accessor → element buffer
+            idx_accessor = prim.get("indices")
+            if idx_accessor is not None and idx_accessor < len(accessors):
+                bv = accessors[idx_accessor].get("bufferView")
+                if bv is not None:
+                    bv_targets[bv] = GL_ELEMENT_ARRAY_BUFFER
+
+            # Attribute accessors → vertex array buffer
+            for accessor_idx in prim.get("attributes", {}).values():
+                if accessor_idx < len(accessors):
+                    bv = accessors[accessor_idx].get("bufferView")
+                    if bv is not None and bv not in bv_targets:
+                        # Don't overwrite index target if somehow shared
+                        bv_targets[bv] = GL_ARRAY_BUFFER
+
+    # Write the target values into each bufferView that needs one.
+    buffer_views = gltf.get("bufferViews", [])
+    for bv_idx, target in bv_targets.items():
+        if bv_idx < len(buffer_views):
+            if "target" not in buffer_views[bv_idx]:
+                buffer_views[bv_idx]["target"] = target
+                modified = True
+
+    if not modified:
+        return  # Nothing changed — no need to rewrite the file.
+
+    # Re-serialize the JSON (compact — no extra whitespace).
+    new_json_bytes = json.dumps(gltf, separators=(",", ":")).encode("utf-8")
+
+    # Pad to 4-byte boundary with ASCII spaces per glTF spec §5.1.
+    pad_needed = (-len(new_json_bytes)) % 4
+    new_json_padded = new_json_bytes + b" " * pad_needed
+    new_json_chunk_length = len(new_json_padded)
+
+    # The BIN chunk starts immediately after the original JSON chunk.
+    bin_chunk_start = 20 + json_chunk_length
+    bin_chunk = bytes(data[bin_chunk_start:])  # Unchanged.
+
+    # New total length: header(12) + JSON chunk header(8) + JSON + BIN.
+    new_total = 12 + 8 + new_json_chunk_length + len(bin_chunk)
+
+    # Reconstruct the GLB binary with the patched JSON.
+    new_data = bytearray()
+    new_data += b"glTF"                                     # magic
+    new_data += struct.pack("<I", 2)                        # version = 2
+    new_data += struct.pack("<I", new_total)                # total length
+    new_data += struct.pack("<I", new_json_chunk_length)    # JSON chunk length
+    new_data += b"JSON"                                     # JSON chunk type
+    new_data += new_json_padded                             # updated JSON
+    new_data += bin_chunk                                   # BIN chunk (intact)
+
+    with open(glb_path, "wb") as f:
+        f.write(new_data)
 
 
 def _load_trimesh(source_mesh: Path, **kwargs) -> trimesh.Trimesh:
@@ -227,9 +529,37 @@ def export_mesh(source_mesh: Path, dest_path: Path, workspace=None) -> Path:
 
     # --- Export to the chosen format ---
     if extension == ".glb":
+        # Pre-compute and embed vertex tangents when a normal map is present.
+        #
+        # glTF 2.0 spec §3.9.3: if a material uses normalTexture, the mesh
+        # primitive MUST supply a TANGENT vertex attribute, or viewers must
+        # generate tangents at runtime using an implementation-defined method.
+        # Runtime tangent generation differs between three.js, Babylon.js,
+        # Blender, Unity, and Unreal — causing inconsistent normal map rendering.
+        # Pre-embedding ensures every viewer produces the same correct result.
+        #
+        # We only compute tangents when we have a normal map (the only texture
+        # that uses the tangent space). Meshes without normal maps are unaffected.
+        if has_textures and normal_img is not None:
+            tangents = _compute_vertex_tangents(mesh)
+            if tangents is not None:
+                # TANGENT is the standard glTF attribute name (uppercase).
+                # trimesh's GLTF exporter includes vertex_attributes entries
+                # as mesh primitive attributes, so this will appear in the file
+                # as the required TANGENT accessor.
+                mesh.vertex_attributes["TANGENT"] = tangents
+
         # glTF Binary: trimesh serialises the entire mesh + materials + textures
         # into a single self-contained binary file. No separate PNGs needed.
         mesh.export(str(dest_path))
+
+        # Post-process: rename '_TANGENT' → 'TANGENT' in the GLB JSON header.
+        # trimesh prefixes all vertex_attributes with '_' (correct for custom
+        # attributes), but TANGENT is a standard glTF attribute that must NOT
+        # have the underscore. This binary patch fixes the key in the JSON chunk
+        # without touching the vertex data — the bytes are already correct.
+        _fix_glb_tangent_attribute(dest_path)
+
         return dest_path
 
     elif extension == ".obj":

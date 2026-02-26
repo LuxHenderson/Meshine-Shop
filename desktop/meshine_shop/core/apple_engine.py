@@ -134,19 +134,28 @@ class AppleObjectCaptureEngine(ReconstructionEngine):
     lightweight Swift CLI subprocess that outputs JSON progress lines.
     """
 
-    def __init__(self, detail: str = "full"):
+    def __init__(self, detail: str = "full", texture_size: int = 2048):
         """
         Initialize the Apple Object Capture engine.
 
         Args:
-            detail: Quality level for reconstruction. One of:
-                    preview  (~25K polys, fast validation)
-                    reduced  (~25K polys, with textures)
-                    medium   (~100K polys, good for AR)
-                    full     (~250K polys, game-ready — default)
-                    raw      (~30M polys, professional post-production)
+            detail:       Quality level for reconstruction. One of:
+                          preview  (~25K polys, fast validation)
+                          reduced  (~25K polys, with textures)
+                          medium   (~100K polys, good for AR)
+                          full     (~250K polys, game-ready — default)
+                          raw      (~30M polys, professional post-production)
+            texture_size: Output texture resolution in pixels (square).
+                          Passed from engine_factory based on quality preset:
+                          Mobile → 1024, PC → 2048, Cinematic → 4096.
+                          Higher resolution recovers more detail from the
+                          original Object Capture PBR texture maps.
         """
         self._detail = detail
+
+        # Texture baking resolution — set by the engine factory based on
+        # the user's quality preset. Higher presets get larger maps.
+        self._texture_size = texture_size
 
         # Locate the Swift CLI binary. If it's not found, the engine
         # shouldn't have been selected by the factory — but we handle
@@ -419,6 +428,8 @@ class AppleObjectCaptureEngine(ReconstructionEngine):
         on_progress("Loading mesh for decimation...")
 
         try:
+            import numpy as np
+
             # Load the PLY mesh into Open3D.
             mesh = o3d.io.read_triangle_mesh(str(mesh_path))
 
@@ -432,6 +443,38 @@ class AppleObjectCaptureEngine(ReconstructionEngine):
                 )
                 return
 
+            # --- Remove isolated floating fragments ---
+            # Object Capture occasionally produces small disconnected mesh
+            # islands (reconstruction artefacts from background geometry or
+            # highlight reflections). Removing all but the largest connected
+            # component keeps the polygon budget focused on the main subject.
+            triangle_clusters, cluster_n_triangles, _ = (
+                mesh.cluster_connected_triangles()
+            )
+            if len(cluster_n_triangles) > 1:
+                triangle_clusters_np = np.asarray(triangle_clusters)
+                largest_cluster_idx = int(np.argmax(cluster_n_triangles))
+                triangles_to_remove = triangle_clusters_np != largest_cluster_idx
+                mesh.remove_triangles_by_mask(triangles_to_remove)
+                mesh.remove_unreferenced_vertices()
+                removed = int(triangles_to_remove.sum())
+                on_progress(
+                    f"Removed {removed:,} isolated triangles "
+                    f"({len(cluster_n_triangles) - 1} floating fragment(s))"
+                )
+
+            # --- Pre-decimation Laplacian smoothing ---
+            # Object Capture meshes are high quality but still carry photometric
+            # noise: slight vertex jitter from texture reprojection and surface
+            # roughness from material specularity. Smoothing before decimation
+            # ensures QEM collapses edges along clean geometric boundaries
+            # rather than noise-driven micro-edges, producing better results at
+            # the same polygon count. 3 iterations is lighter than the COLMAP
+            # path because Object Capture output is already much cleaner.
+            on_progress("Smoothing mesh to reduce surface noise...")
+            mesh = mesh.filter_smooth_laplacian(number_of_iterations=3)
+
+            current_faces = len(mesh.triangles)
             on_progress(
                 f"Decimating from {current_faces:,} to {target_faces:,} triangles..."
             )
@@ -542,26 +585,30 @@ class AppleObjectCaptureEngine(ReconstructionEngine):
 
     def bake_textures(self, workspace, on_progress):
         """
-        Bake albedo, normal, AO, roughness, and metallic textures from USDZ.
+        Bake all five PBR textures from the Object Capture USDZ output.
 
-        Apple Object Capture already produced a PBR-textured USDZ file during
-        the reconstruction stage. The USDZ archive was extracted to
-        workspace/mesh/usdz_extracted/ during mesh_reconstruct(). This stage:
+        Phase 2g upgrade — texel-space projection:
+        Uses bake_usdz_maps_texelspace() to extract all 5 PBR maps (albedo,
+        normal, AO, roughness, metallic) from the original USDZ archive and
+        rebake them onto the decimated mesh's UV atlas at texel-space resolution.
 
-        1. Finds the diffuse texture image in that extraction directory
-        2. Loads the original full-resolution USD mesh with its UV coordinates
-        3. For each vertex in the decimated mesh, finds the nearest original
-           vertex (via Open3D KDTreeFlann) and samples the diffuse texture
-           at that vertex's UV position
-        4. Rasterizes the transferred per-vertex colors to a 2048×2048 albedo
-        5. Bakes normal map and AO from the decimated mesh geometry (same as COLMAP)
-        6. Estimates roughness from albedo HSV analysis + AO crevice blend
-        7. Estimates metallic map from albedo saturation (conservative threshold)
+        Instead of sampling at each of the ~65K–200K decimated vertex positions
+        (vertex-space, Phase 2c approach), this method samples at every output
+        texel (~4M pixels), recovering the full detail of the original Object
+        Capture textures. The projection is done once and reused for all 5 maps.
 
-        Non-fatal: if USDZ extraction was not run or fails, baking is skipped
-        with a warning and the pipeline continues with an untextured mesh.
+        Graceful fallback for each map:
+            albedo   → vertex-space USDZ transfer (bake_albedo_from_usdz)
+            normal   → computed from decimated mesh vertex normals
+            ao       → Open3D hemisphere ray casting
+            roughness → HSV analysis of albedo + AO crevice blend
+            metallic  → HSV saturation threshold on albedo
+
+        Non-fatal: logs a warning and continues if any step fails. The pipeline
+        still exports with whatever maps were successfully baked.
         """
         from meshine_shop.core.texture_baker import (
+            bake_usdz_maps_texelspace,
             bake_albedo_from_usdz,
             vertex_colors_to_texture,
             bake_normal_map,
@@ -569,6 +616,7 @@ class AppleObjectCaptureEngine(ReconstructionEngine):
             bake_roughness_map,
             bake_metallic_map,
         )
+        import numpy as np
 
         uv_obj = workspace.mesh / "meshed_uv.obj"
         if not uv_obj.exists():
@@ -578,7 +626,7 @@ class AppleObjectCaptureEngine(ReconstructionEngine):
             )
             return
 
-        # Load the UV-mapped decimated mesh.
+        # Load the UV-mapped decimated mesh — target for all baking operations.
         on_progress("Loading UV-mapped mesh for texture baking...")
         try:
             mesh = trimesh.load(str(uv_obj), process=False)
@@ -590,80 +638,127 @@ class AppleObjectCaptureEngine(ReconstructionEngine):
             on_progress("Texture baking skipped: mesh has no UV coordinates")
             return
 
-        import numpy as np
         uvs = np.array(mesh.visual.uv, dtype=np.float32)
         faces = np.array(mesh.faces, dtype=np.int32)
-
-        # --- Albedo: extract from Object Capture's USDZ textures ---
-        # The USDZ was extracted during mesh_reconstruct() to this directory.
         usdz_extract_dir = workspace.mesh / "usdz_extracted"
 
+        # ----------------------------------------------------------------
+        # Primary path: texel-space projection from all 5 USDZ PBR maps.
+        # Samples at every output texel for full photographic detail.
+        # texture_size scales with quality preset (Mobile→1024, PC→2048,
+        # Cinematic→4096) so Cinematic exports get 4× more texel density.
+        # ----------------------------------------------------------------
+        baked_maps = {}
         if usdz_extract_dir.exists():
-            on_progress("Transferring USDZ diffuse texture to decimated mesh...")
-            vertex_colors = bake_albedo_from_usdz(
-                mesh, usdz_extract_dir, on_progress
+            on_progress(
+                f"Starting texel-space PBR bake from USDZ source maps "
+                f"at {self._texture_size}×{self._texture_size} "
+                f"(this may take 30–120 seconds)..."
             )
+            try:
+                baked_maps = bake_usdz_maps_texelspace(
+                    mesh,
+                    usdz_extract_dir,
+                    workspace.textures,
+                    on_progress,
+                    image_size=self._texture_size,
+                )
+            except Exception as e:
+                on_progress(f"Texel-space bake failed: {e} — using fallbacks")
         else:
             on_progress(
-                "USDZ extraction directory not found — albedo baking skipped."
+                "USDZ extraction directory not found — using fallback baking"
             )
-            vertex_colors = None
 
-        if vertex_colors is not None:
+        # ----------------------------------------------------------------
+        # Fallback: albedo — vertex-space USDZ transfer (legacy Phase 2c method)
+        # Used only if texel-space bake didn't produce an albedo map.
+        # ----------------------------------------------------------------
+        if "albedo" not in baked_maps and usdz_extract_dir.exists():
+            on_progress("Using vertex-space fallback for albedo...")
             try:
-                on_progress("Rasterizing albedo to texture (this may take a moment)...")
-                albedo_img = vertex_colors_to_texture(uvs, faces, vertex_colors)
-                albedo_img.save(str(workspace.textures / "albedo.png"))
-                on_progress("Albedo texture saved: albedo.png")
+                vertex_colors = bake_albedo_from_usdz(
+                    mesh, usdz_extract_dir, on_progress
+                )
+                if vertex_colors is not None:
+                    on_progress("Rasterizing fallback albedo to texture...")
+                    albedo_img = vertex_colors_to_texture(
+                        uvs, faces, vertex_colors, image_size=self._texture_size
+                    )
+                    albedo_img.save(str(workspace.textures / "albedo.png"))
+                    on_progress("Albedo texture saved (fallback): albedo.png")
             except Exception as e:
-                on_progress(f"Albedo baking failed: {e}")
+                on_progress(f"Fallback albedo baking failed: {e}")
 
-        # --- Normal map: from mesh vertex normals (same as COLMAP path) ---
-        try:
-            on_progress("Baking tangent-space normal map...")
-            normal_img = bake_normal_map(mesh)
-            normal_img.save(str(workspace.textures / "normal.png"))
-            on_progress("Normal map saved: normal.png")
-        except Exception as e:
-            on_progress(f"Normal map baking failed: {e}")
+        # ----------------------------------------------------------------
+        # Fallback: normal map — computed from decimated mesh vertex normals.
+        # Used if texel-space bake didn't find a USDZ normal map.
+        # ----------------------------------------------------------------
+        if "normal" not in baked_maps:
+            on_progress("Baking normal map from mesh vertex normals (fallback)...")
+            try:
+                normal_img = bake_normal_map(mesh, image_size=self._texture_size)
+                normal_img.save(str(workspace.textures / "normal.png"))
+                on_progress("Normal map saved (fallback): normal.png")
+            except Exception as e:
+                on_progress(f"Normal map baking failed: {e}")
 
-        # --- AO: hemisphere ray casting via Open3D (same as COLMAP path) ---
-        try:
-            ao_img = bake_ao(mesh, num_rays=64, on_progress=on_progress)
-            ao_img.save(str(workspace.textures / "ao.png"))
-            on_progress("AO map saved: ao.png")
-        except Exception as e:
-            on_progress(f"AO baking failed: {e}")
+        # ----------------------------------------------------------------
+        # Fallback: AO — Open3D hemisphere ray casting.
+        # Used if texel-space bake didn't find a USDZ AO map.
+        # ----------------------------------------------------------------
+        if "ao" not in baked_maps:
+            on_progress("Baking AO via hemisphere ray casting (fallback)...")
+            try:
+                ao_img = bake_ao(
+                    mesh, num_rays=64, on_progress=on_progress,
+                    image_size=self._texture_size
+                )
+                ao_img.save(str(workspace.textures / "ao.png"))
+                on_progress("AO map saved (fallback): ao.png")
+            except Exception as e:
+                on_progress(f"AO baking failed: {e}")
 
-        # --- Roughness: image-space HSV analysis of albedo + AO blend ---
-        # Requires albedo.png to exist — only runs if albedo baking succeeded.
+        # ----------------------------------------------------------------
+        # Fallback: roughness — HSV analysis of albedo + AO crevice blend.
+        # Used if texel-space bake didn't find a USDZ roughness map.
+        # ----------------------------------------------------------------
         albedo_path = workspace.textures / "albedo.png"
         ao_path = workspace.textures / "ao.png"
-        if albedo_path.exists():
+
+        if "roughness" not in baked_maps and albedo_path.exists():
+            on_progress("Estimating roughness from albedo HSV (fallback)...")
             try:
-                on_progress("Estimating roughness map from albedo...")
                 bake_roughness_map(
                     albedo_path,
                     ao_path,
                     workspace.textures / "roughness.png",
+                    image_size=self._texture_size,
                 )
-                on_progress("Roughness map saved: roughness.png")
+                on_progress("Roughness map saved (fallback): roughness.png")
             except Exception as e:
                 on_progress(f"Roughness estimation failed: {e}")
 
-        # --- Metallic: image-space saturation-based detection from albedo ---
-        if albedo_path.exists():
+        # ----------------------------------------------------------------
+        # Fallback: metallic — HSV saturation threshold on albedo.
+        # Used if texel-space bake didn't find a USDZ metallic map.
+        # ----------------------------------------------------------------
+        if "metallic" not in baked_maps and albedo_path.exists():
+            on_progress("Estimating metallic map from albedo saturation (fallback)...")
             try:
-                on_progress("Estimating metallic map from albedo...")
                 bake_metallic_map(
                     albedo_path,
                     workspace.textures / "metallic.png",
+                    image_size=self._texture_size,
                 )
-                on_progress("Metallic map saved: metallic.png")
+                on_progress("Metallic map saved (fallback): metallic.png")
             except Exception as e:
                 on_progress(f"Metallic estimation failed: {e}")
 
+        # Report what was actually baked.
+        baked_list = sorted(workspace.textures.glob("*.png"))
+        map_names = [p.stem for p in baked_list]
         on_progress(
-            "Texture baking complete. "
+            f"Texture baking complete: {', '.join(map_names) if map_names else 'none'}. "
             "Textures saved to workspace/textures/"
         )

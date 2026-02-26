@@ -50,7 +50,7 @@ class PipelineWorker(QThread):
 
     def __init__(self, engine: ReconstructionEngine,
                  image_paths: list[str], workspace: WorkspacePaths,
-                 quality_preset: str = "PC (25K triangles)"):
+                 quality_preset: str = "PC (65K triangles)"):
         super().__init__()
         self._engine = engine
         self._image_paths = image_paths
@@ -58,7 +58,8 @@ class PipelineWorker(QThread):
 
         # Look up the target triangle count from the quality preset.
         # This value is passed to the engine's decimate() method.
-        self._target_faces = QUALITY_PRESETS.get(quality_preset, 25_000)
+        # Default 65_000 matches the PC preset — a sensible middle ground.
+        self._target_faces = QUALITY_PRESETS.get(quality_preset, 65_000)
 
         # Cooperative cancellation flag. Checked between stages (not mid-stage).
         # Python's GIL makes single boolean reads/writes thread-safe, so no

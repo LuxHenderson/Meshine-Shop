@@ -86,10 +86,10 @@ Meshine Shop/
 
 **Centralized QSS theming:** All visual styling lives in a single `styles.py` file rather than being scattered across widgets. This makes theme changes trivial and keeps UI code focused on layout and behavior.
 
-## Current Features (Phase 1 + Phase 2a–2e Complete)
+## Current Features (Phase 1 + Phase 2a–2j Complete)
 
 ### Reconstruction Engines
-- **Apple Object Capture** (macOS): Metal-accelerated reconstruction producing ~50K vertices with PBR textures (diffuse, normal, roughness, AO) via RealityKit's PhotogrammetrySession API
+- **Apple Object Capture** (macOS): Metal-accelerated reconstruction producing ~250K vertices at `full` detail with PBR textures (diffuse, normal, roughness, AO, metallic) via RealityKit's PhotogrammetrySession API. Quality preset controls detail level: Mobile → `reduced`, PC/Cinematic → `full`
 - **COLMAP** (cross-platform): Full SfM/MVS pipeline with CUDA acceleration on Windows; CPU fallback on all systems
 - Engine factory auto-detects the best engine at startup — no user configuration needed
 
@@ -107,16 +107,21 @@ Meshine Shop/
 - Live processing queue with per-stage status indicators (pending / running / done / error)
 - Real-time progress messages in the queue and status bar
 - USDZ-to-PLY format conversion via Pixar USD library (for Object Capture output)
-- **Mesh decimation** (Phase 2a): Open3D quadric error metrics (QEM) decimation to Mobile (5K), PC (25K), or Cinematic (100K) triangle targets — MIT licensed, production-safe
+- **Mesh decimation** (Phase 2a): Open3D quadric error metrics (QEM) decimation to quality preset triangle targets — MIT licensed, production-safe
 - **UV unwrapping** (Phase 2b): xatlas automatic UV atlas generation — non-overlapping islands packed into [0,1]² space; output is OBJ with embedded UV coordinates
-- **Texture baking** (Phase 2c): three PBR maps baked onto the UV-mapped mesh — albedo (diffuse color from USDZ textures or COLMAP point cloud), tangent-space normal map (from mesh vertex normals), and ambient occlusion (hemisphere ray casting via Open3D). All three saved as 2048×2048 PNGs to workspace/textures/
-- **PBR material estimation** (Phase 2d): roughness and metallic maps derived from image-space HSV analysis of the baked albedo. Roughness: `specularity = V × (1 − S)`, blended with AO crevice factor. Metallic: soft threshold on desaturated high-value pixels. Both maps added to workspace/textures/ and included in all exports
+- **Texture baking** (Phase 2c): five PBR maps baked onto the UV-mapped mesh — albedo, normal, AO, roughness, metallic. Saved to workspace/textures/
+- **PBR material estimation** (Phase 2d): roughness and metallic maps derived from image-space HSV analysis of the baked albedo (COLMAP path). Roughness: `specularity = V × (1 − S)`, blended with AO crevice factor. Metallic: soft threshold on desaturated high-value pixels
+- **Mesh geometry improvements** (Phase 2f): isolated floating mesh fragments removed before decimation (connected component analysis); Laplacian smoothing pre-decimation reduces reconstruction noise; polygon budgets raised to Mobile (15K), PC (65K), Cinematic (200K)
+- **Texel-space PBR baking** (Phase 2g): Apple Object Capture path bakes all five USDZ maps (albedo, normal, AO, roughness, metallic) at texel-space resolution using BVH surface proximity + Cramér's-rule barycentric UV interpolation. For each output texel, the nearest surface point on the original 250K-triangle USDZ mesh is found via trimesh's ProximityQuery; barycentric coordinates locate that point within its USDZ triangle; the per-face-vertex USDZ UV is interpolated at those weights, then sampled from the original texture. This replaces an earlier nearest-vertex KD-tree approach that caused a "Voronoi mosaic" artifact (each texel mapped to its closest vertex UV → flat colour per Voronoi cell → blocky polygon patches visible at all zoom levels). Texture dilation (4px) applied to all maps to prevent UV island seam bleeding
+- **Apple Object Capture quality control** (Phase 2h): quality preset now controls the Object Capture detail level — Mobile uses `reduced` (~25K source polys, faster), PC/Cinematic use `full` (~250K source polys, maximum detail)
+- **Vertex tangent embedding** (Phase 2i): pre-computed MikkTSpace-compatible TANGENT vectors embedded in every GLB with a normal map — required by glTF 2.0 spec for correct normal map decoding across all viewers
+- **Preset-scaled texture resolution** (Phase 2j): texture baking resolution now scales with quality preset — Mobile → 1024×1024, PC → 2048×2048, Cinematic → 4096×4096. Cinematic captures get 4× the texel density, directly recovering fine skin pores and surface microdetail that were invisible at 2048
 
 ### Export
 - Mesh export to OBJ (.obj), glTF Binary (.glb), and FBX (.fbx)
 - Source mesh is the UV-mapped OBJ (Phase 2b output) — UV coordinates preserved in all exports
 - **Full PBR export** (Phase 2c–2d): all five maps (albedo, normal, AO, roughness, metallic) included when present
-  - **GLB**: all textures embedded as a self-contained PBR material per the glTF 2.0 spec — roughness and metallic packed into a single `metallicRoughnessTexture` (G=roughness, B=metallic)
+  - **GLB**: all textures embedded as a self-contained PBR material per the glTF 2.0 spec — roughness and metallic packed into a single `metallicRoughnessTexture` (G=roughness, B=metallic). Vertex tangents embedded (TANGENT attribute) so normal maps render correctly in all glTF viewers without runtime approximation
   - **OBJ**: bundle folder with `.obj`, `.mtl` (using `map_Pr`/`map_Pm` PBR extension directives), and all five PNG maps
   - **FBX** (Phase 2e): bundle folder with `mesh.fbx` + all five PNG maps — textures delivered externally per Unreal Engine and Maya convention. Requires `assimp` CLI on PATH (`brew install assimp`)
 - Export view shows mesh stats and which PBR maps are available before exporting
@@ -148,6 +153,11 @@ Meshine Shop/
 - [x] 2c — Texture baking (albedo, normals, AO)
 - [x] 2d — PBR material estimation (roughness + metallic from image-space HSV analysis)
 - [x] 2e — FBX export with texture bundle (via Assimp CLI)
+- [x] 2f — Mesh geometry quality (higher polygon budgets, pre-decimation smoothing, isolated fragment removal)
+- [x] 2g — Texel-space PBR baking from USDZ (full resolution sampling + texture dilation for all 5 maps)
+- [x] 2h — Apple Object Capture quality control (detail level tied to quality preset)
+- [x] 2i — Vertex tangent embedding in GLB (MikkTSpace-compatible TANGENT attribute for correct normal map rendering)
+- [x] 2j — Preset-scaled texture resolution (Mobile 1024, PC 2048, Cinematic 4096 — 4× texel density for fine skin/surface detail)
 
 ### Phase 3: LiDAR Live Capture
 - [ ] 3a — iOS companion app (ARKit + LiDAR)

@@ -112,7 +112,7 @@ class MeshineShopApp(QMainWindow):
         self._workspace = None
 
     def _start_pipeline(self, image_paths: list[str],
-                        quality_preset: str = "PC (25K triangles)"):
+                        quality_preset: str = "PC (65K triangles)"):
         """
         Create a workspace, engine, and worker, then start the pipeline.
 
@@ -144,9 +144,11 @@ class MeshineShopApp(QMainWindow):
         self._workspace = workspace
 
         # Auto-select the best engine for this platform.
+        # Pass the quality preset so the factory can tune the Apple Object
+        # Capture detail level (Mobile → reduced, PC/Cinematic → full).
         # The factory returns both the engine instance and a display name
         # so we can show the user which engine is processing their data.
-        engine, engine_name = create_best_engine()
+        engine, engine_name = create_best_engine(quality_preset)
         self.statusBar().showMessage(f"Engine: {engine_name} | Workspace: {workspace.root}")
 
         # Create the background worker with the user's quality preset.
