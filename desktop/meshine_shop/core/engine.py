@@ -845,6 +845,7 @@ class ColmapEngine(ReconstructionEngine):
             bake_ao,
             bake_roughness_map,
             bake_metallic_map,
+            enhance_albedo_clarity,
         )
 
         uv_obj = workspace.mesh / "meshed_uv.obj"
@@ -961,6 +962,14 @@ class ColmapEngine(ReconstructionEngine):
                 on_progress("Metallic map saved: metallic.png")
             except Exception as e:
                 on_progress(f"Metallic estimation failed: {e}")
+
+        # Phase 2l: albedo clarity — same post-process as the Apple path.
+        # COLMAP albedo is built from dense/sparse point cloud colours which
+        # suffer the same dark-subject brightness problem as USDZ textures.
+        try:
+            enhance_albedo_clarity(workspace.textures, on_progress)
+        except Exception as e:
+            on_progress(f"Albedo clarity enhancement failed: {e} — skipping")
 
         on_progress(
             "Texture baking complete. "

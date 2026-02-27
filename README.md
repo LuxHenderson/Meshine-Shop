@@ -86,7 +86,7 @@ Meshine Shop/
 
 **Centralized QSS theming:** All visual styling lives in a single `styles.py` file rather than being scattered across widgets. This makes theme changes trivial and keeps UI code focused on layout and behavior.
 
-## Current Features (Phase 1 + Phase 2a–2j Complete)
+## Current Features (Phase 1 + Phase 2a–2l Complete)
 
 ### Reconstruction Engines
 - **Apple Object Capture** (macOS): Metal-accelerated reconstruction producing ~250K vertices at `full` detail with PBR textures (diffuse, normal, roughness, AO, metallic) via RealityKit's PhotogrammetrySession API. Quality preset controls detail level: Mobile → `reduced`, PC/Cinematic → `full`
@@ -116,6 +116,8 @@ Meshine Shop/
 - **Apple Object Capture quality control** (Phase 2h): quality preset now controls the Object Capture detail level — Mobile uses `reduced` (~25K source polys, faster), PC/Cinematic use `full` (~250K source polys, maximum detail)
 - **Vertex tangent embedding** (Phase 2i): pre-computed MikkTSpace-compatible TANGENT vectors embedded in every GLB with a normal map — required by glTF 2.0 spec for correct normal map decoding across all viewers
 - **Preset-scaled texture resolution** (Phase 2j): texture baking resolution now scales with quality preset — Mobile → 1024×1024, PC → 2048×2048, Cinematic → 4096×4096. Cinematic captures get 4× the texel density, directly recovering fine skin pores and surface microdetail that were invisible at 2048
+- **Selective PBR correction** (Phase 2k): Apple Object Capture's roughness and metallic maps are calibrated for RealityKit — raw values produce chrome/liquid-metal in standard glTF renderers. Correction uses the metallic map as a surface-type mask: organic zones (leather, skin, fabric) get roughness floor 0.60 and metallic clamped to 0; genuine metal zones (scissors, buckles, rivets — metallic > 0.30) are left untouched so chrome parts render as chrome
+- **Albedo clarity enhancement** (Phase 2l): photogrammetry captures albedo under real-world lighting, crushing dark subjects to near-black sRGB values that decode to near-zero linear in PBR renderers. Shadow lift (`shadow_lift=0.22`, `shadow_threshold=0.35`) raises only sub-threshold pixels proportionally — dark leather becomes visible without brightening skin or highlights. 1.5× saturation boost amplifies colour differences in lifted dark areas
 
 ### Export
 - Mesh export to OBJ (.obj), glTF Binary (.glb), and FBX (.fbx)
@@ -158,6 +160,8 @@ Meshine Shop/
 - [x] 2h — Apple Object Capture quality control (detail level tied to quality preset)
 - [x] 2i — Vertex tangent embedding in GLB (MikkTSpace-compatible TANGENT attribute for correct normal map rendering)
 - [x] 2j — Preset-scaled texture resolution (Mobile 1024, PC 2048, Cinematic 4096 — 4× texel density for fine skin/surface detail)
+- [x] 2k — Selective PBR correction (metallic-mask-guided: organic zones get roughness floor 0.60 + metallic → 0; metal zones preserved as chrome)
+- [x] 2l — Albedo clarity enhancement (shadow lift for dark-subject detail visibility + 1.5× saturation boost)
 
 ### Phase 3: LiDAR Live Capture
 - [ ] 3a — iOS companion app (ARKit + LiDAR)

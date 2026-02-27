@@ -615,6 +615,8 @@ class AppleObjectCaptureEngine(ReconstructionEngine):
             bake_ao,
             bake_roughness_map,
             bake_metallic_map,
+            correct_organic_pbr_maps,
+            enhance_albedo_clarity,
         )
         import numpy as np
 
@@ -665,6 +667,8 @@ class AppleObjectCaptureEngine(ReconstructionEngine):
                 )
             except Exception as e:
                 on_progress(f"Texel-space bake failed: {e} — using fallbacks")
+
+
         else:
             on_progress(
                 "USDZ extraction directory not found — using fallback baking"
@@ -754,6 +758,39 @@ class AppleObjectCaptureEngine(ReconstructionEngine):
                 on_progress("Metallic map saved (fallback): metallic.png")
             except Exception as e:
                 on_progress(f"Metallic estimation failed: {e}")
+
+        # ----------------------------------------------------------------
+        # Phase 2k: Organic PBR correction — applied LAST, after all maps
+        # are on disk (whether from texelspace USDZ bake or HSV fallbacks).
+        # Placing this here is essential: the texelspace bake may produce
+        # albedo/normal/AO but fall back to HSV for roughness/metallic, so
+        # correcting before fallbacks run would correct files that don't
+        # exist yet, then the fallbacks overwrite them uncorrected.
+        # ----------------------------------------------------------------
+        try:
+            correct_organic_pbr_maps(workspace.textures, on_progress)
+        except Exception as e:
+            on_progress(f"Organic PBR correction failed: {e} — skipping")
+
+        # ----------------------------------------------------------------
+        # Phase 2l: Albedo clarity enhancement — gamma lift + saturation
+        # boost applied after organic PBR correction.
+        #
+        # Photogrammetry albedo for dark subjects (dark costume, hair) has
+        # sRGB values near 0.08–0.20 which decode to linear ~0.003–0.030
+        # (near-black) in a PBR renderer. At that linear albedo, specular
+        # from any directional light overwhelms the diffuse signal entirely,
+        # producing a chrome/liquid-metal appearance regardless of how correct
+        # the roughness and metallic maps are. The gamma lift brings the
+        # effective linear albedo up to a visible range so material detail
+        # and colour can be seen. Saturation boost amplifies the subtle hue
+        # differences (dark blue vs dark brown) that exist in the data but
+        # sit below perceptual threshold at near-black brightness.
+        # ----------------------------------------------------------------
+        try:
+            enhance_albedo_clarity(workspace.textures, on_progress)
+        except Exception as e:
+            on_progress(f"Albedo clarity enhancement failed: {e} — skipping")
 
         # Report what was actually baked.
         baked_list = sorted(workspace.textures.glob("*.png"))

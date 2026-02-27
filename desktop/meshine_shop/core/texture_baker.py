@@ -76,6 +76,10 @@ Public API:
     bake_roughness_map(albedo_path, ao_path, output_path, image_size)
         → PIL Image
     bake_metallic_map(albedo_path, output_path, image_size) → PIL Image
+    correct_organic_pbr_maps(textures_dir, on_progress, roughness_floor, metallic_scale)
+        → None  — In-place PBR correction for organic subjects: roughness floor
+                  lift and metallic scale-down to eliminate Apple Object Capture's
+                  chrome/liquid-metal appearance in standard glTF PBR renderers.
 """
 
 import numpy as np
@@ -1403,3 +1407,232 @@ def bake_metallic_map(albedo_path, output_path,
     img = Image.fromarray(metallic_uint8, "L")
     img.save(str(output_path))
     return img
+
+
+# ---------------------------------------------------------------------------
+# Organic PBR correction (Phase 2k) — Apple Object Capture calibration fix
+# ---------------------------------------------------------------------------
+
+def correct_organic_pbr_maps(textures_dir, on_progress=None,
+                              roughness_floor=0.60, metal_threshold=0.30):
+    """
+    Correct USDZ-derived roughness and metallic maps for glTF PBR renderers
+    (three.js, Unreal Engine, Blender) using the metallic map as a surface-type
+    mask to apply corrections selectively rather than uniformly.
+
+    Why selective correction matters
+    ─────────────────────────────────
+    A subject like Edward Scissorhands has two fundamentally different material
+    types that need opposite treatment:
+
+        Organic surfaces (leather, fabric, skin):
+            Apple's USDZ metallic is near zero but roughness can be calibrated
+            for RealityKit's renderer, not standard PBR. A roughness floor of
+            0.60 ensures these surfaces look matte-textured rather than
+            mirror-like in glTF viewers. Metallic is clamped to 0 — organic
+            surfaces are pure dielectrics.
+
+        Genuine metal surfaces (scissors, buckles, rivets, rings):
+            Apple's AI correctly identifies these as metallic (values 0.5–1.0).
+            They SHOULD render as chrome/shiny metal — that is physically
+            accurate. The previous uniform metallic_scale=0.02 destroyed this,
+            turning chrome scissors into the same dull material as the leather.
+            The roughness floor MUST NOT apply here either — smooth metal has
+            roughness 0.05–0.20; forcing it to 0.60 makes it look like rough
+            stone rather than polished metal.
+
+    Mask logic (applied to both roughness and metallic corrections):
+        metal_mask  = metallic_original > metal_threshold
+        organic_mask = ~metal_mask
+
+        Roughness:  organic zones → linear remap [0,1]→[roughness_floor,1.0]
+                    metal zones   → unchanged (Apple's values are correct)
+
+        Metallic:   organic zones → clamp to 0.0 (pure dielectric)
+                    metal zones   → unchanged (Apple's values are correct)
+
+    Args:
+        textures_dir:    Path — directory containing roughness.png / metallic.png.
+        on_progress:     Optional callback(str) for status messages.
+        roughness_floor: float — minimum roughness for organic zones (default 0.60).
+        metal_threshold: float — metallic value above which a pixel is classified
+                         as a genuine metal surface (default 0.30). Apple assigns
+                         ~0.0–0.15 to organic materials and ~0.50–1.0 to metals,
+                         so 0.30 cleanly separates them.
+    """
+    textures_dir = Path(textures_dir)
+
+    roughness_path = textures_dir / "roughness.png"
+    metallic_path  = textures_dir / "metallic.png"
+
+    # Both maps must exist for selective correction.
+    # If metallic is missing (COLMAP HSV path), fall back to uniform roughness
+    # floor only — better than doing nothing.
+    if not roughness_path.exists() and not metallic_path.exists():
+        return
+
+    # --- Build the metal mask from the metallic map ---
+    # Pixels above metal_threshold are classified as genuine metal surfaces
+    # (scissors, buckles, rings) and are left untouched by both corrections.
+    metal_mask = None
+    if metallic_path.exists():
+        metallic_arr = np.array(
+            Image.open(metallic_path).convert("L"), dtype=np.float32
+        ) / 255.0
+        # Boolean mask: True = metal zone, False = organic zone.
+        metal_mask = metallic_arr > metal_threshold
+
+    # --- Roughness correction ---
+    if roughness_path.exists():
+        roughness_arr = np.array(
+            Image.open(roughness_path).convert("L"), dtype=np.float32
+        ) / 255.0
+
+        if metal_mask is not None:
+            # Selective: remap organic zones, leave metal zones untouched.
+            # Linear remap: 0.0 → roughness_floor, 1.0 → 1.0.
+            # This preserves roughness variation on leather/skin while lifting
+            # the floor above the mirror-reflection threshold.
+            remapped = roughness_arr * (1.0 - roughness_floor) + roughness_floor
+            roughness_arr = np.where(metal_mask, roughness_arr, remapped)
+        else:
+            # No metallic map available — apply floor uniformly (safe fallback).
+            roughness_arr = roughness_arr * (1.0 - roughness_floor) + roughness_floor
+
+        roughness_arr = np.clip(roughness_arr, 0.0, 1.0)
+        Image.fromarray(
+            (roughness_arr * 255).astype(np.uint8), "L"
+        ).save(str(roughness_path))
+
+        if on_progress:
+            n_metal = int(metal_mask.sum()) if metal_mask is not None else 0
+            on_progress(
+                f"Roughness corrected: organic floor={roughness_floor:.2f}, "
+                f"metal zones preserved ({n_metal:,} px)"
+            )
+
+    # --- Metallic correction ---
+    if metallic_path.exists() and metal_mask is not None:
+        # Re-load after the mask was built (mask was built from same data, safe).
+        metallic_arr = np.array(
+            Image.open(metallic_path).convert("L"), dtype=np.float32
+        ) / 255.0
+
+        # Organic zones: clamp to 0.0 — pure dielectrics have zero metallic.
+        # Metal zones: unchanged — scissors/buckles should render as chrome.
+        metallic_arr = np.where(metal_mask, metallic_arr, 0.0)
+        metallic_arr = np.clip(metallic_arr, 0.0, 1.0)
+
+        Image.fromarray(
+            (metallic_arr * 255).astype(np.uint8), "L"
+        ).save(str(metallic_path))
+
+        if on_progress:
+            n_metal = int(metal_mask.sum())
+            on_progress(
+                f"Metallic corrected: organic zones → 0.0, "
+                f"metal zones unchanged ({n_metal:,} px)"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Phase 2l — Albedo clarity enhancement
+# ---------------------------------------------------------------------------
+
+def enhance_albedo_clarity(textures_dir, on_progress=None,
+                            shadow_lift=0.22, shadow_threshold=0.35,
+                            saturation_boost=1.5):
+    """
+    Phase 2l: Reveal shadow-region texture detail and boost colour saturation
+    without changing the overall tonal character of the subject.
+
+    Why the previous gamma=2.2 lift was wrong
+    ──────────────────────────────────────────
+    A uniform gamma lift raises ALL values — including the midtones and near-
+    highlights that were already correct. For a subject like Edward Scissorhands,
+    this turned dark leather (correct) into grey-white (wrong) and blew out the
+    face to near-white. The costume lost its character entirely.
+
+    The goal is not to make the model brighter — it is to make the detail in the
+    dark areas VISIBLE. A shadow-only lift accomplishes this precisely:
+
+    1.  Shadow lift
+        ────────────
+        A linear ramp that adds brightness proportional to how dark a pixel is,
+        applied only to pixels below shadow_threshold:
+
+            lift_amount = shadow_lift * max(0, shadow_threshold - value) / shadow_threshold
+            lifted_value = clamp(value + lift_amount, 0, 1)
+
+        Effect on representative values (shadow_lift=0.22, shadow_threshold=0.35):
+            sRGB 0.00  →  0.22  (pure black: lifted to visible dark tone)
+            sRGB 0.08  →  0.23  (near-black leather: dark detail now visible)
+            sRGB 0.15  →  0.26  (mean costume: just enough to see texture grain)
+            sRGB 0.35  →  0.35  (threshold: exact zero lift, no change)
+            sRGB 0.45  →  0.45  (skin tones: completely untouched)
+            sRGB 1.00  →  1.00  (highlights: completely untouched)
+
+        The leather stays dark (0.26 vs 0.35 for skin), preserving the strong
+        contrast between costume and face that defines the character. The quilted
+        pattern, leather grain, and stitching detail become readable within the
+        dark area. Skin and metal highlights are never touched.
+
+    2.  Saturation boost
+        ─────────────────
+        Photogrammetry captures colour under a single lighting direction. Dark
+        materials appear desaturated — the navy-blue panels and brown leather
+        straps look identical at near-black brightness. A 1.5× saturation boost
+        amplifies the colour differences already encoded in the texture so each
+        material zone reads its true hue rather than anonymous grey.
+
+        Applied after the shadow lift so the lifted dark areas benefit from the
+        saturation boost as well.
+
+    Args:
+        textures_dir:     Path — directory containing albedo.png.
+        on_progress:      Optional callback(str) for status messages.
+        shadow_lift:      float — maximum lift added to pure-black pixels (0.22).
+                          Increase for more aggressive shadow recovery.
+        shadow_threshold: float — sRGB value above which no lift is applied (0.35).
+                          Pixels at or above this value are completely unchanged.
+        saturation_boost: float — PIL ImageEnhance.Color multiplier (1.5 = +50%).
+                          1.0 = no change, 2.0 = double saturation.
+    """
+    textures_dir = Path(textures_dir)
+    albedo_path = textures_dir / "albedo.png"
+
+    if not albedo_path.exists():
+        return
+
+    if on_progress:
+        on_progress(
+            f"Applying albedo clarity enhancement "
+            f"(shadow lift={shadow_lift:.2f}, saturation={saturation_boost:.1f}×)..."
+        )
+
+    from PIL import ImageEnhance
+
+    # Load as float [0, 1] per channel.
+    img = Image.open(albedo_path).convert("RGB")
+    arr = np.array(img, dtype=np.float32) / 255.0
+
+    # --- Step 1: Shadow lift ---
+    # Linear ramp: lift is proportional to how dark the pixel is.
+    # max(0, threshold - value) ensures pixels above threshold get zero lift.
+    # Dividing by threshold normalises so the ramp peaks at 1.0 for black pixels.
+    # Multiplying by shadow_lift scales the ramp to the desired maximum lift.
+    lift = shadow_lift * np.maximum(0.0, (shadow_threshold - arr)) / shadow_threshold
+    arr = np.clip(arr + lift, 0.0, 1.0)
+
+    # Convert back to uint8 PIL for the saturation step.
+    lifted_img = Image.fromarray((arr * 255.0).clip(0, 255).astype(np.uint8), "RGB")
+
+    # --- Step 2: Saturation boost ---
+    # Amplifies colour differences in the dark areas that are now visible
+    # after the shadow lift. Does not affect luminance.
+    enhanced_img = ImageEnhance.Color(lifted_img).enhance(saturation_boost)
+
+    enhanced_img.save(str(albedo_path))
+
+    if on_progress:
+        on_progress("Albedo clarity enhancement complete.")
