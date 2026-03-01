@@ -99,12 +99,18 @@ class PipelineWorker(QThread):
                 ws, cb, self._target_faces
             ),
             # UV unwrapping reads the decimated PLY and writes meshed_uv.obj
-            # with xatlas UV coordinates. Required for Phase 2c texture baking.
+            # with xatlas UV coordinates. This is the final active stage in
+            # Phase 0 — output is a clean UV-mapped geometry file ready for
+            # AI texture generation in Phase 2.
             PipelineStage.UV_UNWRAP: self._engine.unwrap_uv,
-            # Texture baking reads meshed_uv.obj and writes albedo.png,
-            # normal.png, ao.png to workspace.textures/. Non-fatal: the
-            # engine implementation logs a warning and continues on failure.
+            # TEXTURE_BAKE is preserved here (not in STAGE_ORDER) in case
+            # photo-color baking is ever needed again as a fallback.
             PipelineStage.TEXTURE_BAKE: self._engine.bake_textures,
+            # Phase 2: AI texture generation — renders depth reference views of
+            # the mesh, calls Stability AI structure control API with the user's
+            # material prompt, projects results onto the UV layout, and writes
+            # albedo/normal/roughness/metallic maps to workspace/textures/.
+            PipelineStage.AI_TEXTURE_GEN: self._engine.generate_ai_textures,
         }
 
         for stage in STAGE_ORDER:

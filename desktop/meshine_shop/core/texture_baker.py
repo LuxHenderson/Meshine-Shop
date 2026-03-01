@@ -1414,7 +1414,7 @@ def bake_metallic_map(albedo_path, output_path,
 # ---------------------------------------------------------------------------
 
 def correct_organic_pbr_maps(textures_dir, on_progress=None,
-                              roughness_floor=0.60, metal_threshold=0.30):
+                              roughness_floor=0.60, metal_threshold=0.70):
     """
     Correct USDZ-derived roughness and metallic maps for glTF PBR renderers
     (three.js, Unreal Engine, Blender) using the metallic map as a surface-type

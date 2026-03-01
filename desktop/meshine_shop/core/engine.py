@@ -249,6 +249,27 @@ class ReconstructionEngine(ABC):
         """
         ...
 
+    @abstractmethod
+    def generate_ai_textures(self, workspace: "WorkspacePaths",
+                              on_progress: Callable[[str], None]) -> None:
+        """Generate PBR texture maps via AI texture synthesis.
+
+        Reads workspace.root/ai_prompt.txt for the user's material description,
+        renders depth reference views of the mesh from synthetic camera angles,
+        calls the Stability AI structure control API for each view, back-projects
+        the AI-generated images onto the UV layout, and writes PBR maps to
+        workspace.textures/:
+            albedo.png    — AI-generated diffuse color (2048×2048)
+            normal.png    — object-space normal from mesh vertex normals
+            roughness.png — solid map derived from material keyword in prompt
+            metallic.png  — solid map derived from material keyword in prompt
+
+        Non-fatal: if the API key is missing or all API calls fail, the stage
+        logs a warning and returns without writing textures. The pipeline
+        continues with an untextured mesh.
+        """
+        ...
+
 
 # ---------------------------------------------------------------------------
 # COLMAP implementation
@@ -874,44 +895,69 @@ class ColmapEngine(ReconstructionEngine):
         uvs = np.array(mesh.visual.uv, dtype=np.float32)
         faces = np.array(mesh.faces, dtype=np.int32)
 
-        # --- Albedo: find the best colored point cloud source ---
-        vertex_colors = None
+        # --- Albedo: Phase 3 multi-view projection, then point cloud fallback ---
+        #
+        # Priority order:
+        #   1. Multi-view photo projection (Phase 3) — projects every registered
+        #      source photo onto mesh vertices using COLMAP camera poses, averages
+        #      cosine-weighted colours across all viewpoints. Cancels directional
+        #      lighting that appears in any single photo. Falls back if fewer than
+        #      3 cameras were registered or vertex coverage is below 30%.
+        #   2. Dense point cloud (workspace/dense/fused.ply) — CUDA-only; available
+        #      on Linux/Windows with NVIDIA GPU. Higher density than sparse.
+        #   3. Sparse point cloud (workspace/sparse/0/points3D.ply) — always present
+        #      after a successful COLMAP reconstruction. Lowest quality but universal.
 
-        # Try dense point cloud first (higher density, better quality).
-        dense_pcd = workspace.dense / "fused.ply"
-        if dense_pcd.exists():
-            on_progress("Using dense point cloud for albedo colors...")
-            vertex_colors = bake_albedo_from_pointcloud(mesh, dense_pcd, on_progress)
+        albedo_written = False
 
-        # Fall back to sparse points (always produced by COLMAP).
-        if vertex_colors is None:
-            sparse_subdirs = sorted(workspace.sparse.iterdir())
-            if sparse_subdirs:
-                # COLMAP exports sparse points as points3D.ply in the model directory.
-                sparse_pcd = sparse_subdirs[0] / "points3D.ply"
-                if sparse_pcd.exists():
-                    on_progress("Using sparse point cloud for albedo colors...")
-                    vertex_colors = bake_albedo_from_pointcloud(
-                        mesh, sparse_pcd, on_progress
-                    )
-
-        # If we have vertex colors, rasterize them to a texture.
-        # texture_size scales with quality preset for finer detail at higher tiers.
-        if vertex_colors is not None:
-            try:
-                on_progress("Rasterizing albedo to texture (this may take a moment)...")
-                albedo_img = vertex_colors_to_texture(
-                    uvs, faces, vertex_colors, image_size=self._texture_size
-                )
-                albedo_img.save(str(workspace.textures / "albedo.png"))
-                on_progress("Albedo texture saved: albedo.png")
-            except Exception as e:
-                on_progress(f"Albedo baking failed: {e}")
-        else:
-            on_progress(
-                "No colored point cloud found — albedo baking skipped. "
-                "The mesh will export without color texture."
+        # --- Phase 3: multi-view projection ---
+        try:
+            from meshine_shop.core.ai_texture_baker import bake_multiview_albedo_colmap
+            albedo_written = bake_multiview_albedo_colmap(
+                mesh, workspace, on_progress, image_size=self._texture_size
             )
+        except Exception as e:
+            on_progress(f"Multi-view albedo skipped: {e}")
+
+        # --- Point cloud fallback (if multi-view was unavailable or failed) ---
+        if not albedo_written:
+            vertex_colors = None
+
+            # Try dense point cloud first (higher density, better quality).
+            dense_pcd = workspace.dense / "fused.ply"
+            if dense_pcd.exists():
+                on_progress("Using dense point cloud for albedo colors...")
+                vertex_colors = bake_albedo_from_pointcloud(mesh, dense_pcd, on_progress)
+
+            # Fall back to sparse points (always produced by COLMAP).
+            if vertex_colors is None:
+                sparse_subdirs = sorted(workspace.sparse.iterdir())
+                if sparse_subdirs:
+                    # COLMAP exports sparse points as points3D.ply in the model dir.
+                    sparse_pcd = sparse_subdirs[0] / "points3D.ply"
+                    if sparse_pcd.exists():
+                        on_progress("Using sparse point cloud for albedo colors...")
+                        vertex_colors = bake_albedo_from_pointcloud(
+                            mesh, sparse_pcd, on_progress
+                        )
+
+            # Rasterize point cloud vertex colours to texture atlas.
+            # texture_size scales with quality preset (Mobile→1024, PC→2048, etc.)
+            if vertex_colors is not None:
+                try:
+                    on_progress("Rasterizing albedo to texture (this may take a moment)...")
+                    albedo_img = vertex_colors_to_texture(
+                        uvs, faces, vertex_colors, image_size=self._texture_size
+                    )
+                    albedo_img.save(str(workspace.textures / "albedo.png"))
+                    on_progress("Albedo texture saved: albedo.png")
+                except Exception as e:
+                    on_progress(f"Albedo baking failed: {e}")
+            else:
+                on_progress(
+                    "No colored point cloud found — albedo baking skipped. "
+                    "The mesh will export without color texture."
+                )
 
         # --- Normal map: always available from mesh vertex normals ---
         try:
@@ -971,7 +1017,31 @@ class ColmapEngine(ReconstructionEngine):
         except Exception as e:
             on_progress(f"Albedo clarity enhancement failed: {e} — skipping")
 
+        # Phase 3: Multi-Scale Retinex de-lighting — removes baked directional
+        # lighting from the photogrammetry albedo. Applied after all other albedo
+        # post-processing so it operates on the final, clarity-enhanced image.
+        # Non-fatal: pipeline continues with pre-Retinex albedo on failure.
+        try:
+            from meshine_shop.core.ai_texture_baker import apply_retinex_delighting
+            apply_retinex_delighting(workspace.textures, on_progress)
+        except Exception as e:
+            on_progress(f"Retinex de-lighting skipped: {e}")
+
         on_progress(
             "Texture baking complete. "
             "Textures saved to workspace/textures/"
         )
+
+    def generate_ai_textures(self, workspace, on_progress):
+        """
+        Generate PBR texture maps via Stability AI — COLMAP engine delegation.
+
+        Delegates entirely to ai_texture_gen.generate_ai_textures(), which handles
+        depth rendering, Stability AI API calls, UV projection, and writing all
+        four PBR maps (albedo, normal, roughness, metallic) to workspace/textures/.
+        """
+        # Both engines (COLMAP and Apple) share the same AI texture generation
+        # implementation — the process is engine-agnostic since it operates on
+        # the UV-mapped mesh file (meshed_uv.obj) that both engines produce.
+        from meshine_shop.core.ai_texture_gen import generate_ai_textures as _gen
+        _gen(workspace, on_progress)

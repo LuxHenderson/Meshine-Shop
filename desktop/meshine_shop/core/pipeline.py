@@ -5,7 +5,7 @@ This module defines the discrete stages of the photogrammetry reconstruction
 workflow. Each stage represents a distinct, logged step that the user can
 monitor in the UI's processing queue.
 
-The pipeline follows the standard photogrammetry reconstruction sequence:
+Phase 2 pipeline (AI texture generation — current active configuration):
     1. Ingest — Load and validate input images
     2. Feature Extraction — Detect keypoints and descriptors in each image
     3. Sparse Reconstruction (SfM) — Match features across images and
@@ -19,12 +19,14 @@ The pipeline follows the standard photogrammetry reconstruction sequence:
     7. Mesh Decimation — Reduce polygon count to match the user's chosen
        quality preset (Mobile / PC / Cinematic)
     8. UV Unwrapping — Generate non-overlapping UV coordinates for the
-       decimated mesh using xatlas. UV maps are required for texture
-       baking (Phase 2c) and PBR material export to game engines.
-    9. Texture Baking — Project reconstruction colors onto the UV-mapped
-       mesh to produce diffuse (albedo), tangent-space normal map, and
-       ambient occlusion textures. Resolution scales with quality preset:
-       Mobile → 1024×1024, PC → 2048×2048, Cinematic → 4096×4096.
+       decimated mesh using xatlas. Output is meshed_uv.obj — a UV-ready
+       geometry file ready for AI texture generation.
+    9. AI Texture Generation — Renders depth reference views of the mesh
+       from 6 synthetic camera angles, calls the Stability AI structure
+       control API with each depth render + the user's material description
+       prompt, back-projects the AI-generated images onto the UV layout,
+       and writes albedo, normal, roughness, and metallic PBR maps to
+       workspace/textures/. Resolution: 2048×2048 (matches PC preset).
 
 The stage constants defined here are used throughout the app to track
 progress, update the UI, and log output consistently.
@@ -48,6 +50,7 @@ class PipelineStage:
     DECIMATION = "decimation"
     UV_UNWRAP = "uv_unwrapping"
     TEXTURE_BAKE = "texture_baking"
+    AI_TEXTURE_GEN = "ai_texture_gen"
 
 
 # Ordered list of stages — defines the sequence the pipeline executes.
@@ -62,8 +65,10 @@ STAGE_ORDER = [
     PipelineStage.TEXTURE,
     PipelineStage.DECIMATION,
     PipelineStage.UV_UNWRAP,
-    # Phase 2c: bake PBR textures (albedo, normal, AO) onto the UV-mapped mesh.
-    PipelineStage.TEXTURE_BAKE,
+    # Phase 2: AI-generated PBR textures replace photo-color baking entirely.
+    # Reads ai_prompt.txt from workspace root, renders depth reference views,
+    # calls Stability AI structure control API, projects results onto UV layout.
+    PipelineStage.AI_TEXTURE_GEN,
 ]
 
 # Human-readable display names for each stage, used in the processing
@@ -78,6 +83,7 @@ STAGE_DISPLAY_NAMES = {
     PipelineStage.DECIMATION: "Mesh Decimation",
     PipelineStage.UV_UNWRAP: "UV Unwrapping",
     PipelineStage.TEXTURE_BAKE: "Texture Baking",
+    PipelineStage.AI_TEXTURE_GEN: "AI Texture Generation",
 }
 
 # Quality presets for mesh decimation. Each preset maps to a target

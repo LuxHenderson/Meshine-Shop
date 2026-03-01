@@ -20,7 +20,7 @@ from pathlib import Path
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QStackedWidget,
-    QPushButton, QComboBox, QFileDialog,
+    QPushButton, QComboBox, QFileDialog, QLineEdit,
 )
 from PySide6.QtCore import Qt, Signal
 from meshine_shop.ui.drop_zone import DropZone, collect_images_from_paths
@@ -45,8 +45,9 @@ class ImportView(QWidget):
     """
 
     # Emitted when the user clicks "Start Processing". Carries the list
-    # of file paths and the selected quality preset string.
-    start_requested = Signal(list, str)
+    # of file paths, the selected quality preset string, and the material
+    # description prompt for AI texture generation.
+    start_requested = Signal(list, str, str)
 
     def __init__(self):
         super().__init__()
@@ -88,6 +89,19 @@ class ImportView(QWidget):
         self._quality_combo.setCurrentIndex(1)
         self._quality_combo.setFixedWidth(200)
         layout.addWidget(self._quality_combo, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        # Material description prompt — free-text field for the AI texture
+        # generation stage. The user describes the surface/material in plain
+        # language (e.g. "worn dark leather jacket, battle-damaged, stitching
+        # visible"). The pipeline writes this to ai_prompt.txt in the workspace
+        # before starting the worker. Leaving it empty uses a sensible default.
+        self._prompt_input = QLineEdit()
+        self._prompt_input.setObjectName("prompt_input")
+        self._prompt_input.setPlaceholderText(
+            "Describe the material... (e.g. worn dark leather, battle-damaged)"
+        )
+        self._prompt_input.setFixedWidth(380)
+        layout.addWidget(self._prompt_input, alignment=Qt.AlignmentFlag.AlignCenter)
 
         # "Start Processing" button — disabled until files are dropped.
         # Clicking this triggers the full photogrammetry pipeline via
@@ -182,7 +196,8 @@ class ImportView(QWidget):
             # Include the selected quality preset so the worker knows
             # the target triangle count for the decimation stage.
             preset = self._quality_combo.currentText()
-            self.start_requested.emit(self._pending_paths, preset)
+            prompt = self._prompt_input.text().strip()
+            self.start_requested.emit(self._pending_paths, preset, prompt)
 
     def reset_start_button(self):
         """Re-enable the Start button after pipeline completes or errors."""
@@ -200,6 +215,7 @@ class ImportView(QWidget):
         self._clear_btn.hide()
         self._start_btn.setEnabled(False)
         self._start_btn.setText("Start Processing")
+        self._prompt_input.clear()
 
 
 class ProcessView(QWidget):

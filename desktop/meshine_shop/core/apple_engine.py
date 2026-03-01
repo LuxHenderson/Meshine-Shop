@@ -792,6 +792,20 @@ class AppleObjectCaptureEngine(ReconstructionEngine):
         except Exception as e:
             on_progress(f"Albedo clarity enhancement failed: {e} — skipping")
 
+        # ----------------------------------------------------------------
+        # Phase 3: Multi-Scale Retinex de-lighting — removes baked
+        # directional lighting from the photogrammetry albedo using
+        # Land's Retinex theory (log-domain illumination subtraction).
+        # Applied as a blend=0.7 with the original so genuine dark surfaces
+        # (dark leather, black paint) are not over-brightened.
+        # Non-fatal: pipeline continues with pre-Retinex albedo on failure.
+        # ----------------------------------------------------------------
+        try:
+            from meshine_shop.core.ai_texture_baker import apply_retinex_delighting
+            apply_retinex_delighting(workspace.textures, on_progress)
+        except Exception as e:
+            on_progress(f"Retinex de-lighting skipped: {e}")
+
         # Report what was actually baked.
         baked_list = sorted(workspace.textures.glob("*.png"))
         map_names = [p.stem for p in baked_list]
@@ -799,3 +813,17 @@ class AppleObjectCaptureEngine(ReconstructionEngine):
             f"Texture baking complete: {', '.join(map_names) if map_names else 'none'}. "
             "Textures saved to workspace/textures/"
         )
+
+    def generate_ai_textures(self, workspace, on_progress):
+        """
+        Generate PBR texture maps via Stability AI — Apple engine delegation.
+
+        Delegates entirely to ai_texture_gen.generate_ai_textures(), which handles
+        depth rendering, Stability AI API calls, UV projection, and writing all
+        four PBR maps (albedo, normal, roughness, metallic) to workspace/textures/.
+        """
+        # Both engines (COLMAP and Apple) share the same AI texture generation
+        # implementation — the process is engine-agnostic since it operates on
+        # the UV-mapped mesh file (meshed_uv.obj) that both engines produce.
+        from meshine_shop.core.ai_texture_gen import generate_ai_textures as _gen
+        _gen(workspace, on_progress)
