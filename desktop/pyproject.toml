@@ -18,7 +18,6 @@ pycollada = "^0.9.3"
 usd-core = "^25.11"
 xatlas = "^0.0.11"
 scipy = "^1.13"
-requests = "^2.32"
 rtree = "^1.4.1"
 
 [tool.poetry.group.dev.dependencies]

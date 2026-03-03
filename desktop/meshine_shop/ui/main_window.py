@@ -20,7 +20,7 @@ from pathlib import Path
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QStackedWidget,
-    QPushButton, QComboBox, QFileDialog, QLineEdit,
+    QPushButton, QComboBox, QFileDialog,
 )
 from PySide6.QtCore import Qt, Signal
 from meshine_shop.ui.drop_zone import DropZone, collect_images_from_paths
@@ -40,14 +40,13 @@ class ImportView(QWidget):
     Signal flow:
         1. User drops files → DropZone emits files_dropped(list)
         2. ImportView stores the paths and enables the Start button
-        3. User clicks Start → ImportView emits start_requested(list)
+        3. User clicks Start → ImportView emits start_requested(paths, preset)
         4. App layer receives start_requested and creates the pipeline worker
     """
 
     # Emitted when the user clicks "Start Processing". Carries the list
-    # of file paths, the selected quality preset string, and the material
-    # description prompt for AI texture generation.
-    start_requested = Signal(list, str, str)
+    # of file paths and the selected quality preset string.
+    start_requested = Signal(list, str)
 
     def __init__(self):
         super().__init__()
@@ -89,19 +88,6 @@ class ImportView(QWidget):
         self._quality_combo.setCurrentIndex(1)
         self._quality_combo.setFixedWidth(200)
         layout.addWidget(self._quality_combo, alignment=Qt.AlignmentFlag.AlignCenter)
-
-        # Material description prompt — free-text field for the AI texture
-        # generation stage. The user describes the surface/material in plain
-        # language (e.g. "worn dark leather jacket, battle-damaged, stitching
-        # visible"). The pipeline writes this to ai_prompt.txt in the workspace
-        # before starting the worker. Leaving it empty uses a sensible default.
-        self._prompt_input = QLineEdit()
-        self._prompt_input.setObjectName("prompt_input")
-        self._prompt_input.setPlaceholderText(
-            "Describe the material... (e.g. worn dark leather, battle-damaged)"
-        )
-        self._prompt_input.setFixedWidth(380)
-        layout.addWidget(self._prompt_input, alignment=Qt.AlignmentFlag.AlignCenter)
 
         # "Start Processing" button — disabled until files are dropped.
         # Clicking this triggers the full photogrammetry pipeline via
@@ -196,8 +182,7 @@ class ImportView(QWidget):
             # Include the selected quality preset so the worker knows
             # the target triangle count for the decimation stage.
             preset = self._quality_combo.currentText()
-            prompt = self._prompt_input.text().strip()
-            self.start_requested.emit(self._pending_paths, preset, prompt)
+            self.start_requested.emit(self._pending_paths, preset)
 
     def reset_start_button(self):
         """Re-enable the Start button after pipeline completes or errors."""
@@ -215,7 +200,6 @@ class ImportView(QWidget):
         self._clear_btn.hide()
         self._start_btn.setEnabled(False)
         self._start_btn.setText("Start Processing")
-        self._prompt_input.clear()
 
 
 class ProcessView(QWidget):
@@ -326,14 +310,6 @@ class ExportView(QWidget):
         self._filesize_label.hide()
         layout.addWidget(self._filesize_label, alignment=Qt.AlignmentFlag.AlignCenter)
 
-        # Texture availability indicator — shows which PBR maps were baked
-        # during Phase 2c. Hidden until set_mesh_ready() confirms they exist.
-        self._textures_label = QLabel("")
-        self._textures_label.setObjectName("mesh_info")
-        self._textures_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._textures_label.hide()
-        layout.addWidget(self._textures_label, alignment=Qt.AlignmentFlag.AlignCenter)
-
         # Format selector — centered dropdown without a label, matching
         # the quality preset dropdown on the Import page.
         self._format_combo = QComboBox()
@@ -401,32 +377,6 @@ class ExportView(QWidget):
         self._triangles_label.setText(f"Triangles: {mesh_info['triangles']:,}")
         self._filesize_label.setText(f"File size: {mesh_info['file_size_mb']} MB")
 
-        # Check which PBR texture maps were baked during Phase 2c + 2d.
-        # Report which maps are present so the user knows the export will
-        # be textured (or untextured if baking failed/was skipped).
-        if hasattr(workspace, "textures"):
-            baked_maps = []
-            if (workspace.textures / "albedo.png").exists():
-                baked_maps.append("Albedo")
-            if (workspace.textures / "normal.png").exists():
-                baked_maps.append("Normal")
-            if (workspace.textures / "ao.png").exists():
-                baked_maps.append("AO")
-            if (workspace.textures / "roughness.png").exists():
-                baked_maps.append("Roughness")
-            if (workspace.textures / "metallic.png").exists():
-                baked_maps.append("Metallic")
-
-            if baked_maps:
-                self._textures_label.setText(
-                    f"Textures: {', '.join(baked_maps)}"
-                )
-                self._textures_label.show()
-            else:
-                self._textures_label.hide()
-        else:
-            self._textures_label.hide()
-
         # Switch from placeholder to active state — show stats in the
         # panel and reveal the controls below it.
         self._placeholder.hide()
@@ -454,7 +404,6 @@ class ExportView(QWidget):
         self._vertices_label.hide()
         self._triangles_label.hide()
         self._filesize_label.hide()
-        self._textures_label.hide()
         self._format_combo.hide()
         self._export_btn.hide()
         self._reset_btn.hide()

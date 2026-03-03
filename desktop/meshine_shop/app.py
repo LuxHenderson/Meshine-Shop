@@ -93,7 +93,7 @@ class MeshineShopApp(QMainWindow):
 
         # Connect the Import view's "Start Processing" button to the pipeline
         # orchestration method. This is the entry point for the entire pipeline.
-        # start_requested now carries (paths, quality_preset, prompt) — three args.
+        # start_requested carries (paths, quality_preset) — two args.
         self.main_content.import_view.start_requested.connect(self._start_pipeline)
 
         # Connect the Reset button in the Export view to the reset handler.
@@ -113,8 +113,7 @@ class MeshineShopApp(QMainWindow):
         self._workspace = None
 
     def _start_pipeline(self, image_paths: list[str],
-                        quality_preset: str = "PC (65K triangles)",
-                        prompt: str = ""):
+                        quality_preset: str = "PC (65K triangles)"):
         """
         Create a workspace, engine, and worker, then start the pipeline.
 
@@ -144,13 +143,6 @@ class MeshineShopApp(QMainWindow):
         # view can find the output mesh after the pipeline completes.
         workspace = create_workspace()
         self._workspace = workspace
-
-        # Write the user's material description prompt to the workspace so
-        # the AI texture generation stage can read it without needing to change
-        # the standard (workspace, on_progress) engine method signature.
-        # If the user left the field blank, write an empty string — the stage
-        # falls back to a sensible default prompt automatically.
-        (workspace.root / "ai_prompt.txt").write_text(prompt, encoding="utf-8")
 
         # Auto-select the best engine for this platform.
         # Pass the quality preset so the factory can tune the Apple Object

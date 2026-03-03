@@ -814,16 +814,3 @@ class AppleObjectCaptureEngine(ReconstructionEngine):
             "Textures saved to workspace/textures/"
         )
 
-    def generate_ai_textures(self, workspace, on_progress):
-        """
-        Generate PBR texture maps via Stability AI — Apple engine delegation.
-
-        Delegates entirely to ai_texture_gen.generate_ai_textures(), which handles
-        depth rendering, Stability AI API calls, UV projection, and writing all
-        four PBR maps (albedo, normal, roughness, metallic) to workspace/textures/.
-        """
-        # Both engines (COLMAP and Apple) share the same AI texture generation
-        # implementation — the process is engine-agnostic since it operates on
-        # the UV-mapped mesh file (meshed_uv.obj) that both engines produce.
-        from meshine_shop.core.ai_texture_gen import generate_ai_textures as _gen
-        _gen(workspace, on_progress)
