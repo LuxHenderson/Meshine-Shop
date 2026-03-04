@@ -225,22 +225,20 @@ class MeshineShopApp(QMainWindow):
 
     def _on_pipeline_finished(self):
         """
-        Prepare the Export view after the pipeline completes successfully.
+        Load the mesh into the Viewport and Export views after pipeline completes.
 
-        Loads mesh stats from the pipeline's output mesh and passes them to
-        the Export view, then auto-switches to the Export tab so the user
-        can export immediately without manually navigating.
+        Auto-switches to the Viewport (index 2) so the user sees the rendered
+        mesh immediately. The Export view is also populated in the background
+        so the user can navigate there via the sidebar without waiting.
 
-        Prefers meshed_uv.obj (UV-unwrapped, Phase 2b output) over meshed.ply
-        (decimated-only). The OBJ carries UV coordinates needed for texture
-        baking in Phase 2c. Falls back to meshed.ply if UV unwrapping somehow
-        didn't produce output.
+        Prefers meshed_uv.obj (UV-unwrapped OBJ with photo-color PBR textures)
+        over meshed.ply as the source for both views.
         """
         if self._workspace is None:
             return
 
-        # Prefer the UV-unwrapped OBJ produced by Phase 2b.
-        # Fall back to the raw decimated PLY if the OBJ isn't present.
+        # Prefer the UV-unwrapped OBJ with baked photo-color PBR textures.
+        # Fall back to the decimated PLY if the OBJ isn't present.
         mesh_uv_obj = self._workspace.mesh / "meshed_uv.obj"
         mesh_ply = self._workspace.mesh / "meshed.ply"
 
@@ -255,8 +253,15 @@ class MeshineShopApp(QMainWindow):
         # Load mesh stats (vertex count, triangle count, file size) for display.
         mesh_info = load_mesh_info(mesh_file)
 
-        # Populate the Export view with mesh details and switch to it.
+        # Load the mesh into the Viewport for inspection and painting.
+        # This creates the MeshPainter BVH and uploads the albedo texture to GPU.
+        self.main_content.viewport_view.set_mesh_ready(self._workspace)
+
+        # Also populate the Export view so it's ready when the user navigates there.
         self.main_content.export_view.set_mesh_ready(self._workspace, mesh_info)
+
+        # Auto-switch to the Viewport so the user sees the rendered mesh.
+        # Export is at index 3 — the user navigates there manually via the sidebar.
         self.main_content.switch_view(2)
         self.sidebar.button_group.button(2).setChecked(True)
 
@@ -314,6 +319,9 @@ class MeshineShopApp(QMainWindow):
 
         # Reset the processing queue back to its empty state.
         self.main_content.process_view.queue.reset()
+
+        # Reset the Viewport back to its placeholder state.
+        self.main_content.viewport_view.reset()
 
         # Reset the Export view back to its placeholder state.
         self.main_content.export_view.reset()

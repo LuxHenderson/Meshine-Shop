@@ -1,14 +1,15 @@
 """
 Main content area and view definitions for Meshine Shop.
 
-This module contains the three primary views of the application:
-    - ImportView:  Drag-and-drop zone for importing photo sets
-    - ProcessView: Processing queue showing pipeline progress
-    - ExportView:  Export settings and format options
+This module contains the four primary views of the application:
+    - ImportView:   Drag-and-drop zone for importing photo sets
+    - ProcessView:  Processing queue showing pipeline progress
+    - ViewportView: 3D viewport for inspecting and painting the mesh
+    - ExportView:   Export settings and format options
 
 These views are stacked inside a QStackedWidget (MainContent), which
 shows only one view at a time. The sidebar's nav_changed signal drives
-which view is visible — index 0=Import, 1=Process, 2=Export.
+which view is visible — index 0=Import, 1=Process, 2=Viewport, 3=Export.
 
 This stacked approach was chosen over tab widgets or page navigation
 because it provides instant view switching with zero transition cost,
@@ -25,6 +26,8 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Signal
 from meshine_shop.ui.drop_zone import DropZone, collect_images_from_paths
 from meshine_shop.ui.processing_queue import ProcessingQueue
+from meshine_shop.ui.viewport import ViewportWidget
+from meshine_shop.ui.viewport_tools import ViewportToolsPanel
 from meshine_shop.core.pipeline import EXPORT_FORMATS, QUALITY_PRESETS
 from meshine_shop.core.workspace import WorkspacePaths
 
@@ -234,9 +237,78 @@ class ProcessView(QWidget):
         layout.addStretch()
 
 
+class ViewportView(QWidget):
+    """
+    The third step — inspecting and painting the reconstructed mesh.
+
+    Horizontal layout: ViewportWidget (fills remaining space) on the left,
+    ViewportToolsPanel (200px fixed) on the right. The tools panel signals
+    are connected to the viewport's public API so tool switches, color picks,
+    and slider adjustments take effect immediately.
+
+    After the pipeline completes, the app calls set_mesh_ready(workspace)
+    which loads the UV-unwrapped OBJ + albedo texture into the viewport.
+    reset() clears the viewport back to its placeholder state.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        # Zero-margin horizontal layout — viewport fills all available space
+        # except the 200px tools panel on the right.
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # The OpenGL render surface (stretch=1 → fills all remaining width)
+        self.viewport = ViewportWidget()
+        layout.addWidget(self.viewport, 1)
+
+        # The tools panel (fixed 200px, always on the right side)
+        self.tools = ViewportToolsPanel()
+        layout.addWidget(self.tools)
+
+        # Wire tool panel signals → viewport methods so changes are live
+        self.tools.tool_changed.connect(self.viewport.set_tool)
+        self.tools.color_changed.connect(self.viewport.set_paint_color)
+        self.tools.brush_size_changed.connect(self.viewport.set_brush_size)
+        self.tools.opacity_changed.connect(self.viewport.set_brush_opacity)
+
+    def set_mesh_ready(self, workspace: WorkspacePaths) -> None:
+        """
+        Load the pipeline output into the viewport.
+
+        Called by the app layer after the pipeline completes successfully.
+        Loads meshed_uv.obj plus the textures directory into both the
+        ViewportWidget (for rendering) and makes the camera available to
+        the tools panel (for the controls dialog).
+
+        Args:
+            workspace: WorkspacePaths with .mesh and .textures attributes.
+        """
+        mesh_path = workspace.mesh / "meshed_uv.obj"
+        textures_dir = workspace.textures
+
+        if not mesh_path.exists():
+            # UV-unwrapped OBJ not available — silently stay at placeholder
+            return
+
+        # Load mesh into the viewport (creates MeshPainter + ViewportCamera)
+        self.viewport.load_mesh(mesh_path, textures_dir)
+
+        # Give the tools panel a reference to the camera so the Controls
+        # dialog can read/write settings live without going through the viewport
+        if self.viewport._camera is not None:
+            self.tools.set_camera(self.viewport._camera)
+
+    def reset(self) -> None:
+        """Clear the viewport and return to the placeholder state."""
+        self.viewport.reset()
+
+
 class ExportView(QWidget):
     """
-    The third step — exporting the reconstructed mesh.
+    The fourth step — exporting the reconstructed mesh.
 
     Toggles between two states:
         - Placeholder: shown when no mesh is available yet
@@ -452,18 +524,18 @@ class MainContent(QWidget):
     """
     Container that manages view switching via QStackedWidget.
 
-    QStackedWidget holds all three views in a stack, displaying only
+    QStackedWidget holds all four views in a stack, displaying only
     one at a time. The switch_view method (connected to the sidebar's
     nav_changed signal) controls which view is visible.
 
     View index mapping:
         0 = ImportView
         1 = ProcessView
-        2 = ExportView
+        2 = ViewportView  ← Phase 5; pipeline auto-switches here on completion
+        3 = ExportView    ← user navigates here manually via sidebar
 
-    The import_view and process_view attributes are exposed publicly so
-    the app layer can connect signals to them (e.g., start_requested from
-    ImportView, and worker signals to ProcessView's queue).
+    The import_view, process_view, viewport_view, and export_view attributes
+    are exposed publicly so the app layer can connect signals to them.
     """
 
     def __init__(self):
@@ -472,17 +544,19 @@ class MainContent(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
 
         # Create named references to views so the app can access them
-        # for signal wiring. Previously these were anonymous addWidget calls.
+        # for signal wiring.
         self.import_view = ImportView()
         self.process_view = ProcessView()
+        self.viewport_view = ViewportView()   # Phase 5 — index 2
         self.export_view = ExportView()
 
         # QStackedWidget shows one child at a time. Views are added in
         # the same order as the sidebar buttons, so their indices match.
         self.stack = QStackedWidget()
-        self.stack.addWidget(self.import_view)     # index 0
-        self.stack.addWidget(self.process_view)    # index 1
-        self.stack.addWidget(self.export_view)     # index 2
+        self.stack.addWidget(self.import_view)      # index 0
+        self.stack.addWidget(self.process_view)     # index 1
+        self.stack.addWidget(self.viewport_view)    # index 2 ← new
+        self.stack.addWidget(self.export_view)      # index 3 (was 2)
 
         layout.addWidget(self.stack)
 

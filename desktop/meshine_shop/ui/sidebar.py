@@ -2,8 +2,8 @@
 Sidebar navigation widget for Meshine Shop.
 
 The sidebar provides the primary navigation for the application. It contains
-three nav buttons — Import, Process, and Export — which correspond to the
-three main workflow stages of the photogrammetry pipeline.
+four nav buttons — Import, Process, Viewport, and Export — which correspond
+to the four main stages of the photogrammetry workflow.
 
 Navigation uses Qt's signal/slot system: when a button is clicked, the
 sidebar emits a nav_changed signal with the button's index. The main
@@ -23,17 +23,18 @@ from PySide6.QtCore import Signal, Qt
 class Sidebar(QWidget):
     # Custom signal emitted when the user clicks a nav button.
     # Carries the integer index of the selected button (0=Import,
-    # 1=Process, 2=Export), which maps directly to the stacked
-    # widget indices in MainContent.
+    # 1=Process, 2=Viewport, 3=Export), which maps directly to the
+    # stacked widget indices in MainContent.
     nav_changed = Signal(int)
 
     # Navigation item definitions: (display label, tooltip description).
     # These are iterated to build the nav buttons dynamically, making it
     # easy to add new sections later without touching the layout code.
     NAV_ITEMS = [
-        ("Import", "Drag & drop photo sets"),
-        ("Process", "Run the pipeline"),
-        ("Export", "Download game-ready assets"),
+        ("Import",   "Drag & drop photo sets"),
+        ("Process",  "Run the pipeline"),
+        ("Viewport", "Inspect and paint textures"),   # index 2 — Phase 5
+        ("Export",   "Download game-ready assets"),   # index 3 (was 2)
     ]
 
     def __init__(self):

@@ -436,4 +436,218 @@ QComboBox#quality_combo QAbstractItemView {
     selection-background-color: #3a3a3a;
     selection-color: #dc3545;
 }
+
+/* ===== Viewport Tools Panel ===== */
+/* The 200px fixed-width right panel on the Viewport page. Slightly darker
+   surface than the main canvas, with a left border to separate it from the
+   OpenGL viewport area. */
+QWidget#viewport_tools_panel {
+    background-color: #252525;
+    border-left: 1px solid #3a3a3a;
+}
+
+/* Section header labels in the tools panel. */
+QLabel#tools_section_header {
+    color: #4a5568;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 1.5px;
+}
+
+/* Text labels next to sliders (Size, Opacity). */
+QLabel#tools_label {
+    color: #d4d4d4;
+    font-size: 12px;
+}
+
+/* Numeric readout next to each slider. */
+QLabel#tools_readout {
+    color: #999999;
+    font-size: 12px;
+}
+
+/* Horizontal dividers within the tools panel. */
+QFrame#tools_divider {
+    background-color: #3a3a3a;
+    border: none;
+}
+
+/* Tool selector buttons (Brush / Region) — square icon-style.
+   Transparent background by default, hover lifts slightly, checked
+   state uses the crimson accent border as the active indicator. */
+QPushButton#tool_button {
+    background: transparent;
+    color: #999999;
+    border: 1px solid #3a3a3a;
+    border-radius: 4px;
+    padding: 4px;
+    font-size: 18px;
+}
+
+QPushButton#tool_button:hover {
+    background: #333333;
+    color: #e0e0e0;
+}
+
+QPushButton#tool_button:checked {
+    background: #2d2d2d;
+    border-color: #dc3545;
+    color: #e0e0e0;
+}
+
+/* Color swatch button — displays the current paint color as its background.
+   The actual background-color is set inline via setStyleSheet() per-color
+   change; this rule just provides the border and sizing defaults. */
+QPushButton#color_swatch {
+    border: 1px solid #3a3a3a;
+    border-radius: 4px;
+    min-height: 28px;
+}
+
+QPushButton#color_swatch:hover {
+    border-color: #dc3545;
+}
+
+/* ⚙ Controls button at the bottom of the tools panel. */
+QPushButton#controls_gear_btn {
+    background-color: transparent;
+    color: #d4d4d4;
+    border: 1px solid #555555;
+    border-radius: 6px;
+    font-size: 12px;
+    padding: 6px 12px;
+    text-align: left;
+}
+
+QPushButton#controls_gear_btn:hover {
+    background-color: #333333;
+    border-color: #dc3545;
+    color: #ffffff;
+}
+
+/* Viewport placeholder label — shown in the OpenGL area before any
+   mesh is loaded. Centered muted text over the dark background. */
+QLabel#viewport_placeholder {
+    color: #999999;
+    font-size: 13px;
+}
+
+/* ===== Viewport Controls Dialog ===== */
+/* The scheme selector bar at the top of the controls dialog. */
+QWidget#controls_scheme_bar {
+    background-color: #252525;
+}
+
+/* Horizontal and vertical dividers inside the controls dialog. */
+QFrame#controls_divider {
+    background-color: #3a3a3a;
+    border: none;
+}
+
+/* Left category list — no frame, dark surface. */
+QListWidget#controls_category_list {
+    background-color: #252525;
+    color: #d4d4d4;
+    font-size: 13px;
+    border: none;
+    padding: 8px 0;
+}
+
+QListWidget#controls_category_list::item {
+    padding: 10px 16px;
+    border-left: 3px solid transparent;
+}
+
+QListWidget#controls_category_list::item:hover {
+    background-color: #333333;
+    color: #e0e0e0;
+}
+
+QListWidget#controls_category_list::item:selected {
+    background-color: #2d2d2d;
+    color: #dc3545;
+    border-left: 3px solid #dc3545;
+}
+
+/* Section header labels inside category pages. */
+QLabel#controls_section_header {
+    color: #d4d4d4;
+    font-size: 14px;
+    font-weight: 600;
+    padding-bottom: 4px;
+}
+
+/* Action label text in binding rows. */
+QLabel#binding_action_label {
+    color: #d4d4d4;
+    font-size: 12px;
+}
+
+/* Binding pill — shows current binding text in a rounded box. */
+QLabel#binding_pill {
+    background-color: #333333;
+    color: #e0e0e0;
+    border: 1px solid #3a3a3a;
+    border-radius: 4px;
+    font-size: 12px;
+    padding: 2px 8px;
+}
+
+/* ✕ / ↺ / ✎ icon buttons in binding rows. */
+QPushButton#binding_icon_btn {
+    background: transparent;
+    color: #999999;
+    border: 1px solid #3a3a3a;
+    border-radius: 3px;
+    font-size: 11px;
+    padding: 0;
+}
+
+QPushButton#binding_icon_btn:hover {
+    background: #333333;
+    color: #e0e0e0;
+    border-color: #dc3545;
+}
+
+/* Save Changes button in controls dialog footer. */
+QPushButton#primary_button {
+    background-color: #dc3545;
+    color: #ffffff;
+    border: none;
+    border-radius: 6px;
+    font-size: 13px;
+    font-weight: 600;
+    padding: 8px 20px;
+}
+
+QPushButton#primary_button:hover {
+    background-color: #c82333;
+}
+
+QPushButton#primary_button:pressed {
+    background-color: #a71d2a;
+}
+
+/* Scheme dropdown inside controls dialog. */
+QComboBox#scheme_combo {
+    background-color: #333333;
+    color: #e0e0e0;
+    border: 1px solid #3a3a3a;
+    border-radius: 4px;
+    padding: 4px 10px;
+    font-size: 13px;
+}
+
+QComboBox#scheme_combo::drop-down {
+    border: none;
+    width: 24px;
+}
+
+QComboBox#scheme_combo QAbstractItemView {
+    background-color: #252525;
+    color: #e0e0e0;
+    border: 1px solid #3a3a3a;
+    selection-background-color: #3a3a3a;
+    selection-color: #dc3545;
+}
 """
