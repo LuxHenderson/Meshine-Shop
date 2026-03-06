@@ -13,12 +13,9 @@ Rendering pipeline (per frame):
     4. After paint strokes: upload dirty rect to GPU via glTexSubImage2D
 
 Camera navigation:
-    - RMB held + mouse drag   → fly look (yaw/pitch)
-    - RMB held + WASD/Q/E     → fly move (translate in view space)
-    - RMB held + Shift         → 3× speed boost
-    - Alt + LMB drag          → orbit around focal point
-    - Scroll wheel             → dolly (zoom in/out)
-    - MMB drag                 → pan (shift focal point + position)
+    - LMB drag                 → orbit around focal point
+    - Scroll wheel             → dolly (zoom toward cursor)
+    - MMB drag                 → pan (shift camera + focal point)
     - F key                    → frame mesh (auto-position camera)
 
 Texture painting:
@@ -28,7 +25,11 @@ Texture painting:
 
 from __future__ import annotations
 
+import ctypes
+import ctypes.util
 import logging
+import math
+import sys
 import time
 from pathlib import Path
 
@@ -40,8 +41,10 @@ try:
 except ImportError:
     _HAS_MODERNGL = False
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QKeyEvent, QMouseEvent, QWheelEvent
+from PySide6.QtCore import Qt, QPoint, QTimer
+from PySide6.QtGui import (
+    QColor, QCursor, QKeyEvent, QMouseEvent, QPainter, QWheelEvent,
+)
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import QLabel, QSizePolicy, QVBoxLayout, QWidget
 
@@ -49,6 +52,47 @@ from meshine_shop.core.mesh_painter import MeshPainter
 from meshine_shop.core.viewport_camera import ViewportCamera
 
 log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# macOS native cursor warp
+# ---------------------------------------------------------------------------
+# Qt's QCursor.setPos() is ignored by macOS during an active mouse drag. We
+# call CGWarpMouseCursorPosition directly via ctypes to bypass that restriction.
+# On non-macOS platforms we fall back to QCursor.setPos().
+
+if sys.platform == "darwin":
+    try:
+        _cg_lib = ctypes.cdll.LoadLibrary(
+            ctypes.util.find_library("CoreGraphics") or "CoreGraphics"
+        )
+
+        class _CGPoint(ctypes.Structure):
+            _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
+
+        _cg_lib.CGWarpMouseCursorPosition.restype = ctypes.c_int
+        _cg_lib.CGWarpMouseCursorPosition.argtypes = [_CGPoint]
+
+        def _warp_cursor_native(x: float, y: float) -> None:
+            """Move cursor to (x, y) in global screen logical coordinates."""
+            _cg_lib.CGWarpMouseCursorPosition(_CGPoint(x, y))
+
+    except Exception:
+        _warp_cursor_native = None  # type: ignore[assignment]
+else:
+    _warp_cursor_native = None  # type: ignore[assignment]
+
+
+def _warp_cursor(pos: QPoint) -> None:
+    """
+    Warp the system cursor to a global screen position.
+
+    Uses CGWarpMouseCursorPosition on macOS (works during active drags).
+    Falls back to QCursor.setPos on other platforms.
+    """
+    if _warp_cursor_native is not None:
+        _warp_cursor_native(float(pos.x()), float(pos.y()))
+    else:
+        QCursor.setPos(pos)
 
 # --------------------------------------------------------------------------- #
 # GLSL shaders                                                                 #
@@ -124,6 +168,40 @@ class _PlaceholderLabel(QWidget):
         layout.addWidget(label)
 
 
+class _DotOverlay(QWidget):
+    """
+    Tiny white dot drawn as a child widget overlay over the OpenGL viewport.
+
+    Positioned at the LMB click point on the mesh surface and visible while
+    the button is held. Being a separate QWidget means QPainter never touches
+    the OpenGL context — no ghosting, no framebuffer interference.
+    """
+
+    RADIUS: int = 5  # dot radius in pixels
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        # Fixed square bounding box large enough for the circle + 1px padding
+        size = self.RADIUS * 2 + 2
+        self.setFixedSize(size, size)
+        # Pass all mouse/keyboard events through to the viewport below
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.hide()
+
+    def place(self, x: int, y: int) -> None:
+        """Center the dot on (x, y) in parent-widget pixel coordinates."""
+        self.move(x - self.RADIUS - 1, y - self.RADIUS - 1)
+        self.raise_()
+
+    def paintEvent(self, event) -> None:  # noqa: ARG002
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        # Slightly translucent white so the dot doesn't look pasted on
+        painter.setBrush(QColor(255, 255, 255, 210))
+        painter.drawEllipse(1, 1, self.RADIUS * 2, self.RADIUS * 2)
+
+
 class ViewportWidget(QOpenGLWidget):
     """
     OpenGL 3D viewport — renders the mesh and handles navigation + painting.
@@ -176,17 +254,43 @@ class ViewportWidget(QOpenGLWidget):
         # ------------------------------------------------------------------ #
         # Mouse / keyboard navigation state                                    #
         # ------------------------------------------------------------------ #
-        self._fly_mode: bool = False          # True while RMB is held
         self._alt_held: bool = False          # True while Alt is held
         self._mmb_held: bool = False          # True while MMB is held
         self._lmb_held: bool = False          # True while LMB is held (for paint drag)
+        # Set on LMB miss (cursor warp) — absorbs the first move event so the
+        # warp delta (potentially hundreds of pixels) never triggers an orbit.
+        self._orbit_skip_one: bool = False
+        # Global screen position (QPoint) where LMB was pressed — cursor is
+        # warped back here on release so it reappears exactly where the user
+        # clicked. Storing global avoids any mapToGlobal conversion issues on
+        # Retina displays.
+        self._lmb_cursor_origin_global: "QPoint | None" = None
+        # White dot overlay shown at the click position while LMB is held
+        self._dot_overlay = _DotOverlay(self)
+        # World-space 3D position of the LMB hit point (or miss-anchor point) —
+        # re-projected every frame so the dot tracks the model surface as it orbits.
+        self._dot_world_pos: "np.ndarray | None" = None
+        # True when _dot_world_pos was set for a miss (off-model click). Release
+        # handling skips the dot-based cursor restore in this case so the cursor
+        # returns to the original click position instead.
+        self._dot_is_miss: bool = False
+        # Set of held button name strings ("left", "right", "middle") — used to
+        # match multi-button chord bindings (e.g. "left+right" for pan)
+        self._mouse_btns: set[str] = set()
         self._keys_held: set[Qt.Key] = set()
         self._last_mouse_pos: tuple[int, int] | None = None
 
-        # Fly tick timer — fires at ~60fps to apply WASD movement while keys held
-        self._fly_timer = QTimer(self)
-        self._fly_timer.setInterval(16)       # ~60fps
-        self._fly_timer.timeout.connect(self._fly_tick)
+        # Smoothed WASD velocity components (world-space, range −1..+1).
+        self._vel_fwd:   float = 0.0
+        self._vel_right: float = 0.0
+        self._vel_up:    float = 0.0
+
+        # Movement tick timer — fires at ~60fps so WASD translation works
+        # whenever the viewport has focus.
+        self._move_timer = QTimer(self)
+        self._move_timer.setInterval(16)
+        self._move_timer.timeout.connect(self._move_tick)
+        self._move_timer.start()
         self._last_tick_time: float = time.monotonic()
 
         # ------------------------------------------------------------------ #
@@ -256,12 +360,14 @@ class ViewportWidget(QOpenGLWidget):
             self._painter.save_albedo()
 
     def reset(self) -> None:
-        """Clear all state and stop the fly timer. Returns widget to idle."""
-        self._fly_timer.stop()
+        """Clear all state. Returns widget to idle."""
+        self._move_timer.stop()
         self._painter = None
         self._camera = None
         self._needs_upload = False
-        self._fly_mode = False
+        self._dot_world_pos = None
+        self._dot_is_miss = False
+        self._vel_fwd = self._vel_right = self._vel_up = 0.0
         self._keys_held.clear()
         self._last_mouse_pos = None
 
@@ -361,6 +467,16 @@ class ViewportWidget(QOpenGLWidget):
         self._albedo_tex.use(0)
         self._vao.render()
 
+        # Re-project the 3D dot anchor to screen every frame so the white dot
+        # tracks the mesh surface point as the model orbits.
+        if self._dot_world_pos is not None and self._dot_overlay.isVisible():
+            screen = self._world_to_screen(self._dot_world_pos)
+            if screen is not None:
+                self._dot_overlay.place(*screen)
+            else:
+                # Hit point behind camera — hide dot until it's visible again
+                self._dot_overlay.hide()
+
     def resizeGL(self, w: int, h: int) -> None:
         """Called by Qt when the widget is resized."""
         if self._ctx is not None:
@@ -451,6 +567,81 @@ class ViewportWidget(QOpenGLWidget):
     # Mouse input                                                          #
     # ------------------------------------------------------------------ #
 
+    def _world_to_screen(self, world_pt: np.ndarray) -> tuple[int, int] | None:
+        """
+        Project a world-space point into widget-local pixel coordinates.
+
+        Returns None if the camera is not ready or the point is behind the
+        near plane (w <= 0 after projection).
+        """
+        if self._camera is None:
+            return None
+        w, h = self.width(), self.height()
+        if w == 0 or h == 0:
+            return None
+        aspect = w / h
+        view = self._camera.get_view_matrix()
+        proj = self._camera.get_projection_matrix(aspect)
+        pt_h = np.array([*world_pt, 1.0], dtype=np.float64)
+        clip = proj @ view @ pt_h
+        if clip[3] <= 0:
+            return None  # behind near plane
+        ndc = clip[:3] / clip[3]
+        px = round((ndc[0] + 1.0) * 0.5 * w)
+        py = round((1.0 - ndc[1]) * 0.5 * h)
+        px = max(0, min(w - 1, px))
+        py = max(0, min(h - 1, py))
+        return (px, py)
+
+    def _compute_lmb_anchor(
+        self, click_x: int, click_y: int
+    ) -> tuple[tuple[int, int], np.ndarray]:
+        """
+        Determine the orbit pivot world point and its screen position for an
+        LMB press at (click_x, click_y).
+
+        Priority:
+          1. Ray-cast against mesh surface — if hit, that point is the pivot.
+          2. Miss — bbox centre X/Z at camera's Y elevation (clamped to bbox),
+             so orbiting pivots at the model's height nearest the camera.
+
+        Returns (screen_pos, world_pivot). The cursor is warped to screen_pos
+        once on press; no per-frame pinning is done so orbit stays stable.
+        """
+        fallback_screen = (click_x, click_y)
+
+        if self._camera is None or self._painter is None:
+            fp = self._camera.focal_point.copy() if self._camera else np.zeros(3)
+            return fallback_screen, fp
+
+        w, h = self.width(), self.height()
+        if w == 0 or h == 0:
+            return fallback_screen, self._camera.focal_point.copy()
+
+        aspect = w / h
+
+        # Convert click pixel to NDC (Y flipped: pixel-top = NDC +1)
+        ndc_x = (click_x / w) * 2.0 - 1.0
+        ndc_y = 1.0 - (click_y / h) * 2.0
+
+        # Unproject to world-space ray
+        origin, direction = self._camera.unproject_ray(ndc_x, ndc_y, aspect)
+
+        # 1. Try mesh surface hit
+        hit_pos = self._painter.ray_cast_world_pos(origin, direction)
+        if hit_pos is not None:
+            screen = self._world_to_screen(hit_pos) or fallback_screen
+            return screen, hit_pos
+
+        # 2. Miss — model centre at camera Y elevation
+        bbox_min, bbox_max = self._painter.get_bbox()
+        centre   = (bbox_min.astype(np.float64) + bbox_max.astype(np.float64)) * 0.5
+        cam_y    = float(self._camera.position[1])
+        pivot_y  = float(np.clip(cam_y, float(bbox_min[1]), float(bbox_max[1])))
+        world_pt = np.array([centre[0], pivot_y, centre[2]], dtype=np.float64)
+        screen   = self._world_to_screen(world_pt) or fallback_screen
+        return screen, world_pt
+
     def mousePressEvent(self, event: QMouseEvent) -> None:
         self.setFocus()
         x, y = event.position().x(), event.position().y()
@@ -458,21 +649,103 @@ class ViewportWidget(QOpenGLWidget):
 
         btn = event.button()
 
-        if btn == Qt.MouseButton.RightButton:
-            # Enter fly mode
-            self._fly_mode = True
-            self._last_tick_time = time.monotonic()
-            self._fly_timer.start()
-            self.setCursor(Qt.CursorShape.BlankCursor)
+        # Track all held buttons by name for chord binding checks
+        _BTN_NAMES = {
+            Qt.MouseButton.LeftButton:   "left",
+            Qt.MouseButton.MiddleButton: "middle",
+            Qt.MouseButton.RightButton:  "right",
+        }
+        if btn in _BTN_NAMES:
+            self._mouse_btns.add(_BTN_NAMES[btn])
 
-        elif btn == Qt.MouseButton.MiddleButton:
+        if btn == Qt.MouseButton.MiddleButton:
             self._mmb_held = True
 
         elif btn == Qt.MouseButton.LeftButton:
             self._lmb_held = True
-            if not self._alt_held and self._camera is not None:
-                # Paint on LMB press (not when Alt is held — that's orbit)
-                self._handle_paint(int(x), int(y))
+            # Capture global cursor position at press — restored on release so
+            # the cursor reappears exactly where the user first clicked.
+            self._lmb_cursor_origin_global = QCursor.pos()
+            # If the click lands on the mesh, hide the system cursor to give
+            # an "attached to model" feel while orbiting. Restored on release.
+            if self._camera is not None and self._painter is not None:
+                w, h = self.width(), self.height()
+                if w > 0 and h > 0:
+                    ndc_x = (int(x) / w) * 2.0 - 1.0
+                    ndc_y = 1.0 - (int(y) / h) * 2.0
+                    origin, direction = self._camera.unproject_ray(
+                        ndc_x, ndc_y, w / h)
+                    hit = self._painter.ray_cast_world_pos(origin, direction)
+                    if hit is not None:
+                        # Hit — cursor hides, white dot anchors to the 3D
+                        # surface hit point and tracks it through orbit.
+                        self.setCursor(Qt.CursorShape.BlankCursor)
+                        self._dot_world_pos = hit
+                        self._dot_overlay.place(int(x), int(y))
+                        self._dot_overlay.show()
+                    else:
+                        # Miss — snap cursor to projected focal point and show
+                        # the white dot on the actual model surface at the same
+                        # screen height as the click.
+                        #
+                        # Strategy: cast a second ray through the model's centre
+                        # screen column at the cursor's Y. This ray almost always
+                        # hits the mesh and lands on the visible surface rather
+                        # than a fictitious interior point. Falls back to the
+                        # bbox-centre-at-cursor-height geometry if the centre ray
+                        # also misses (e.g. cursor Y is above/below the mesh).
+                        bbox_min, bbox_max = self._painter.get_bbox()
+                        centre = (
+                            bbox_min.astype(np.float64)
+                            + bbox_max.astype(np.float64)
+                        ) * 0.5
+                        centre_screen = self._world_to_screen(centre)
+                        dot_world: np.ndarray | None = None
+                        if centre_screen is not None:
+                            # Ray through (model_centre_x, cursor_y) in screen space
+                            cen_ndc_x = (centre_screen[0] / w) * 2.0 - 1.0
+                            cen_ndc_y = 1.0 - (int(y) / h) * 2.0
+                            c_origin, c_dir = self._camera.unproject_ray(
+                                cen_ndc_x, cen_ndc_y, w / h
+                            )
+                            dot_world = self._painter.ray_cast_world_pos(
+                                c_origin, c_dir
+                            )
+                        if dot_world is None:
+                            # Fallback: bbox centre XZ at the world Y that
+                            # corresponds to the cursor's vertical position.
+                            dx_ = float(origin[0] - centre[0])
+                            dz_ = float(origin[2] - centre[2])
+                            denom_ = float(direction[0] ** 2 + direction[2] ** 2)
+                            if abs(denom_) > 1e-6:
+                                t_ = -(
+                                    dx_ * direction[0] + dz_ * direction[2]
+                                ) / denom_
+                                world_y = float(origin[1] + t_ * direction[1])
+                            else:
+                                world_y = float(centre[1])
+                            world_y = float(
+                                np.clip(
+                                    world_y, float(bbox_min[1]), float(bbox_max[1])
+                                )
+                            )
+                            dot_world = np.array(
+                                [centre[0], world_y, centre[2]], dtype=np.float64
+                            )
+                        dot_screen = self._world_to_screen(dot_world)
+                        if dot_screen is not None:
+                            self._dot_world_pos = dot_world
+                            self._dot_is_miss = True
+                            self._dot_overlay.place(*dot_screen)
+                            self._dot_overlay.show()
+                        # Snap cursor to projected focal point (existing behaviour)
+                        # Do NOT overwrite _last_mouse_pos here. Set skip flag to
+                        # absorb the first synthetic move event after the warp.
+                        screen = self._world_to_screen(self._camera.focal_point)
+                        if screen is not None:
+                            QCursor.setPos(self.mapToGlobal(QPoint(*screen)))
+                        self.setCursor(Qt.CursorShape.BlankCursor)
+                        self._orbit_skip_one = True
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         x, y = int(event.position().x()), int(event.position().y())
@@ -488,38 +761,68 @@ class ViewportWidget(QOpenGLWidget):
         if self._camera is None:
             return
 
-        if self._fly_mode:
-            # RMB drag → fly look (yaw/pitch)
-            self._camera.fly_look(dx, dy)
-            self.update()
-
-        elif self._alt_held and self._lmb_held:
-            # Alt + LMB drag → orbit
-            self._camera.orbit(dx, dy)
-            self.update()
-
-        elif self._mmb_held:
-            # MMB drag → pan
+        # Pan takes priority — chord bindings (e.g. LMB+RMB) must be checked
+        # before single-button actions so the chord isn't swallowed first.
+        if self._mouse_binding_active("pan"):
             self._camera.pan(dx, dy)
             self.update()
 
+        elif self._mouse_binding_active("orbit"):
+            # LMB drag → orbit around the pivot.
+            # After a miss-case cursor warp, absorb the very first move event
+            # as a new anchor. The warp can deliver an event from either the
+            # click position or the warped position — either could produce a
+            # huge delta. Eating it here prevents that snap entirely.
+            if self._orbit_skip_one:
+                self._orbit_skip_one = False
+                self.update()
+                return
+            if dx != 0 or dy != 0:
+                self._camera.orbit(dx, dy)
+            self.update()
+
         elif self._lmb_held and self._tool == "brush" and not self._alt_held:
-            # LMB drag → brush stroke
+            # LMB drag (no chord, no alt) → brush stroke
             self._handle_paint(x, y)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         btn = event.button()
 
-        if btn == Qt.MouseButton.RightButton:
-            self._fly_mode = False
-            self._fly_timer.stop()
-            self.unsetCursor()
+        # Remove released button from the chord-tracking set
+        _BTN_NAMES = {
+            Qt.MouseButton.LeftButton:   "left",
+            Qt.MouseButton.MiddleButton: "middle",
+            Qt.MouseButton.RightButton:  "right",
+        }
+        self._mouse_btns.discard(_BTN_NAMES.get(btn, ""))
 
-        elif btn == Qt.MouseButton.MiddleButton:
+        if btn == Qt.MouseButton.MiddleButton:
             self._mmb_held = False
 
         elif btn == Qt.MouseButton.LeftButton:
             self._lmb_held = False
+            self._orbit_skip_one = False
+            self._dot_overlay.hide()
+            # Determine restore target. For on-mesh hits, warp cursor to the
+            # dot's current projected screen position. For off-mesh clicks
+            # (_dot_is_miss) or no dot, restore to the original click position.
+            if self._dot_world_pos is not None and not self._dot_is_miss:
+                restore_screen = self._world_to_screen(self._dot_world_pos)
+                if restore_screen is not None:
+                    restore_global = self.mapToGlobal(QPoint(*restore_screen))
+                else:
+                    restore_global = self._lmb_cursor_origin_global
+            else:
+                restore_global = self._lmb_cursor_origin_global
+            self._dot_world_pos = None
+            self._dot_is_miss = False
+            # Restore cursor via CGWarpMouseCursorPosition (macOS native) —
+            # Qt's QCursor.setPos() is silently ignored during an active drag.
+            self.unsetCursor()
+            if restore_global is not None:
+                tgt = restore_global
+                QTimer.singleShot(0, lambda: _warp_cursor(tgt))
+            self._lmb_cursor_origin_global = None
 
         self._last_mouse_pos = None
 
@@ -528,7 +831,41 @@ class ViewportWidget(QOpenGLWidget):
             return
         # angleDelta().y() is 120 per notch (standard Qt)
         ticks = event.angleDelta().y() / 120.0
-        self._camera.dolly(ticks)
+
+        # Cursor-targeted zoom: always dolly toward the world point under the
+        # cursor. On a mesh hit that's the surface point. On a miss we project
+        # the cursor ray onto the focal plane (perpendicular to the forward
+        # vector, passing through focal_point) to find a unique target at the
+        # same depth as the orbit centre — giving true directional zoom even
+        # when hovering over empty space beside or above/below the model.
+        direction: np.ndarray | None = None
+        if self._painter is not None:
+            w, h = self.width(), self.height()
+            if w > 0 and h > 0:
+                cursor_local = self.mapFromGlobal(QCursor.pos())
+                cx, cy = cursor_local.x(), cursor_local.y()
+                ndc_x = (cx / w) * 2.0 - 1.0
+                ndc_y = 1.0 - (cy / h) * 2.0
+                origin, ray_dir = self._camera.unproject_ray(ndc_x, ndc_y, w / h)
+                hit = self._painter.ray_cast_world_pos(origin, ray_dir)
+                if hit is not None:
+                    direction = hit - self._camera.position
+                else:
+                    # Project cursor ray onto the focal plane to find a unique
+                    # 3D target for this cursor position at the model's depth.
+                    fwd = self._camera._forward()
+                    denom = float(np.dot(ray_dir, fwd))
+                    if abs(denom) > 1e-6:
+                        t = float(np.dot(
+                            self._camera.focal_point - origin, fwd
+                        )) / denom
+                        t = max(0.01, t)  # always in front of camera
+                        target = origin + t * ray_dir
+                    else:
+                        target = self._camera.focal_point
+                    direction = target - self._camera.position
+
+        self._camera.dolly(ticks, direction)
         self.update()
 
     # ------------------------------------------------------------------ #
@@ -560,50 +897,78 @@ class ViewportWidget(QOpenGLWidget):
         self._keys_held.discard(key)
 
     # ------------------------------------------------------------------ #
-    # Fly tick — WASD movement at ~60fps                                   #
+    # WASD movement tick — ~60fps                                          #
     # ------------------------------------------------------------------ #
 
-    def _fly_tick(self) -> None:
-        """
-        Called by QTimer at ~60fps while in fly mode.
-
-        Reads held keys and translates the camera in the view-space directions
-        that match the UE fly navigation model.
-        """
-        if not self._fly_mode or self._camera is None:
+    def _move_tick(self) -> None:
+        """Translate the camera with WASD/Q/E keys at ~60fps."""
+        if self._camera is None:
             return
 
         now = time.monotonic()
-        dt = now - self._last_tick_time
+        dt = min(now - self._last_tick_time, 0.1)
         self._last_tick_time = now
 
-        # Clamp dt to avoid large jumps after a pause
-        dt = min(dt, 0.1)
-
-        # Read movement keys (defaults match DEFAULT_BINDINGS)
         bindings = self._camera.settings.bindings
-        forward_key = self._qt_key(bindings.get("forward", "W"))
+        forward_key  = self._qt_key(bindings.get("forward",  "W"))
         backward_key = self._qt_key(bindings.get("backward", "S"))
-        left_key = self._qt_key(bindings.get("left", "A"))
-        right_key = self._qt_key(bindings.get("right", "D"))
-        up_key = self._qt_key(bindings.get("up", "E"))
-        down_key = self._qt_key(bindings.get("down", "Q"))
-        boost_key = self._qt_key(bindings.get("boost", "Shift"))
+        left_key     = self._qt_key(bindings.get("left",     "A"))
+        right_key    = self._qt_key(bindings.get("right",    "D"))
+        up_key       = self._qt_key(bindings.get("up",       "E"))
+        down_key     = self._qt_key(bindings.get("down",     "Q"))
 
-        fwd = (1 if forward_key in self._keys_held else 0) - (
-            1 if backward_key in self._keys_held else 0
-        )
-        right = (1 if right_key in self._keys_held else 0) - (
-            1 if left_key in self._keys_held else 0
-        )
-        up = (1 if up_key in self._keys_held else 0) - (
-            1 if down_key in self._keys_held else 0
-        )
-        boost = boost_key in self._keys_held
+        target_fwd   = float((1 if forward_key  in self._keys_held else 0) -
+                             (1 if backward_key in self._keys_held else 0))
+        target_right = float((1 if right_key    in self._keys_held else 0) -
+                             (1 if left_key     in self._keys_held else 0))
+        target_up    = float((1 if up_key       in self._keys_held else 0) -
+                             (1 if down_key     in self._keys_held else 0))
 
-        if fwd != 0 or right != 0 or up != 0:
-            self._camera.fly_move(fwd, right, up, dt, boost=boost)
+        tau   = 0.08
+        alpha = 1.0 - math.exp(-dt / tau)
+        self._vel_fwd   += (target_fwd   - self._vel_fwd)   * alpha
+        self._vel_right += (target_right - self._vel_right) * alpha
+        self._vel_up    += (target_up    - self._vel_up)    * alpha
+
+        speed   = self._camera.settings.keyboard_speed * dt
+        fwd_v   = self._camera._forward()
+        right_v = self._camera._right()
+        world_up = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+
+        delta = fwd_v * self._vel_fwd + right_v * self._vel_right + world_up * self._vel_up
+        mag = float(np.linalg.norm(delta))
+        if mag > 1e-4:
+            move = delta * (speed * min(mag, 1.0) / mag)
+            self._camera.position    += move
+            self._camera.focal_point += move
             self.update()
+        elif abs(self._vel_fwd) > 1e-4 or abs(self._vel_right) > 1e-4 or abs(self._vel_up) > 1e-4:
+            self.update()
+
+    def _mouse_binding_active(self, action_key: str) -> bool:
+        """
+        Check whether the mouse binding for action_key matches the current
+        held-button state and modifier keys.
+
+        Supports single-button bindings ("left") and chord bindings ("left+right").
+        All required buttons in the binding must be in _mouse_btns, and all
+        listed modifiers must be active.
+        """
+        if self._camera is None:
+            return False
+        binding = self._camera.settings.bindings.get(action_key)
+        if not isinstance(binding, dict):
+            return False
+        mouse = binding.get("mouse", "")
+        if mouse:
+            required_btns = set(mouse.split("+"))
+            if not required_btns.issubset(self._mouse_btns):
+                return False
+        mods = binding.get("modifiers", [])
+        for m in mods:
+            if m == "Alt" and not self._alt_held:
+                return False
+        return True
 
     @staticmethod
     def _qt_key(key_str: str) -> Qt.Key:

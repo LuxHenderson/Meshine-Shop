@@ -6,13 +6,9 @@ Unreal Engine-style navigation controls and fully user-configurable keybindings.
 It has no Qt or OpenGL dependencies; the QOpenGLWidget queries it for matrices.
 
 Navigation modes (defaults, all rebindable via ViewportSettings.bindings):
-    Fly look:   Hold RMB + drag        → update yaw/pitch
-    Fly move:   Hold RMB + WASD        → move along/across view direction
-    Fly boost:  Hold RMB + Shift       → 3× keyboard_speed
-    Fly up/dn:  Hold RMB + E/Q         → translate world-up / world-down
-    Orbit:      Alt + LMB drag         → orbit around focal_point
-    Dolly:      Scroll wheel           → move forward/back along view direction
-    Pan:        MMB drag               → translate focal_point perpendicular to view
+    Orbit:      LMB drag               → orbit around focal_point
+    Dolly:      Scroll wheel           → zoom toward cursor (surface hit or focal plane)
+    Pan:        MMB drag               → translate camera + focal_point perpendicular to view
     Frame:      F key                  → reset camera to frame the full mesh
 
 Settings and bindings are stored in ~/.meshine_shop/config.json under the
@@ -40,18 +36,16 @@ import numpy as np
 
 DEFAULT_BINDINGS: dict = {
     # Mouse controls
-    "orbit":    {"modifiers": ["Alt"], "mouse": "left"},
+    "orbit":    {"modifiers": [],      "mouse": "left"},
     "pan":      {"modifiers": [],      "mouse": "middle"},
     "dolly":    {"modifiers": [],      "mouse": "scroll"},
-    "fly_look": {"modifiers": [],      "mouse": "right"},
-    # Keyboard controls (fly mode — active while fly_look mouse button is held)
+    # Keyboard controls
     "forward":  "W",
     "left":     "A",
     "backward": "S",
     "right":    "D",
     "up":       "E",
     "down":     "Q",
-    "boost":    "Shift",
     "frame":    "F",
 }
 
@@ -59,17 +53,15 @@ DEFAULT_BINDINGS: dict = {
 BINDING_PRESETS: dict[str, dict] = {
     "Default": DEFAULT_BINDINGS.copy(),
     "Unreal Engine": {
-        "orbit":    {"modifiers": ["Alt"], "mouse": "left"},
+        "orbit":    {"modifiers": [],      "mouse": "left"},
         "pan":      {"modifiers": ["Alt"], "mouse": "right"},
         "dolly":    {"modifiers": [],      "mouse": "scroll"},
-        "fly_look": {"modifiers": [],      "mouse": "right"},
         "forward":  "W",
         "left":     "A",
         "backward": "S",
         "right":    "D",
         "up":       "E",
         "down":     "Q",
-        "boost":    "Shift",
         "frame":    "F",
     },
 }
@@ -87,10 +79,11 @@ class ViewportSettings:
     Stored in ~/.meshine_shop/config.json under the "viewport" key.
     The controls dialog reads and writes this through the camera instance.
     """
-    mouse_sensitivity: float = 0.3    # Degrees per pixel for look / orbit
-    keyboard_speed: float = 5.0       # World units per second in fly mode
+    mouse_sensitivity: float = 0.3    # Degrees per pixel for orbit
+    keyboard_speed: float = 5.0       # World units per second for WASD movement
     scroll_speed: float = 1.0         # World units per scroll tick
     invert_y: bool = False            # Invert vertical look direction
+    invert_x: bool = False            # Invert horizontal look direction
     scheme: str = "Default"           # Active preset name ("Custom" if modified)
     bindings: dict = field(default_factory=lambda: dict(DEFAULT_BINDINGS))
 
@@ -152,6 +145,7 @@ class ViewportCamera:
         # and pan operations.
         self.focal_point: np.ndarray = np.array([0.0, 0.0, 0.0], dtype=np.float64)
 
+
         # --- Settings (loaded from config or defaulted) ---
         self.settings: ViewportSettings = ViewportSettings()
         self.load_settings()
@@ -170,6 +164,7 @@ class ViewportCamera:
         s.keyboard_speed    = float(vp.get("keyboard_speed",    s.keyboard_speed))
         s.scroll_speed      = float(vp.get("scroll_speed",      s.scroll_speed))
         s.invert_y          = bool (vp.get("invert_y",          s.invert_y))
+        s.invert_x          = bool (vp.get("invert_x",          s.invert_x))
         s.scheme            = str  (vp.get("scheme",            s.scheme))
 
         # Load bindings — merge with defaults so new actions added in future
@@ -186,6 +181,7 @@ class ViewportCamera:
             "keyboard_speed":    s.keyboard_speed,
             "scroll_speed":      s.scroll_speed,
             "invert_y":          s.invert_y,
+            "invert_x":          s.invert_x,
             "scheme":            s.scheme,
             "bindings":          s.bindings,
         }
@@ -240,7 +236,7 @@ class ViewportCamera:
         fwd = self._forward()
         up  = np.array([0.0, 1.0, 0.0], dtype=np.float64)
         r   = self._right()
-        # Recompute orthogonal up from forward × right
+        # Recompute orthogonal up from right × forward
         u   = np.cross(r, fwd)
 
         # Build the 4×4 look-at view matrix.
@@ -308,52 +304,6 @@ class ViewportCamera:
         fwd = self._forward()
         self.position = centroid - fwd * dist
 
-    def fly_look(self, dx: float, dy: float) -> None:
-        """
-        Update yaw and pitch from a mouse drag delta (fly look mode).
-
-        Args:
-            dx: Horizontal mouse delta in pixels (positive = right).
-            dy: Vertical mouse delta in pixels (positive = down).
-        """
-        sens = self.settings.mouse_sensitivity
-        y_sign = -1.0 if self.settings.invert_y else 1.0
-
-        self.yaw   += math.radians(dx * sens)
-        self.pitch += math.radians(dy * sens * y_sign)
-
-        # Clamp pitch to ±89° to avoid gimbal lock at poles.
-        self.pitch = max(-math.radians(89), min(math.radians(89), self.pitch))
-
-        # Keep yaw in [−π, π].
-        self.yaw = ((self.yaw + math.pi) % (2 * math.pi)) - math.pi
-
-    def fly_move(self, forward: float, right: float, up: float,
-                 dt: float, boost: bool = False) -> None:
-        """
-        Translate the camera in fly mode based on held keys.
-
-        Args:
-            forward: +1 if moving forward, -1 if backward, 0 otherwise.
-            right:   +1 if strafing right, -1 if left, 0 otherwise.
-            up:      +1 if moving world-up, -1 if world-down, 0 otherwise.
-            dt:      Elapsed time since last tick in seconds.
-            boost:   True if Shift is held — applies 3× speed multiplier.
-        """
-        speed = self.settings.keyboard_speed * dt * (3.0 if boost else 1.0)
-        fwd = self._forward()
-        r   = self._right()
-        world_up = np.array([0.0, 1.0, 0.0], dtype=np.float64)
-
-        delta = fwd * forward + r * right + world_up * up
-        n = np.linalg.norm(delta)
-        if n > 1e-8:
-            delta /= n  # Normalise diagonal movement
-        self.position += delta * speed
-
-        # Keep focal_point locked relative to position so orbit stays coherent.
-        # (Orbit uses focal_point; panning updates it. Flying just moves position.)
-
     def orbit(self, dx: float, dy: float) -> None:
         """
         Orbit camera position around focal_point.
@@ -366,9 +316,10 @@ class ViewportCamera:
             dy: Vertical mouse delta (positive = orbit up).
         """
         sens = self.settings.mouse_sensitivity
+        x_sign = -1.0 if self.settings.invert_x else 1.0
         y_sign = -1.0 if self.settings.invert_y else 1.0
 
-        d_yaw   = math.radians(dx * sens)
+        d_yaw   = math.radians(dx * sens * x_sign)
         d_pitch = math.radians(dy * sens * y_sign)
 
         # Vector from focal_point to camera.
@@ -398,15 +349,32 @@ class ViewportCamera:
         self.pitch = math.asin(max(-1.0, min(1.0,
                                    -to_focal[1] / np.linalg.norm(to_focal))))
 
-    def dolly(self, ticks: float) -> None:
+    def dolly(self, ticks: float, direction: "np.ndarray | None" = None) -> None:
         """
-        Zoom by moving the camera forward/backward along its view direction.
+        Zoom by moving the camera along a direction.
 
         Args:
-            ticks: Scroll wheel ticks. Positive = zoom in, negative = zoom out.
+            ticks:     Scroll wheel ticks. Positive = zoom in, negative = zoom out.
+            direction: World-space vector to move along. If None, uses the camera's
+                       forward vector. Pass (target_point - position) to zoom toward
+                       a specific world point (e.g. what's under the cursor).
         """
-        fwd = self._forward()
-        self.position += fwd * (ticks * self.settings.scroll_speed)
+        if direction is None:
+            d = self._forward()
+            self.position += d * (ticks * self.settings.scroll_speed)
+        else:
+            norm = float(np.linalg.norm(direction))
+            if norm < 1e-8:
+                return
+            d = direction / norm
+            delta = d * (ticks * self.settings.scroll_speed)
+            # Move both position and focal_point by the same delta so the
+            # orbital relationship (distance, yaw, pitch) stays intact.
+            # Without this, orbit after a cursor-targeted zoom snaps because
+            # position - focal_point points in a different direction than the
+            # stored yaw/pitch.
+            self.position    += delta
+            self.focal_point += delta
 
     def pan(self, dx: float, dy: float) -> None:
         """
@@ -419,7 +387,11 @@ class ViewportCamera:
         """
         sens = self.settings.mouse_sensitivity * 0.01  # Pan is slower than look
         r   = self._right()
-        up  = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+        # Use the camera's actual up vector (perpendicular to both right and
+        # forward) instead of world Y. World Y causes arcing/spherical motion
+        # when the camera has any pitch because the vertical pan axis is then
+        # diagonal relative to the screen's vertical at non-zero pitch angles.
+        up  = np.cross(r, self._forward())
 
         delta = -r * (dx * sens) + up * (dy * sens)
         self.position    += delta

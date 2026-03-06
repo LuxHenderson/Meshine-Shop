@@ -207,17 +207,23 @@ class MeshPainter:
         origins = ray_origin[np.newaxis, :]  # (1, 3)
         dirs = ray_dir[np.newaxis, :]        # (1, 3)
 
-        # intersects_location returns (locations, index_ray, index_tri)
+        # intersects_location returns (locations, index_ray, index_tri).
+        # multiple_hits=True is required to guarantee we can select the
+        # CLOSEST hit — trimesh's BVH does not guarantee ordering with
+        # multiple_hits=False and may return a back face instead of the
+        # nearest front face.
         locations, index_ray, index_tri = self._ray_intersector.intersects_location(
-            origins, dirs, multiple_hits=False
+            origins, dirs, multiple_hits=True
         )
 
         if len(locations) == 0:
             return None  # Ray missed the mesh
 
-        # Take the closest hit (only one since multiple_hits=False)
-        hit_pos = locations[0]   # (3,)
-        face_idx = int(index_tri[0])
+        # Select the hit closest to the ray origin (front-facing surface)
+        distances = np.linalg.norm(locations - ray_origin, axis=1)
+        closest = int(np.argmin(distances))
+        hit_pos = locations[closest]
+        face_idx = int(index_tri[closest])
 
         # Compute UV via barycentric interpolation over the face's UV triangle
         uv_coord = self._barycentric_uv(face_idx, hit_pos)
@@ -448,6 +454,30 @@ class MeshPainter:
         )
         faces = np.asarray(self._mesh.faces, dtype=np.uint32)
         return verts, norms, uvs, faces
+
+    def ray_cast_world_pos(
+        self, ray_origin: np.ndarray, ray_dir: np.ndarray
+    ) -> np.ndarray | None:
+        """
+        Cast a ray and return the world-space hit position, or None on miss.
+
+        Unlike ray_cast(), this skips UV computation and only returns the 3D
+        intersection point. Used by the viewport to determine the orbit pivot
+        when the user clicks on the mesh surface.
+        """
+        if self._uvs is None:
+            return None
+        origins = ray_origin[np.newaxis, :]
+        dirs    = ray_dir[np.newaxis, :]
+        # Use multiple_hits=True so we can pick the closest hit explicitly —
+        # multiple_hits=False does not guarantee the nearest surface is returned.
+        locations, _, _ = self._ray_intersector.intersects_location(
+            origins, dirs, multiple_hits=True
+        )
+        if len(locations) == 0:
+            return None
+        distances = np.linalg.norm(locations - ray_origin, axis=1)
+        return locations[int(np.argmin(distances))].astype(np.float64)
 
     def get_bbox(self) -> tuple[np.ndarray, np.ndarray]:
         """

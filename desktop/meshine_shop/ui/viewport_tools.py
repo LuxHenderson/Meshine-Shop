@@ -56,7 +56,6 @@ MOUSE_ACTIONS = [
     ("orbit",    "Orbit"),
     ("pan",      "Pan"),
     ("dolly",    "Dolly"),
-    ("fly_look", "Fly Look"),
 ]
 
 KEY_ACTIONS = [
@@ -66,7 +65,6 @@ KEY_ACTIONS = [
     ("right",    "Move Right"),
     ("up",       "Move Up"),
     ("down",     "Move Down"),
-    ("boost",    "Speed Boost"),
     ("frame",    "Frame Mesh"),
 ]
 
@@ -78,16 +76,20 @@ def _binding_to_label(key: str, binding) -> str:
     """
     Convert a raw binding value to a human-readable string for display.
 
-    Mouse bindings are dicts like {"modifiers": ["Alt"], "mouse": "left"}.
+    Mouse bindings are dicts like {"modifiers": ["Alt"], "mouse": "left"} or
+    chord bindings like {"modifiers": [], "mouse": "left+right"}.
     Keyboard bindings are plain strings like "W", "Shift".
     """
     if isinstance(binding, dict):
         mods = binding.get("modifiers", [])
         mouse = binding.get("mouse", "")
         scroll = binding.get("scroll", "")
-        parts = mods + (
-            [f"{mouse.title()} Mouse Button"] if mouse else []
-        ) + (["Scroll Wheel"] if scroll else [])
+        # Support multi-button chords stored as "left+right" etc.
+        btn_parts = (
+            [f"{b.title()} Mouse Button" for b in mouse.split("+")]
+            if mouse else []
+        )
+        parts = mods + btn_parts + (["Scroll Wheel"] if scroll else [])
         return " + ".join(parts) if parts else "(none)"
     return str(binding) if binding else "(none)"
 
@@ -217,7 +219,6 @@ class _MouseControlsPage(QWidget):
             self._rows[action_key] = row
 
         layout.addStretch()
-        self._capturing: str | None = None  # key being captured
 
     def refresh(self) -> None:
         """Refresh all pills from the current camera settings."""
@@ -239,16 +240,16 @@ class _MouseControlsPage(QWidget):
         self.bindings_changed.emit()
 
     def _on_edit(self, action_key: str) -> None:
-        # For mouse bindings the dialog just shows a message — full capture
-        # mode requires a native event filter which is beyond scope for now.
-        self._rows[action_key].set_capturing(True)
-        self._capturing = action_key
-        log.debug("Mouse binding capture not yet implemented for %s", action_key)
-        # Immediately cancel capture for now (future work: native event filter)
-        self._rows[action_key].set_binding(
-            self._camera.settings.bindings.get(action_key)
-        )
-        self._capturing = None
+        # Open the mouse capture dialog and wait for a click or scroll.
+        capture_dlg = _MouseCaptureDialog(action_key, self)
+        if capture_dlg.exec() == QDialog.DialogCode.Accepted:
+            new_binding = capture_dlg.captured_binding
+            if new_binding:
+                bindings = dict(self._camera.settings.bindings)
+                bindings[action_key] = new_binding
+                self._camera.apply_bindings(bindings, scheme="Custom")
+                self._rows[action_key].set_binding(new_binding)
+                self.bindings_changed.emit()
 
 
 class _KeyboardControlsPage(QWidget):
@@ -317,6 +318,156 @@ class _KeyboardControlsPage(QWidget):
                 self._camera.apply_bindings(bindings, scheme="Custom")
                 self._rows[action_key].set_binding(new_key)
                 self.bindings_changed.emit()
+
+
+class _MouseCaptureDialog(QDialog):
+    """
+    Modal dialog that captures mouse button chords and scroll gestures.
+
+    Uses a QApplication event filter to intercept mouse events from all
+    child widgets (not just the dialog background), fixing the bug where
+    clicking on a label or empty area would be silently ignored.
+
+    Chord detection: the user holds one or more buttons simultaneously.
+    The status label updates live showing what's held. On release of all
+    buttons the chord is confirmed and the dialog closes. This lets the
+    user bind e.g. LMB+RMB by pressing both then releasing.
+
+    Stored binding format:
+        Single button: {"modifiers": [...], "mouse": "left"}
+        Chord:         {"modifiers": [...], "mouse": "left+right"}
+        Scroll:        {"modifiers": [...], "scroll": "y"}
+    """
+
+    from PySide6.QtWidgets import QApplication as _QApp
+
+    # Map Qt mouse button enum values to binding string names
+    _BUTTON_NAMES = {
+        Qt.MouseButton.LeftButton:   "left",
+        Qt.MouseButton.MiddleButton: "middle",
+        Qt.MouseButton.RightButton:  "right",
+    }
+
+    def __init__(self, action_label: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Rebind Mouse")
+        self.setFixedSize(340, 155)
+        self.captured_binding: dict = {}
+
+        # Set of button names ("left", "right", etc.) currently held down
+        self._btns_held: set[str] = set()
+        # Binding built from the current held state (confirmed on release)
+        self._pending: dict = {}
+
+        layout = QVBoxLayout(self)
+
+        # Instruction
+        instr = QLabel(f"Hold button(s) then release to bind to:\n{action_label}")
+        instr.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(instr)
+
+        # Live status showing what's currently held
+        self._status = QLabel("(waiting for input…)")
+        self._status.setObjectName("binding_pill")
+        self._status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self._status)
+
+        # Cancel — its clicked signal fires on release inside the button,
+        # before our eventFilter sees the release, so reject() is called first
+        # and the dialog is already closed when we check _btns_held.
+        self._cancel_btn = QPushButton("Cancel")
+        self._cancel_btn.clicked.connect(self.reject)
+        layout.addWidget(self._cancel_btn)
+
+        # Install globally so we catch events on child widgets too
+        from PySide6.QtWidgets import QApplication
+        QApplication.instance().installEventFilter(self)
+
+    def done(self, result: int) -> None:
+        """Remove the app-wide event filter before closing."""
+        from PySide6.QtWidgets import QApplication
+        QApplication.instance().removeEventFilter(self)
+        super().done(result)
+
+    def _in_dialog(self, widget) -> bool:
+        """Return True if widget is this dialog or a descendant of it."""
+        w = widget
+        while w is not None:
+            if w is self:
+                return True
+            w = w.parent()
+        return False
+
+    def _active_modifiers(self) -> list[str]:
+        """Return currently held modifier key names."""
+        from PySide6.QtWidgets import QApplication
+        mods = QApplication.keyboardModifiers()
+        result = []
+        if mods & Qt.KeyboardModifier.AltModifier:
+            result.append("Alt")
+        if mods & Qt.KeyboardModifier.ControlModifier:
+            result.append("Ctrl")
+        if mods & Qt.KeyboardModifier.ShiftModifier:
+            result.append("Shift")
+        return result
+
+    def _update_status(self) -> None:
+        """Refresh the status label and rebuild _pending from current state."""
+        if not self._btns_held:
+            self._status.setText("(waiting for input…)")
+            self._pending = {}
+            return
+        mods = self._active_modifiers()
+        # Sort for consistent display and storage ordering
+        btn_parts = [f"{b.title()} Mouse Button" for b in sorted(self._btns_held)]
+        self._status.setText(" + ".join(mods + btn_parts))
+        self._pending = {
+            "modifiers": mods,
+            "mouse": "+".join(sorted(self._btns_held)),
+        }
+
+    def eventFilter(self, obj, event) -> bool:
+        """
+        Intercept mouse press/release/wheel events from anywhere inside the
+        dialog so we catch clicks on labels and empty areas, not just the
+        dialog background.
+        """
+        from PySide6.QtCore import QEvent
+
+        if not self._in_dialog(obj):
+            return False  # ignore events from outside this dialog
+
+        t = event.type()
+
+        if t == QEvent.Type.MouseButtonPress:
+            btn_name = self._BUTTON_NAMES.get(event.button())
+            if btn_name:
+                # Skip if the press is on the Cancel button — let it reject normally
+                if obj is self._cancel_btn:
+                    return False
+                self._btns_held.add(btn_name)
+                self._update_status()
+            return False  # don't consume — let normal Qt routing continue
+
+        if t == QEvent.Type.MouseButtonRelease:
+            btn_name = self._BUTTON_NAMES.get(event.button())
+            if btn_name and btn_name in self._btns_held:
+                self._btns_held.discard(btn_name)
+                if not self._btns_held and self._pending:
+                    # All buttons released — confirm the chord
+                    self.captured_binding = self._pending
+                    self.accept()
+            return False
+
+        if t == QEvent.Type.Wheel:
+            self.captured_binding = {
+                "modifiers": self._active_modifiers(),
+                "scroll": "y",
+            }
+            self.accept()
+            return True  # consume the scroll so it doesn't scroll the dialog
+
+        return False
 
 
 class _KeyCaptureDialog(QDialog):
@@ -410,10 +561,16 @@ class _MovementSpeedPage(QWidget):
             0.1, 5.0, 0.1,
         )
 
-        # Invert Y checkbox
+        # Invert axis checkboxes — laid out side-by-side
+        invert_row = QHBoxLayout()
+        self._invert_x = QCheckBox("Invert X Axis")
+        self._invert_x.setChecked(camera.settings.invert_x)
         self._invert_y = QCheckBox("Invert Y Axis")
         self._invert_y.setChecked(camera.settings.invert_y)
-        layout.addWidget(self._invert_y)
+        invert_row.addWidget(self._invert_x)
+        invert_row.addWidget(self._invert_y)
+        invert_row.addStretch()
+        layout.addLayout(invert_row)
 
         layout.addStretch()
 
@@ -446,6 +603,7 @@ class _MovementSpeedPage(QWidget):
         s.mouse_sensitivity = self._mouse_sensitivity.value()
         s.keyboard_speed = self._keyboard_speed.value()
         s.scroll_speed = self._scroll_speed.value()
+        s.invert_x = self._invert_x.isChecked()
         s.invert_y = self._invert_y.isChecked()
         self._camera.save_settings()
 
