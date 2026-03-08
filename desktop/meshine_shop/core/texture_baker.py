@@ -378,8 +378,46 @@ def bake_usdz_maps_texelspace(mesh, usdz_extract_dir, output_dir, on_progress,
             on_progress("No mesh prim found in USDZ — skipping texel-space baking")
             return {}
 
+        import math
+
         # Extract vertex positions and face-vertex indices.
         orig_points = np.array(mesh_prim.GetPointsAttr().Get(), dtype=np.float32)
+
+        # Apply the world transform (identity in current Object Capture output,
+        # kept for forward-compatibility).
+        xform_cache = UsdGeom.XformCache(Usd.TimeCode.Default())
+        world_xform = xform_cache.GetLocalToWorldTransform(mesh_prim.GetPrim())
+        mat = np.array(world_xform, dtype=np.float32).reshape(4, 4)
+        pts_h = np.column_stack([orig_points, np.ones(len(orig_points), dtype=np.float32)])
+        orig_points = (pts_h @ mat)[:, :3]
+
+        # --- Auto-level: same PCA correction as apple_engine.py ---
+        # Must use the same rotation so the BVH built here aligns with the
+        # UV mesh produced from the leveled PLY; if they differ, texture
+        # projection samples the wrong source pixels.
+        pts64 = orig_points.astype(np.float64)
+        centered_all = pts64 - pts64.mean(axis=0)
+        cov = (centered_all.T @ centered_all) / len(centered_all)
+        eigenvalues, eigenvectors = np.linalg.eigh(cov)
+        height_axis = eigenvectors[:, -1]
+        if height_axis[1] < 0:
+            height_axis = -height_axis
+        world_up = np.array([0.0, 1.0, 0.0])
+        cos_a = float(np.clip(np.dot(height_axis, world_up), -1.0, 1.0))
+        if cos_a < math.cos(math.radians(1.0)):
+            rot_axis = np.cross(height_axis, world_up)
+            rot_axis_norm = np.linalg.norm(rot_axis)
+            if rot_axis_norm > 1e-8:
+                rot_axis /= rot_axis_norm
+                angle = math.acos(cos_a)
+                K = np.array([[ 0,           -rot_axis[2],  rot_axis[1]],
+                              [ rot_axis[2],   0,           -rot_axis[0]],
+                              [-rot_axis[1],   rot_axis[0],  0          ]])
+                R = (np.eye(3)
+                     + math.sin(angle) * K
+                     + (1 - math.cos(angle)) * (K @ K)).astype(np.float32)
+                orig_points = (R @ orig_points.T).T
+
         orig_face_indices = np.array(mesh_prim.GetFaceVertexIndicesAttr().Get())
 
         # Find the UV primvar. USD stores UVs as faceVarying primvars named

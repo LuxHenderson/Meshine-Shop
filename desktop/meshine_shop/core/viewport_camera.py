@@ -298,9 +298,9 @@ class ViewportCamera:
         dist = (diagonal / 2.0) / math.tan(math.radians(30.0)) * 1.2
 
         self.focal_point = centroid.copy()
-        # Start slightly above and in front of the centroid.
+        # Slightly elevated front view — camera above centroid, looking down at model.
         self.yaw   = 0.0
-        self.pitch = math.radians(-15.0)  # Look down slightly
+        self.pitch = math.radians(20.0)  # positive pitch = camera high, looking down
         fwd = self._forward()
         self.position = centroid - fwd * dist
 

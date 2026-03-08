@@ -362,8 +362,52 @@ class AppleObjectCaptureEngine(ReconstructionEngine):
                     "No mesh geometry found in USD file."
                 )
 
+            import math
+
             # Extract vertices and face indices from the USD mesh.
             points = np.array(mesh_prim.GetPointsAttr().Get(), dtype=np.float64)
+
+            # Apply the mesh prim's world transform (identity in current Object Capture
+            # output, kept for forward-compatibility with future USD versions).
+            # USD uses row vectors: p_world = p_local @ M (4×4, row-major).
+            xform_cache = UsdGeom.XformCache(Usd.TimeCode.Default())
+            world_xform = xform_cache.GetLocalToWorldTransform(mesh_prim.GetPrim())
+            mat = np.array(world_xform).reshape(4, 4)
+            points_h = np.column_stack([points, np.ones(len(points))])
+            points = (points_h @ mat)[:, :3]
+
+            # --- Auto-level: align the mesh's principal height axis with world Y ---
+            # Object Capture uses ARKit gravity sensing to determine "up," but small
+            # device tilt during capture leaves the mesh a few degrees off vertical.
+            # PCA on ALL vertices finds the direction of maximum variance — for any
+            # upright object this is the height axis. Rotating it to align with world Y
+            # is more robust than fitting to the bottom vertices, which fails for objects
+            # with complex feet/bases (figurines, characters, etc.).
+            # The same rotation is applied in texture_baker.py so the USDZ BVH stays
+            # in the same coordinate space as the UV-unwrapped mesh.
+            centered_all = points - points.mean(axis=0)
+            cov = (centered_all.T @ centered_all) / len(centered_all)
+            eigenvalues, eigenvectors = np.linalg.eigh(cov)
+            # eigh returns eigenvalues ascending; last column = max-variance direction
+            height_axis = eigenvectors[:, -1]
+            if height_axis[1] < 0:
+                height_axis = -height_axis  # ensure it points toward +Y
+            world_up = np.array([0.0, 1.0, 0.0])
+            cos_a = float(np.clip(np.dot(height_axis, world_up), -1.0, 1.0))
+            if cos_a < math.cos(math.radians(1.0)):  # only correct if tilt > 1°
+                rot_axis = np.cross(height_axis, world_up)
+                rot_axis_norm = np.linalg.norm(rot_axis)
+                if rot_axis_norm > 1e-8:
+                    rot_axis /= rot_axis_norm
+                    angle = math.acos(cos_a)
+                    K = np.array([[ 0,          -rot_axis[2],  rot_axis[1]],
+                                  [ rot_axis[2],  0,          -rot_axis[0]],
+                                  [-rot_axis[1],  rot_axis[0],  0         ]])
+                    R = (np.eye(3)
+                         + math.sin(angle) * K
+                         + (1 - math.cos(angle)) * (K @ K))
+                    points = (R @ points.T).T
+
             face_indices = np.array(mesh_prim.GetFaceVertexIndicesAttr().Get())
             face_counts = np.array(mesh_prim.GetFaceVertexCountsAttr().Get())
 

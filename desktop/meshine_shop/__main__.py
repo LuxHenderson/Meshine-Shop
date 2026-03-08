@@ -47,7 +47,7 @@ def main():
 
     # Create and display the main application window.
     window = MeshineShopApp()
-    window.show()
+    window.showMaximized()
 
     # app.exec() enters the Qt event loop — blocking here until the window
     # is closed. sys.exit ensures the process returns Qt's exit code to the OS.

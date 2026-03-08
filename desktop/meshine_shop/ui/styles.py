@@ -532,6 +532,30 @@ QLabel#viewport_placeholder {
     font-size: 13px;
 }
 
+/* Reset Rotation button — sits above the Controls gear button.
+   Subtle styling so it reads as secondary to the tool buttons. */
+QPushButton#reset_rotation_btn {
+    background: transparent;
+    color: #999999;
+    border: 1px solid #3a3a3a;
+    border-radius: 4px;
+    padding: 6px 8px;
+    font-size: 12px;
+    text-align: left;
+}
+
+QPushButton#reset_rotation_btn:hover {
+    background: #333333;
+    color: #e0e0e0;
+    border-color: #555555;
+}
+
+QPushButton#reset_rotation_btn:pressed {
+    background: #2d2d2d;
+    color: #e0e0e0;
+    border-color: #dc3545;
+}
+
 /* ===== Viewport Controls Dialog ===== */
 /* The scheme selector bar at the top of the controls dialog. */
 QWidget#controls_scheme_bar {

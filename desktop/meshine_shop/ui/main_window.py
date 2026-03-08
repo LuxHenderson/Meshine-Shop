@@ -273,6 +273,8 @@ class ViewportView(QWidget):
         self.tools.color_changed.connect(self.viewport.set_paint_color)
         self.tools.brush_size_changed.connect(self.viewport.set_brush_size)
         self.tools.opacity_changed.connect(self.viewport.set_brush_opacity)
+        # Reset Rotation button → snap mesh back to original orientation
+        self.tools.reset_rotation_requested.connect(self.viewport.reset_model_rotation)
 
     def set_mesh_ready(self, workspace: WorkspacePaths) -> None:
         """

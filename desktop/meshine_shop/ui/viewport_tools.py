@@ -19,7 +19,6 @@ import logging
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
-    QButtonGroup,
     QCheckBox,
     QColorDialog,
     QDialog,
@@ -735,6 +734,8 @@ class ViewportToolsPanel(QWidget):
     color_changed = Signal(tuple)
     brush_size_changed = Signal(int)
     opacity_changed = Signal(float)
+    # Emitted when the user clicks the "Reset Rotation" button
+    reset_rotation_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -760,17 +761,14 @@ class ViewportToolsPanel(QWidget):
         tool_row = QHBoxLayout()
         tool_row.setSpacing(6)
 
-        # Mutually exclusive checkable tool buttons
-        self._btn_group = QButtonGroup(self)
-        self._btn_group.setExclusive(True)
-
+        # Checkable tool buttons — manually exclusive so clicking an active
+        # button deactivates it (no tool selected). A QButtonGroup with
+        # exclusive=True would prevent un-checking the active button.
         self._brush_btn = QPushButton("🖌")
         self._brush_btn.setObjectName("tool_button")
         self._brush_btn.setCheckable(True)
-        self._brush_btn.setChecked(True)
         self._brush_btn.setToolTip("Brush — paint on the mesh surface")
         self._brush_btn.setFixedSize(40, 40)
-        self._btn_group.addButton(self._brush_btn)
         tool_row.addWidget(self._brush_btn)
 
         self._region_btn = QPushButton("⬤")
@@ -778,18 +776,25 @@ class ViewportToolsPanel(QWidget):
         self._region_btn.setCheckable(True)
         self._region_btn.setToolTip("Region Select — flood-fill a connected region")
         self._region_btn.setFixedSize(40, 40)
-        self._btn_group.addButton(self._region_btn)
         tool_row.addWidget(self._region_btn)
+
+        # Rotate tool — shows gizmo rings for X/Y/Z axis rotation
+        self._rotate_btn = QPushButton("⟳")
+        self._rotate_btn.setObjectName("tool_button")
+        self._rotate_btn.setCheckable(True)
+        self._rotate_btn.setToolTip("Rotate — drag the X/Y/Z rings to rotate the mesh")
+        self._rotate_btn.setFixedSize(40, 40)
+        tool_row.addWidget(self._rotate_btn)
 
         tool_row.addStretch()
         layout.addLayout(tool_row)
 
-        self._brush_btn.toggled.connect(
-            lambda checked: self.tool_changed.emit("brush") if checked else None
-        )
-        self._region_btn.toggled.connect(
-            lambda checked: self.tool_changed.emit("region") if checked else None
-        )
+        # Wire click handlers — each button manages mutual exclusivity and
+        # emits tool_changed("") when toggled off so the viewport knows no
+        # tool is active.
+        self._brush_btn.clicked.connect(self._on_brush_clicked)
+        self._region_btn.clicked.connect(self._on_region_clicked)
+        self._rotate_btn.clicked.connect(self._on_rotate_clicked)
 
         # ------------------------------------------------------------------ #
         # Divider                                                              #
@@ -866,6 +871,17 @@ class ViewportToolsPanel(QWidget):
         layout.addStretch()
 
         # ------------------------------------------------------------------ #
+        # Reset Rotation button (always visible; no-op when not rotated)      #
+        # ------------------------------------------------------------------ #
+        self._reset_rot_btn = QPushButton("↺  Reset Rotation")
+        self._reset_rot_btn.setObjectName("reset_rotation_btn")
+        self._reset_rot_btn.setToolTip(
+            "Snap the mesh back to its original orientation"
+        )
+        self._reset_rot_btn.clicked.connect(self.reset_rotation_requested.emit)
+        layout.addWidget(self._reset_rot_btn)
+
+        # ------------------------------------------------------------------ #
         # Divider above gear button                                            #
         # ------------------------------------------------------------------ #
         div2 = QFrame()
@@ -881,6 +897,37 @@ class ViewportToolsPanel(QWidget):
         controls_btn.setToolTip("Open viewport navigation controls settings")
         controls_btn.clicked.connect(self._open_controls_dialog)
         layout.addWidget(controls_btn)
+
+    # ------------------------------------------------------------------ #
+    # Tool toggle handlers                                                 #
+    # ------------------------------------------------------------------ #
+
+    def _on_brush_clicked(self) -> None:
+        """Toggle brush on/off; deactivate region and rotate if active."""
+        if self._brush_btn.isChecked():
+            self._region_btn.setChecked(False)
+            self._rotate_btn.setChecked(False)
+            self.tool_changed.emit("brush")
+        else:
+            self.tool_changed.emit("")
+
+    def _on_region_clicked(self) -> None:
+        """Toggle region select on/off; deactivate brush and rotate if active."""
+        if self._region_btn.isChecked():
+            self._brush_btn.setChecked(False)
+            self._rotate_btn.setChecked(False)
+            self.tool_changed.emit("region")
+        else:
+            self.tool_changed.emit("")
+
+    def _on_rotate_clicked(self) -> None:
+        """Toggle rotate on/off; deactivate brush and region if active."""
+        if self._rotate_btn.isChecked():
+            self._brush_btn.setChecked(False)
+            self._region_btn.setChecked(False)
+            self.tool_changed.emit("rotate")
+        else:
+            self.tool_changed.emit("")
 
     # ------------------------------------------------------------------ #
     # Camera reference                                                     #
