@@ -36,75 +36,49 @@ QWidget {
     font-size: 13px;
 }
 
-/* ===== Sidebar ===== */
-/* The sidebar sits on the left edge of the window. Slightly darker
-   background than the main canvas to distinguish the menu zone. The
-   right border is now handled by a dedicated QFrame separator widget
-   in app.py for precise 1px rendering. */
-QWidget#sidebar {
+/* ===== Top Navigation Bar ===== */
+/* Slim 40px horizontal strip at the top of the window. Slightly darker
+   than the main canvas to visually anchor the navigation zone. The bottom
+   border is handled by a dedicated QFrame separator in app.py. */
+QWidget#top_nav_bar {
     background-color: #252525;
 }
 
-/* App title at the top of the sidebar. */
-QLabel#sidebar_title {
-    color: #dc3545;
-    font-size: 16px;
-    font-weight: 700;
-    letter-spacing: 2px;
-    padding: 0 8px 16px 8px;
-}
-
-/* Horizontal rule below the sidebar title — visually separates branding
-   from the navigation items. */
-QFrame#sidebar_divider {
-    background-color: #3a3a3a;
-    border: none;
-}
-
-/* "NAVIGATION" section label — small all-caps label that groups the
-   nav buttons and makes the sidebar read as a structured menu. */
-QLabel#nav_section_label {
-    color: #4a5568;
-    font-size: 10px;
-    font-weight: 600;
-    letter-spacing: 1.5px;
-    padding: 12px 8px 4px 8px;
-}
-
-/* Vertical separator line between sidebar and main content. */
+/* Horizontal separator line between the nav bar and main content. */
 QFrame#sidebar_separator {
     background-color: #3a3a3a;
     border: none;
 }
 
-/* Navigation buttons — transparent by default so they blend into the
-   sidebar. Muted text keeps inactive items visually quiet. A left border
-   is reserved for the active state indicator. */
+/* Navigation tab buttons — fill the bar width equally (equal stretch weights
+   assigned in sidebar.py). Transparent background by default; muted text keeps
+   inactive tabs visually quiet. A bottom border slot is reserved for the active
+   state indicator — tab-strip convention for a horizontal nav bar. */
 QPushButton#nav_button {
     background-color: transparent;
     border: none;
-    border-left: 3px solid transparent;
+    border-bottom: 3px solid transparent;
     border-radius: 0px;
     color: #999999;
     font-size: 13px;
     font-weight: 500;
-    padding: 12px 20px;
-    text-align: left;
+    padding: 0 20px;
+    text-align: center;
 }
 
 /* Hover state — subtle background lift and brighter text. */
 QPushButton#nav_button:hover {
     background-color: #333333;
     color: #d4d4d4;
-    border-left: 3px solid #555555;
+    border-bottom: 3px solid #555555;
 }
 
-/* Checked/active state — crimson left accent bar clearly marks the
-   current view, a standard navigation pattern in sidebar menus. */
+/* Checked/active state — crimson bottom accent clearly marks the current
+   tab, matching the tab-strip convention for horizontal navigation. */
 QPushButton#nav_button:checked {
     background-color: #2d2d2d;
     color: #dc3545;
-    border-left: 3px solid #dc3545;
+    border-bottom: 3px solid #dc3545;
 }
 
 /* ===== Drop Zone ===== */
@@ -435,6 +409,15 @@ QComboBox#quality_combo QAbstractItemView {
     border: 1px solid #3a3a3a;
     selection-background-color: #3a3a3a;
     selection-color: #dc3545;
+}
+
+/* ===== Viewport Layers Panel ===== */
+/* The 200px fixed-width left panel on the Viewport page. Mirrors the tools
+   panel visually — same dark surface, same font hierarchy. Border is on the
+   right edge so it separates cleanly from the OpenGL viewport on the right. */
+QWidget#viewport_layers_panel {
+    background-color: #252525;
+    border-right: 1px solid #3a3a3a;
 }
 
 /* ===== Viewport Tools Panel ===== */

@@ -1,106 +1,83 @@
 """
-Sidebar navigation widget for Meshine Shop.
+Top navigation bar for Meshine Shop.
 
-The sidebar provides the primary navigation for the application. It contains
-four nav buttons — Import, Process, Viewport, and Export — which correspond
-to the four main stages of the photogrammetry workflow.
+Replaces the original vertical sidebar with a slim horizontal bar that sits
+above the main content area. The four workflow tabs — Import, Process,
+Viewport, Export — are evenly distributed across the full bar width so each
+one takes identical space regardless of label length.
 
-Navigation uses Qt's signal/slot system: when a button is clicked, the
-sidebar emits a nav_changed signal with the button's index. The main
-content area listens for this signal and swaps to the corresponding view.
+The same nav_changed(int) signal and QButtonGroup wiring from the original
+Sidebar are preserved exactly, so nothing in app.py needs to change beyond
+swapping to a vertical layout. Callers still refer to self.sidebar and
+self.sidebar.button_group as before.
 
-QButtonGroup is used with exclusive mode to ensure only one nav button
-can be active at a time, which mirrors the single-view-at-a-time behavior
-of the stacked widget in MainContent.
+Design decisions:
+    - Fixed height (40px) keeps the chrome minimal so the viewport gets maximum space.
+    - Equal stretch weights on every button ensure perfectly even spacing at any window width.
+    - Active indicator is a crimson bottom border (tab-strip convention) rather than a
+      left border, which reads better on a horizontal bar.
+    - "MESHINE SHOP" branding is the window title; the bar is navigation only.
 """
 
-from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QLabel, QPushButton, QButtonGroup, QFrame,
-)
-from PySide6.QtCore import Signal, Qt
+from PySide6.QtWidgets import QWidget, QHBoxLayout, QPushButton, QButtonGroup
+from PySide6.QtCore import Signal
 
 
 class Sidebar(QWidget):
-    # Custom signal emitted when the user clicks a nav button.
-    # Carries the integer index of the selected button (0=Import,
-    # 1=Process, 2=Viewport, 3=Export), which maps directly to the
-    # stacked widget indices in MainContent.
+    """
+    Slim horizontal top navigation bar.
+
+    Emits nav_changed(int) when the user selects a tab, matching the
+    original Sidebar contract so all downstream wiring is unchanged.
+    """
+
+    # Same signal as the original Sidebar — downstream code is unaffected.
     nav_changed = Signal(int)
 
-    # Navigation item definitions: (display label, tooltip description).
-    # These are iterated to build the nav buttons dynamically, making it
-    # easy to add new sections later without touching the layout code.
+    # Tab definitions: (display label, tooltip).
+    # Order matches the QStackedWidget indices in MainContent.
     NAV_ITEMS = [
         ("Import",   "Drag & drop photo sets"),
         ("Process",  "Run the pipeline"),
-        ("Viewport", "Inspect and paint textures"),   # index 2 — Phase 5
-        ("Export",   "Download game-ready assets"),   # index 3 (was 2)
+        ("Viewport", "Inspect and paint textures"),
+        ("Export",   "Download game-ready assets"),
     ]
 
     def __init__(self):
         super().__init__()
-        # Object name is used by QSS to target sidebar-specific styles.
-        self.setObjectName("sidebar")
-        # Fixed width ensures the sidebar never stretches or shrinks
-        # when the window is resized — only the main content area flexes.
-        self.setFixedWidth(220)
+        # Object name used by QSS to apply the top-bar background.
+        self.setObjectName("top_nav_bar")
+        # Fixed height keeps the bar slim — just tall enough for comfortable
+        # click targets without wasting vertical space above the content area.
+        self.setFixedHeight(40)
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 20, 12, 20)
-        layout.setSpacing(4)
+        # Horizontal layout with no margins or inter-widget spacing.
+        # Even distribution is achieved by assigning stretch=1 to every button
+        # (see the addWidget calls below), not by adding spacers.
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
-        # App branding — displayed at the top of the sidebar in crimson
-        # with letter-spacing for a clean, logo-like appearance.
-        title = QLabel("MESHINE SHOP")
-        title.setObjectName("sidebar_title")
-        layout.addWidget(title)
-
-        # Horizontal rule below the branding — visually separates the app
-        # title from the navigation items, reinforcing the menu structure.
-        title_divider = QFrame()
-        title_divider.setObjectName("sidebar_divider")
-        title_divider.setFrameShape(QFrame.Shape.HLine)
-        title_divider.setFrameShadow(QFrame.Shadow.Plain)
-        title_divider.setFixedHeight(1)
-        layout.addWidget(title_divider)
-
-        # "NAVIGATION" section label — provides context for the buttons
-        # below it, making the sidebar read clearly as a structured menu.
-        nav_label = QLabel("NAVIGATION")
-        nav_label.setObjectName("nav_section_label")
-        layout.addWidget(nav_label)
-
-        # QButtonGroup enforces mutual exclusivity — clicking one button
-        # automatically unchecks the others. Each button is assigned an
-        # integer ID matching its position, which becomes the signal payload.
+        # QButtonGroup enforces mutual exclusivity — clicking one tab
+        # automatically unchecks the others, same as the original sidebar.
         self.button_group = QButtonGroup(self)
         self.button_group.setExclusive(True)
 
-        for i, (label, _tooltip) in enumerate(self.NAV_ITEMS):
+        for i, (label, tooltip) in enumerate(self.NAV_ITEMS):
             btn = QPushButton(label)
-            # Object name allows QSS to style all nav buttons uniformly.
+            # Shared object name so all tab buttons receive the same QSS rules.
             btn.setObjectName("nav_button")
-            # Checkable buttons maintain a pressed/active state, which
-            # QSS uses to apply the :checked style (crimson left accent).
+            # Checkable so Qt tracks the active/pressed state for QSS :checked.
             btn.setCheckable(True)
-            btn.setToolTip(_tooltip)
+            btn.setToolTip(tooltip)
             self.button_group.addButton(btn, i)
-            layout.addWidget(btn)
+            # stretch=1 on every button → they all receive equal width as the
+            # window resizes, keeping the tabs perfectly evenly spaced.
+            layout.addWidget(btn, 1)
 
-        # Stretch pushes the version label to the bottom of the sidebar.
-        layout.addStretch()
-
-        # Version indicator — dimmed so it's visible but unobtrusive.
-        # Useful for debugging and user-facing release identification.
-        version = QLabel("v0.1.0")
-        version.setStyleSheet("color: #4a5568; font-size: 11px; padding: 0 8px;")
-        layout.addWidget(version)
-
-        # Default to the Import view on launch — this is the natural
-        # starting point of the workflow (import photos first).
+        # Default to Import on launch — the natural workflow start point.
         self.button_group.button(0).setChecked(True)
 
-        # Forward the button group's idClicked signal as our nav_changed signal.
-        # This decouples the sidebar's internal implementation from consumers —
-        # they just listen for nav_changed(int) without knowing about QButtonGroup.
+        # Forward the button group's idClicked signal as nav_changed so callers
+        # don't need to know about QButtonGroup internals.
         self.button_group.idClicked.connect(self.nav_changed.emit)

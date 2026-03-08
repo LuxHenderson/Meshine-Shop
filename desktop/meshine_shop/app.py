@@ -20,7 +20,7 @@ all visual design centralized in one place (styles.py) and makes
 future theme changes trivial.
 """
 
-from PySide6.QtWidgets import QMainWindow, QHBoxLayout, QWidget, QStatusBar, QFrame
+from PySide6.QtWidgets import QMainWindow, QHBoxLayout, QVBoxLayout, QWidget, QStatusBar, QFrame
 from PySide6.QtCore import Qt
 
 from meshine_shop.ui.sidebar import Sidebar
@@ -53,29 +53,26 @@ class MeshineShopApp(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
 
-        # Horizontal layout: sidebar on the left, main content on the right.
-        # Zero margins and spacing ensure the sidebar and content area sit
-        # flush against each other with no gaps.
-        layout = QHBoxLayout(central)
+        # Vertical layout: slim top nav bar, then main content below.
+        # Zero margins and spacing keep everything flush with no gaps.
+        layout = QVBoxLayout(central)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # Sidebar handles navigation between the three main views.
+        # Top nav bar — slim horizontal strip with evenly spaced tabs.
         self.sidebar = Sidebar()
-        # MainContent uses a QStackedWidget to swap between Import/Process/Export.
+        # MainContent uses a QStackedWidget to swap between Import/Process/Viewport/Export.
         self.main_content = MainContent()
 
-        # Vertical separator — a 1px QFrame line that visually divides the
-        # sidebar menu from the main content area. More reliable than the CSS
-        # border-right approach because QFrame always renders at exactly 1px.
+        # Horizontal separator — 1px line between the nav bar and content area,
+        # matching the visual weight of the old vertical sidebar divider.
         separator = QFrame()
         separator.setObjectName("sidebar_separator")
-        separator.setFrameShape(QFrame.Shape.VLine)
+        separator.setFrameShape(QFrame.Shape.HLine)
         separator.setFrameShadow(QFrame.Shadow.Plain)
-        separator.setFixedWidth(1)
+        separator.setFixedHeight(1)
 
-        # The sidebar is fixed-width (220px); the main content stretches to
-        # fill remaining space (stretch factor of 1).
+        # Nav bar at fixed height; main content stretches to fill all remaining space.
         layout.addWidget(self.sidebar)
         layout.addWidget(separator)
         layout.addWidget(self.main_content, 1)

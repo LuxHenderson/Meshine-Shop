@@ -491,6 +491,114 @@ class MeshPainter:
         return bbox_min, bbox_max
 
     # ------------------------------------------------------------------ #
+    # Undo / Redo snapshot support                                        #
+    # ------------------------------------------------------------------ #
+
+    def get_snapshot_data(
+        self, geometry: bool = True
+    ) -> tuple[
+        "np.ndarray | None",
+        "np.ndarray | None",
+        "np.ndarray | None",
+        "Image.Image",
+    ]:
+        """
+        Return deep copies of the current editor state for a history snapshot.
+
+        Called by EditHistory.push_snapshot() before each destructive operation.
+
+        Parameters
+        ----------
+        geometry : bool
+            True  → copy vertices, faces, and normals (needed for sculpt/mesh ops)
+            False → skip geometry copies (paint-only operations don't change it)
+
+        Returns
+        -------
+        (vertices_copy, faces_copy, normals_copy, albedo_copy)
+        Geometry arrays are None when geometry=False.
+        """
+        if geometry:
+            # Deep copy all geometry arrays so the snapshot is fully independent
+            # of any subsequent in-place modifications to the mesh.
+            verts = np.array(self._mesh.vertices, dtype=np.float32, copy=True)
+            faces = np.array(self._mesh.faces, dtype=np.uint32, copy=True)
+            # vertex_normals is a lazily-computed trimesh property — force
+            # evaluation before copying so we capture the current normals.
+            norms = np.array(self._mesh.vertex_normals, dtype=np.float32, copy=True)
+        else:
+            verts = faces = norms = None
+
+        # Always copy the PIL image — it is mutable and paint strokes modify it
+        # in place, so a reference copy would be invalidated immediately.
+        albedo = self._albedo_img.copy()
+
+        return verts, faces, norms, albedo
+
+    def restore_snapshot(
+        self,
+        vertices: "np.ndarray | None",
+        faces: "np.ndarray | None",
+        normals: "np.ndarray | None",
+        albedo: "Image.Image",
+    ) -> None:
+        """
+        Overwrite the current editor state with a previously captured snapshot.
+
+        Called by ViewportWidget._restore_from_snapshot() after popping an
+        undo or redo entry. After this call the caller must re-upload the VBO
+        and texture to the GPU to reflect the restored state visually.
+
+        Parameters
+        ----------
+        vertices, faces, normals : arrays or None
+            When not None, the mesh geometry is replaced and the BVH + face
+            adjacency are rebuilt from scratch to match the new topology.
+        albedo : PIL Image
+            The texture buffer to restore. Always provided.
+        """
+        # Restore geometry if this was a geometry-including snapshot
+        if vertices is not None and faces is not None:
+            # Rebuild the trimesh from the snapshot arrays so all internal
+            # caches (normals, bounds, etc.) reflect the restored geometry.
+            self._mesh = trimesh.Trimesh(
+                vertices=vertices.astype(np.float64),
+                faces=faces,
+                process=False,
+            )
+            # Re-extract UV coords — needed because the face order may differ
+            # after a mesh operation (safe no-op for sculpt-only restores).
+            self._uvs = self._extract_uvs()
+
+            # Rebuild BVH so ray_cast() works correctly on restored geometry
+            self._rebuild_bvh()
+
+            # Rebuild face adjacency for BFS region fill
+            self._face_adj = self._build_face_adjacency()
+
+        # Restore texture — replace the PIL buffer with the snapshot copy
+        self._albedo_img = albedo.copy()
+        self._tex_w, self._tex_h = self._albedo_img.size
+
+        # Mark texture as fully dirty so the full texture is reuploaded to the
+        # GPU (the caller reads get_dirty_rect() or calls get_texture_rgba()).
+        self._dirty = (0, 0, self._tex_w, self._tex_h)
+
+    def _rebuild_bvh(self) -> None:
+        """
+        Rebuild the ray–triangle BVH after geometry changes.
+
+        Called after restore_snapshot() and after any sculpt or mesh operation
+        that modifies vertex positions or topology. The old BVH is invalidated
+        whenever self._mesh changes.
+        """
+        self._ray_intersector = (
+            trimesh.ray.ray_pyembree.RayMeshIntersector(self._mesh)
+            if trimesh.ray.has_embree
+            else trimesh.ray.ray_triangle.RayMeshIntersector(self._mesh)
+        )
+
+    # ------------------------------------------------------------------ #
     # Persistence                                                          #
     # ------------------------------------------------------------------ #
 

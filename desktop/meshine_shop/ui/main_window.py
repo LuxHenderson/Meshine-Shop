@@ -28,6 +28,7 @@ from meshine_shop.ui.drop_zone import DropZone, collect_images_from_paths
 from meshine_shop.ui.processing_queue import ProcessingQueue
 from meshine_shop.ui.viewport import ViewportWidget
 from meshine_shop.ui.viewport_tools import ViewportToolsPanel
+from meshine_shop.ui.viewport_layers import ViewportLayersPanel
 from meshine_shop.core.pipeline import EXPORT_FORMATS, QUALITY_PRESETS
 from meshine_shop.core.workspace import WorkspacePaths
 
@@ -254,11 +255,16 @@ class ViewportView(QWidget):
     def __init__(self):
         super().__init__()
 
-        # Zero-margin horizontal layout — viewport fills all available space
-        # except the 200px tools panel on the right.
+        # Zero-margin horizontal layout: layers panel (left) | viewport | tools panel (right).
+        # The viewport takes all remaining space between the two fixed-width panels.
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
+
+        # Layers panel — 200px fixed, left side. Houses layer management UI
+        # (polygon selections saved as named layers). Content populated in Steps 13–15.
+        self.layers = ViewportLayersPanel()
+        layout.addWidget(self.layers)
 
         # The OpenGL render surface (stretch=1 → fills all remaining width)
         self.viewport = ViewportWidget()
@@ -275,6 +281,11 @@ class ViewportView(QWidget):
         self.tools.opacity_changed.connect(self.viewport.set_brush_opacity)
         # Reset Rotation button → snap mesh back to original orientation
         self.tools.reset_rotation_requested.connect(self.viewport.reset_model_rotation)
+        # Undo/Redo buttons and Cmd+Z shortcuts
+        self.tools.undo_requested.connect(self.viewport.undo)
+        self.tools.redo_requested.connect(self.viewport.redo)
+        # Keep Undo/Redo button enabled state in sync with the history stack
+        self.viewport.history_changed.connect(self.tools.update_undo_redo_state)
 
     def set_mesh_ready(self, workspace: WorkspacePaths) -> None:
         """

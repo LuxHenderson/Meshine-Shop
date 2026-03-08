@@ -41,13 +41,14 @@ try:
 except ImportError:
     _HAS_MODERNGL = False
 
-from PySide6.QtCore import Qt, QPoint, QTimer
+from PySide6.QtCore import Qt, QPoint, QTimer, Signal
 from PySide6.QtGui import (
     QColor, QCursor, QKeyEvent, QMouseEvent, QPainter, QWheelEvent,
 )
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import QLabel, QSizePolicy, QVBoxLayout, QWidget
 
+from meshine_shop.core.edit_history import EditHistory
 from meshine_shop.core.mesh_painter import MeshPainter
 from meshine_shop.core.viewport_camera import ViewportCamera
 
@@ -340,6 +341,10 @@ class ViewportWidget(QOpenGLWidget):
         reset()                            — clear all state, stop timers
     """
 
+    # Emitted whenever the undo/redo stack depth changes so the tools panel
+    # can enable/disable the Undo and Redo buttons. Args: (can_undo, can_redo).
+    history_changed = Signal(bool, bool)
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
 
@@ -370,6 +375,8 @@ class ViewportWidget(QOpenGLWidget):
         # ------------------------------------------------------------------ #
         self._painter: MeshPainter | None = None
         self._camera: ViewportCamera | None = None
+        # Edit history — reset on each new mesh load, shared with the tools panel
+        self._history: EditHistory = EditHistory()
         # Set True by load_mesh(); cleared in paintGL after GPU upload.
         # Ensures GPU upload happens inside the guaranteed-current GL context.
         self._needs_upload: bool = False
@@ -474,6 +481,10 @@ class ViewportWidget(QOpenGLWidget):
             self._release_gpu_resources()
             self.doneCurrent()
 
+        # Clear undo/redo history — a new mesh load starts a fresh edit session
+        self._history.clear()
+        self.history_changed.emit(False, False)
+
         # Create the painter (loads mesh + PIL texture, builds BVH)
         self._painter = MeshPainter(mesh_path, textures_dir)
 
@@ -536,6 +547,79 @@ class ViewportWidget(QOpenGLWidget):
         """Write the edited albedo buffer back to albedo.png."""
         if self._painter:
             self._painter.save_albedo()
+
+    # ------------------------------------------------------------------ #
+    # Undo / Redo — called by tool panel buttons and Cmd+Z shortcuts       #
+    # ------------------------------------------------------------------ #
+
+    def undo(self) -> None:
+        """
+        Restore the previous edit state from the undo stack.
+
+        Captures the current state onto the redo stack first so it can be
+        re-applied by redo(). Then pops the undo snapshot, restores the
+        painter, re-uploads GPU resources, and emits history_changed.
+        """
+        if not self._history.can_undo or self._painter is None:
+            return
+
+        # Save current state to redo stack before overwriting
+        self._history.push_redo(self._painter, geometry=False)
+
+        snap = self._history.undo()
+        if snap:
+            self._restore_from_snapshot(snap)
+
+        self.history_changed.emit(self._history.can_undo, self._history.can_redo)
+
+    def redo(self) -> None:
+        """
+        Re-apply an undone edit from the redo stack.
+
+        Captures the current state back onto the undo stack first so the
+        user can undo again after redoing. Then pops the redo snapshot,
+        restores the painter, re-uploads GPU resources, and emits history_changed.
+        """
+        if not self._history.can_redo or self._painter is None:
+            return
+
+        # Save current state back to undo stack WITHOUT clearing redo.
+        # push_snapshot() would wipe _redos before we can pop from it.
+        self._history.push_undo_only(self._painter, geometry=False)
+
+        snap = self._history.redo()
+        if snap:
+            self._restore_from_snapshot(snap)
+
+        self.history_changed.emit(self._history.can_undo, self._history.can_redo)
+
+    def _restore_from_snapshot(self, snap) -> None:
+        """
+        Apply a snapshot to the painter and re-upload GPU resources.
+
+        For geometry snapshots: rebuilds the mesh VBO/VAO (new vertex data).
+        For texture-only snapshots: marks the full texture dirty so paintGL
+        calls _refresh_dirty_texture on the next frame, uploading via
+        glTexSubImage2D.
+        """
+        if self._painter is None:
+            return
+
+        # Restore painter state (geometry + texture or texture only)
+        self._painter.restore_snapshot(
+            snap.vertices, snap.faces, snap.normals, snap.albedo
+        )
+
+        if snap.geometry_included:
+            # Geometry changed — need a full VBO/VAO rebuild.
+            # Set _needs_upload so paintGL triggers the full GPU re-upload.
+            self._needs_upload = True
+        else:
+            # Texture-only change — painter.restore_snapshot already set the
+            # full dirty rect, so _refresh_dirty_texture will handle it.
+            pass
+
+        self.update()
 
     def reset_model_rotation(self) -> None:
         """
@@ -1251,6 +1335,14 @@ class ViewportWidget(QOpenGLWidget):
             # stroke here and continues on drag via mouseMoveEvent.
             # Clicking in empty space does nothing — ray_cast returns None.
             if self._tool:
+                # Snapshot before the stroke begins so the pre-paint state can
+                # be restored by Undo. geometry=False because brush/region paint
+                # only modifies the texture, not the mesh vertices.
+                if self._painter is not None:
+                    self._history.push_snapshot(self._painter, geometry=False)
+                    self.history_changed.emit(
+                        self._history.can_undo, self._history.can_redo
+                    )
                 self._handle_paint(int(x), int(y))
                 return  # skip orbit cursor setup — tool owns LMB while active
 
@@ -1517,6 +1609,7 @@ class ViewportWidget(QOpenGLWidget):
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
         key = event.key()
+        mods = event.modifiers()
 
         # Track alt modifier
         if key == Qt.Key.Key_Alt:
@@ -1527,6 +1620,16 @@ class ViewportWidget(QOpenGLWidget):
             bbox_min, bbox_max = self._painter.get_bbox()
             self._camera.frame_mesh(bbox_min, bbox_max)
             self.update()
+            return
+
+        # Cmd+Z → Undo, Cmd+Shift+Z → Redo
+        ctrl = Qt.KeyboardModifier.ControlModifier
+        shift = Qt.KeyboardModifier.ShiftModifier
+        if key == Qt.Key.Key_Z and (mods & ctrl):
+            if mods & shift:
+                self.redo()
+            else:
+                self.undo()
             return
 
         self._keys_held.add(key)

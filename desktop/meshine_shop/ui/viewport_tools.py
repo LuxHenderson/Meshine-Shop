@@ -736,6 +736,9 @@ class ViewportToolsPanel(QWidget):
     opacity_changed = Signal(float)
     # Emitted when the user clicks the "Reset Rotation" button
     reset_rotation_requested = Signal()
+    # Emitted when Undo / Redo buttons are clicked
+    undo_requested = Signal()
+    redo_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -871,6 +874,34 @@ class ViewportToolsPanel(QWidget):
         layout.addStretch()
 
         # ------------------------------------------------------------------ #
+        # Undo / Redo buttons — side by side, same style as Reset Rotation.   #
+        # Disabled until there is history to step through; enabled/disabled   #
+        # by update_undo_redo_state() called from ViewportWidget after each   #
+        # operation.                                                           #
+        # ------------------------------------------------------------------ #
+        undo_redo_row = QHBoxLayout()
+        undo_redo_row.setSpacing(6)
+
+        self._undo_btn = QPushButton("↩  Undo")
+        self._undo_btn.setObjectName("reset_rotation_btn")  # reuse same QSS style
+        self._undo_btn.setToolTip("Undo the last edit  (Cmd+Z)")
+        self._undo_btn.setEnabled(False)
+        # NoFocus prevents the macOS focus ring from staying on after a click
+        self._undo_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._undo_btn.clicked.connect(self.undo_requested.emit)
+        undo_redo_row.addWidget(self._undo_btn)
+
+        self._redo_btn = QPushButton("↪  Redo")
+        self._redo_btn.setObjectName("reset_rotation_btn")  # reuse same QSS style
+        self._redo_btn.setToolTip("Redo the last undone edit  (Cmd+Shift+Z)")
+        self._redo_btn.setEnabled(False)
+        self._redo_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._redo_btn.clicked.connect(self.redo_requested.emit)
+        undo_redo_row.addWidget(self._redo_btn)
+
+        layout.addLayout(undo_redo_row)
+
+        # ------------------------------------------------------------------ #
         # Reset Rotation button (always visible; no-op when not rotated)      #
         # ------------------------------------------------------------------ #
         self._reset_rot_btn = QPushButton("↺  Reset Rotation")
@@ -939,6 +970,23 @@ class ViewportToolsPanel(QWidget):
         to the tools panel (needed by the controls dialog).
         """
         self._camera = camera
+
+    def update_undo_redo_state(self, can_undo: bool, can_redo: bool) -> None:
+        """
+        Enable or disable the Undo/Redo buttons to reflect current history depth.
+
+        Called by ViewportWidget after every snapshot push, undo, or redo so
+        the button enabled states always match what's actually possible.
+
+        Parameters
+        ----------
+        can_undo : bool
+            True when there is at least one step to undo.
+        can_redo : bool
+            True when there is at least one step to redo.
+        """
+        self._undo_btn.setEnabled(can_undo)
+        self._redo_btn.setEnabled(can_redo)
 
     # ------------------------------------------------------------------ #
     # Slot handlers                                                        #
