@@ -287,6 +287,10 @@ class ViewportView(QWidget):
         # Keep Undo/Redo button enabled state in sync with the history stack
         self.viewport.history_changed.connect(self.tools.update_undo_redo_state)
 
+        # Sculpt brush radius and strength sliders
+        self.tools.sculpt_radius_changed.connect(self.viewport.set_sculpt_radius)
+        self.tools.sculpt_strength_changed.connect(self.viewport.set_sculpt_strength)
+
     def set_mesh_ready(self, workspace: WorkspacePaths) -> None:
         """
         Load the pipeline output into the viewport.

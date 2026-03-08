@@ -385,6 +385,20 @@ class ViewportWidget(QOpenGLWidget):
         # Paint tool state                                                     #
         # ------------------------------------------------------------------ #
         self._tool: str = ""                  # "" | "brush" | "region" | "rotate"
+
+        # ------------------------------------------------------------------ #
+        # Sculpt tool state                                                    #
+        # ------------------------------------------------------------------ #
+        # World-space brush radius for sculpt operations.
+        # 0.05 is a reasonable default for a hand-sized real-world scan.
+        self._sculpt_radius: float = 0.05
+        # Displacement strength per sculpt call. Scaled by the falloff weight
+        # so vertices at the brush center move by exactly this amount.
+        self._sculpt_strength: float = 0.005
+        # True if sculpt() modified geometry this frame — triggers VBO re-upload
+        # in paintGL without reuploading the texture.
+        self._needs_mesh_upload: bool = False
+
         self._paint_color: tuple = (220, 100, 60)  # default rust-orange
         self._brush_size: int = 12            # pixels
         self._brush_opacity: float = 1.0
@@ -548,6 +562,14 @@ class ViewportWidget(QOpenGLWidget):
         if self._painter:
             self._painter.save_albedo()
 
+    def set_sculpt_radius(self, radius: float) -> None:
+        """Set the world-space radius for sculpt brushes."""
+        self._sculpt_radius = float(radius)
+
+    def set_sculpt_strength(self, strength: float) -> None:
+        """Set the per-call displacement strength for sculpt brushes."""
+        self._sculpt_strength = float(strength)
+
     # ------------------------------------------------------------------ #
     # Undo / Redo — called by tool panel buttons and Cmd+Z shortcuts       #
     # ------------------------------------------------------------------ #
@@ -563,8 +585,9 @@ class ViewportWidget(QOpenGLWidget):
         if not self._history.can_undo or self._painter is None:
             return
 
-        # Save current state to redo stack before overwriting
-        self._history.push_redo(self._painter, geometry=False)
+        # Save current state to redo stack before overwriting.
+        # Always include geometry so redo can re-apply sculpt deformations.
+        self._history.push_redo(self._painter, geometry=True)
 
         snap = self._history.undo()
         if snap:
@@ -585,7 +608,8 @@ class ViewportWidget(QOpenGLWidget):
 
         # Save current state back to undo stack WITHOUT clearing redo.
         # push_snapshot() would wipe _redos before we can pop from it.
-        self._history.push_undo_only(self._painter, geometry=False)
+        # Always include geometry so undo-after-redo restores sculpt correctly.
+        self._history.push_undo_only(self._painter, geometry=True)
 
         snap = self._history.redo()
         if snap:
@@ -731,6 +755,15 @@ class ViewportWidget(QOpenGLWidget):
                          self._vao, self._albedo_tex)
             except Exception:
                 log.exception("ViewportWidget: GPU upload failed")
+
+        # Sculpt VBO re-upload: vertex positions changed but texture is intact.
+        # _upload_mesh_only() rebuilds VBO/VAO/IBO without touching _albedo_tex.
+        if self._needs_mesh_upload and self._painter is not None:
+            self._needs_mesh_upload = False
+            try:
+                self._upload_mesh_only()
+            except Exception:
+                log.exception("ViewportWidget: sculpt VBO re-upload failed")
 
         # Clear depth to 1.0 and color to black; the background gradient quad
         # will immediately overwrite every color pixel, so the clear color
@@ -901,6 +934,35 @@ class ViewportWidget(QOpenGLWidget):
         self._albedo_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
         self._albedo_tex.repeat_x = False
         self._albedo_tex.repeat_y = False
+
+    def _upload_mesh_only(self) -> None:
+        """
+        Re-upload vertex position/normal data to the GPU without touching the texture.
+
+        Called after sculpt operations — the texture is unchanged so we avoid
+        the cost of reuploading it. Releases only the geometry buffers (VAO/VBO/IBO),
+        then rebuilds them from the current painter state.
+        """
+        # Release geometry buffers only — _albedo_tex is intentionally preserved
+        for attr in ("_vao", "_vbo", "_ibo"):
+            resource = getattr(self, attr, None)
+            if resource is not None:
+                try:
+                    resource.release()
+                except Exception:
+                    pass
+            setattr(self, attr, None)
+
+        verts, norms, uvs, faces = self._painter.get_render_arrays()
+        interleaved = np.hstack([verts, norms, uvs]).astype(np.float32)
+
+        self._vbo = self._ctx.buffer(interleaved.tobytes())
+        self._ibo = self._ctx.buffer(faces.tobytes())
+        self._vao = self._ctx.vertex_array(
+            self._prog,
+            [(self._vbo, "3f 3f 2f", "in_position", "in_normal", "in_uv")],
+            self._ibo,
+        )
 
     def _refresh_dirty_texture(self) -> None:
         """
@@ -1335,11 +1397,13 @@ class ViewportWidget(QOpenGLWidget):
             # stroke here and continues on drag via mouseMoveEvent.
             # Clicking in empty space does nothing — ray_cast returns None.
             if self._tool:
-                # Snapshot before the stroke begins so the pre-paint state can
-                # be restored by Undo. geometry=False because brush/region paint
-                # only modifies the texture, not the mesh vertices.
+                # Snapshot before the stroke begins. geometry=True for sculpt
+                # operations (they change vertex positions); geometry=False for
+                # paint tools (texture-only changes).
+                _SCULPT_TOOLS = {"inflate", "deflate", "smooth", "flatten"}
+                _needs_geo = self._tool in _SCULPT_TOOLS
                 if self._painter is not None:
-                    self._history.push_snapshot(self._painter, geometry=False)
+                    self._history.push_snapshot(self._painter, geometry=_needs_geo)
                     self.history_changed.emit(
                         self._history.can_undo, self._history.can_redo
                     )
@@ -1530,6 +1594,12 @@ class ViewportWidget(QOpenGLWidget):
         elif btn == Qt.MouseButton.LeftButton:
             self._lmb_held = False
             self._orbit_skip_one = False
+            # Rebuild BVH after sculpt drag — deferred from mouseMoveEvent
+            # because rebuilding every drag pixel is too expensive (~50ms/rebuild).
+            # Rebuilding on release keeps ray_cast accurate for the next stroke.
+            _SCULPT_TOOLS = {"inflate", "deflate", "smooth", "flatten"}
+            if self._tool in _SCULPT_TOOLS and self._painter is not None:
+                self._painter._rebuild_bvh()
             # Clear gizmo drag state — drag is complete, hover re-evaluates on next move
             if self._gizmo_axis is not None:
                 self._gizmo_axis = None
@@ -1622,14 +1692,13 @@ class ViewportWidget(QOpenGLWidget):
             self.update()
             return
 
-        # Cmd+Z → Undo, Cmd+Shift+Z → Redo
+        # Cmd+Z → Undo, Cmd+Y → Redo
         ctrl = Qt.KeyboardModifier.ControlModifier
-        shift = Qt.KeyboardModifier.ShiftModifier
         if key == Qt.Key.Key_Z and (mods & ctrl):
-            if mods & shift:
-                self.redo()
-            else:
-                self.undo()
+            self.undo()
+            return
+        if key == Qt.Key.Key_Y and (mods & ctrl):
+            self.redo()
             return
 
         self._keys_held.add(key)
@@ -1763,11 +1832,27 @@ class ViewportWidget(QOpenGLWidget):
 
         face_idx, uv = result
 
+        _SCULPT_TOOLS = {"inflate", "deflate", "smooth", "flatten"}
+
         if self._tool == "brush":
             self._painter.paint_brush(
                 uv, self._paint_color, self._brush_size, self._brush_opacity
             )
         elif self._tool == "region":
             self._painter.fill_region(face_idx, self._paint_color)
+        elif self._tool in _SCULPT_TOOLS:
+            # Sculpt hit point: the locations array from ray_cast gives us the
+            # 3D model-space position. We use ray_cast_world_pos() to get it
+            # (second BVH traversal, but sculpt calls are infrequent on drag).
+            hit_pos = self._painter.ray_cast_world_pos(ray_origin, ray_dir)
+            if hit_pos is not None:
+                self._painter.sculpt(
+                    hit_pos, self._tool,
+                    self._sculpt_radius, self._sculpt_strength,
+                )
+                # Flag VBO for re-upload in the next paintGL call.
+                # We don't call _upload_mesh_only() here because we're not
+                # guaranteed to be inside the OpenGL context during mouse events.
+                self._needs_mesh_upload = True
 
-        self.update()  # triggers paintGL → _refresh_dirty_texture
+        self.update()  # triggers paintGL → _refresh_dirty_texture / VBO re-upload

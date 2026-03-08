@@ -739,6 +739,9 @@ class ViewportToolsPanel(QWidget):
     # Emitted when Undo / Redo buttons are clicked
     undo_requested = Signal()
     redo_requested = Signal()
+    # Emitted when the sculpt brush radius or strength sliders change
+    sculpt_radius_changed = Signal(float)
+    sculpt_strength_changed = Signal(float)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -792,12 +795,103 @@ class ViewportToolsPanel(QWidget):
         tool_row.addStretch()
         layout.addLayout(tool_row)
 
+        # ------------------------------------------------------------------ #
+        # Sculpt brush buttons — second tool row                              #
+        # ------------------------------------------------------------------ #
+        sculpt_row = QHBoxLayout()
+        sculpt_row.setSpacing(6)
+
+        # Inflate: push vertices outward along their normals
+        self._inflate_btn = QPushButton("▲")
+        self._inflate_btn.setObjectName("tool_button")
+        self._inflate_btn.setCheckable(True)
+        self._inflate_btn.setToolTip("Inflate — push surface outward along normals")
+        self._inflate_btn.setFixedSize(36, 36)
+        sculpt_row.addWidget(self._inflate_btn)
+
+        # Deflate: pull vertices inward along their normals
+        self._deflate_btn = QPushButton("▼")
+        self._deflate_btn.setObjectName("tool_button")
+        self._deflate_btn.setCheckable(True)
+        self._deflate_btn.setToolTip("Deflate — pull surface inward along normals")
+        self._deflate_btn.setFixedSize(36, 36)
+        sculpt_row.addWidget(self._deflate_btn)
+
+        # Smooth: Laplacian vertex averaging
+        self._smooth_btn = QPushButton("≋")
+        self._smooth_btn.setObjectName("tool_button")
+        self._smooth_btn.setCheckable(True)
+        self._smooth_btn.setToolTip("Smooth — average vertex positions (Laplacian)")
+        self._smooth_btn.setFixedSize(36, 36)
+        sculpt_row.addWidget(self._smooth_btn)
+
+        # Flatten: project vertices onto best-fit plane (PCA)
+        self._flatten_btn = QPushButton("⊥")
+        self._flatten_btn.setObjectName("tool_button")
+        self._flatten_btn.setCheckable(True)
+        self._flatten_btn.setToolTip("Flatten — level surface to best-fit plane")
+        self._flatten_btn.setFixedSize(36, 36)
+        sculpt_row.addWidget(self._flatten_btn)
+
+        sculpt_row.addStretch()
+        layout.addLayout(sculpt_row)
+
+        # Sculpt strength slider
+        str_row = QHBoxLayout()
+        str_lbl = QLabel("Strength")
+        str_lbl.setObjectName("tools_label")
+        str_lbl.setMinimumWidth(50)
+        str_row.addWidget(str_lbl)
+
+        # Range 1–100, maps to 0.001–0.05 world-space displacement strength
+        self._strength_slider = QSlider(Qt.Orientation.Horizontal)
+        self._strength_slider.setRange(1, 100)
+        self._strength_slider.setValue(20)    # default: 0.010
+        str_row.addWidget(self._strength_slider)
+
+        self._strength_readout = QLabel("0.010")
+        self._strength_readout.setObjectName("tools_readout")
+        self._strength_readout.setMinimumWidth(36)
+        self._strength_readout.setAlignment(Qt.AlignmentFlag.AlignRight)
+        str_row.addWidget(self._strength_readout)
+        layout.addLayout(str_row)
+
+        self._strength_slider.valueChanged.connect(self._on_strength_changed)
+
+        # Sculpt radius slider
+        rad_row = QHBoxLayout()
+        rad_lbl = QLabel("Radius")
+        rad_lbl.setObjectName("tools_label")
+        rad_lbl.setMinimumWidth(50)
+        rad_row.addWidget(rad_lbl)
+
+        # Range 1–100, maps to 0.005–0.50 world-space radius
+        self._radius_slider = QSlider(Qt.Orientation.Horizontal)
+        self._radius_slider.setRange(1, 100)
+        self._radius_slider.setValue(30)      # default: 0.05
+        rad_row.addWidget(self._radius_slider)
+
+        self._radius_readout = QLabel("0.050")
+        self._radius_readout.setObjectName("tools_readout")
+        self._radius_readout.setMinimumWidth(36)
+        self._radius_readout.setAlignment(Qt.AlignmentFlag.AlignRight)
+        rad_row.addWidget(self._radius_readout)
+        layout.addLayout(rad_row)
+
+        self._radius_slider.valueChanged.connect(self._on_radius_changed)
+
         # Wire click handlers — each button manages mutual exclusivity and
         # emits tool_changed("") when toggled off so the viewport knows no
         # tool is active.
         self._brush_btn.clicked.connect(self._on_brush_clicked)
         self._region_btn.clicked.connect(self._on_region_clicked)
         self._rotate_btn.clicked.connect(self._on_rotate_clicked)
+
+        # Wire sculpt button click handlers
+        self._inflate_btn.clicked.connect(self._on_inflate_clicked)
+        self._deflate_btn.clicked.connect(self._on_deflate_clicked)
+        self._smooth_btn.clicked.connect(self._on_smooth_clicked)
+        self._flatten_btn.clicked.connect(self._on_flatten_clicked)
 
         # ------------------------------------------------------------------ #
         # Divider                                                              #
@@ -934,31 +1028,84 @@ class ViewportToolsPanel(QWidget):
     # ------------------------------------------------------------------ #
 
     def _on_brush_clicked(self) -> None:
-        """Toggle brush on/off; deactivate region and rotate if active."""
+        """Toggle brush on/off; deactivate all other tools if active."""
         if self._brush_btn.isChecked():
-            self._region_btn.setChecked(False)
-            self._rotate_btn.setChecked(False)
+            self._deactivate_all_except(self._brush_btn)
             self.tool_changed.emit("brush")
         else:
             self.tool_changed.emit("")
 
     def _on_region_clicked(self) -> None:
-        """Toggle region select on/off; deactivate brush and rotate if active."""
+        """Toggle region select on/off; deactivate all other tools if active."""
         if self._region_btn.isChecked():
-            self._brush_btn.setChecked(False)
-            self._rotate_btn.setChecked(False)
+            self._deactivate_all_except(self._region_btn)
             self.tool_changed.emit("region")
         else:
             self.tool_changed.emit("")
 
     def _on_rotate_clicked(self) -> None:
-        """Toggle rotate on/off; deactivate brush and region if active."""
+        """Toggle rotate on/off; deactivate all other tools if active."""
         if self._rotate_btn.isChecked():
-            self._brush_btn.setChecked(False)
-            self._region_btn.setChecked(False)
+            self._deactivate_all_except(self._rotate_btn)
             self.tool_changed.emit("rotate")
         else:
             self.tool_changed.emit("")
+
+    def _on_inflate_clicked(self) -> None:
+        """Toggle inflate sculpt brush; deactivate all other tools."""
+        if self._inflate_btn.isChecked():
+            self._deactivate_all_except(self._inflate_btn)
+            self.tool_changed.emit("inflate")
+        else:
+            self.tool_changed.emit("")
+
+    def _on_deflate_clicked(self) -> None:
+        """Toggle deflate sculpt brush; deactivate all other tools."""
+        if self._deflate_btn.isChecked():
+            self._deactivate_all_except(self._deflate_btn)
+            self.tool_changed.emit("deflate")
+        else:
+            self.tool_changed.emit("")
+
+    def _on_smooth_clicked(self) -> None:
+        """Toggle smooth sculpt brush; deactivate all other tools."""
+        if self._smooth_btn.isChecked():
+            self._deactivate_all_except(self._smooth_btn)
+            self.tool_changed.emit("smooth")
+        else:
+            self.tool_changed.emit("")
+
+    def _on_flatten_clicked(self) -> None:
+        """Toggle flatten sculpt brush; deactivate all other tools."""
+        if self._flatten_btn.isChecked():
+            self._deactivate_all_except(self._flatten_btn)
+            self.tool_changed.emit("flatten")
+        else:
+            self.tool_changed.emit("")
+
+    def _deactivate_all_except(self, keep: QPushButton) -> None:
+        """Uncheck all tool buttons except the given one."""
+        for btn in (
+            self._brush_btn, self._region_btn, self._rotate_btn,
+            self._inflate_btn, self._deflate_btn,
+            self._smooth_btn, self._flatten_btn,
+        ):
+            if btn is not keep:
+                btn.setChecked(False)
+
+    def _on_strength_changed(self, value: int) -> None:
+        """Map slider 1–100 → strength 0.001–0.05 and emit signal."""
+        # Linear map: 1 → 0.001, 100 → 0.05
+        strength = 0.001 + (value - 1) / 99.0 * (0.05 - 0.001)
+        self._strength_readout.setText(f"{strength:.3f}")
+        self.sculpt_strength_changed.emit(strength)
+
+    def _on_radius_changed(self, value: int) -> None:
+        """Map slider 1–100 → radius 0.005–0.50 and emit signal."""
+        # Linear map: 1 → 0.005, 100 → 0.50
+        radius = 0.005 + (value - 1) / 99.0 * (0.50 - 0.005)
+        self._radius_readout.setText(f"{radius:.3f}")
+        self.sculpt_radius_changed.emit(radius)
 
     # ------------------------------------------------------------------ #
     # Camera reference                                                     #

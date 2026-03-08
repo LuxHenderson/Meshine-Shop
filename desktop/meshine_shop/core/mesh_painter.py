@@ -20,6 +20,7 @@ High-level flow:
 from __future__ import annotations
 
 import logging
+import math
 from collections import deque
 from pathlib import Path
 
@@ -134,6 +135,21 @@ class MeshPainter:
         self._face_adj: dict[int, list[int]] = self._build_face_adjacency()
         log.info("MeshPainter: face adjacency built")
 
+        # Precompute vertex neighbor lists for sculpt Smooth brush.
+        # List of numpy arrays: _vertex_neighbors[i] = array of vertex indices
+        # adjacent to vertex i via shared edges.
+        self._vertex_neighbors: list = self._build_vertex_neighbors()
+
+        # Precompute UV-seam partner groups. OBJ UV seams duplicate vertices:
+        # same 3D position, different UV index. Sculpting one side without the
+        # other tears the mesh open. We group coincident vertices so sculpt()
+        # can propagate every displacement to all partners at the same position.
+        self._seam_partners: list = self._build_seam_partners()
+
+        # Set True by sculpt() when vertex positions have changed.
+        # Viewport polls is_sculpt_dirty() to decide whether to re-upload the VBO.
+        self._sculpt_dirty: bool = False
+
     # ------------------------------------------------------------------ #
     # UV extraction                                                        #
     # ------------------------------------------------------------------ #
@@ -178,6 +194,86 @@ class MeshPainter:
         except Exception:
             log.warning("MeshPainter: could not build face adjacency — region fill disabled")
         return adj
+
+    def _build_vertex_neighbors(self) -> list:
+        """
+        Build per-vertex neighbor vertex index lists from face topology.
+
+        Returns a list where index i is a numpy array of vertex indices
+        adjacent to vertex i via a shared face edge. Used by the Smooth
+        sculpt brush to compute Laplacian averages.
+
+        Vectorized construction: stacks all directed edge pairs, sorts by
+        source vertex using searchsorted boundaries, then deduplicates each
+        vertex's neighbor slice with np.unique.
+        """
+        faces = self._mesh.faces  # (F, 3) int
+        n_verts = len(self._mesh.vertices)
+
+        # Build all directed edges from all three edge pairs per face:
+        # (a→b, b→a), (a→c, c→a), (b→c, c→b) — gives all adjacencies
+        edges = np.vstack([
+            faces[:, [0, 1]], faces[:, [1, 0]],
+            faces[:, [0, 2]], faces[:, [2, 0]],
+            faces[:, [1, 2]], faces[:, [2, 1]],
+        ])  # (6F, 2)
+
+        # Sort edges by source vertex so we can slice per-vertex with searchsorted
+        src = edges[:, 0]
+        dst = edges[:, 1]
+        order = np.argsort(src, kind="stable")
+        src_sorted = src[order]
+        dst_sorted = dst[order]
+
+        # Compute slice boundaries: boundaries[v] = first edge index with src == v
+        boundaries = np.searchsorted(src_sorted, np.arange(n_verts + 1))
+
+        neighbors = []
+        for v in range(n_verts):
+            s, e = int(boundaries[v]), int(boundaries[v + 1])
+            nbrs = np.unique(dst_sorted[s:e])
+            neighbors.append(nbrs)
+
+        return neighbors
+
+    def _build_seam_partners(self) -> list:
+        """
+        Group vertices that share the same 3D position (UV-seam duplicates).
+
+        OBJ files split vertices at UV seams, creating duplicate vertices: same
+        XYZ position but different UV coordinate and vertex index. If sculpt moves
+        one side of a seam without the other, the mesh tears open along the seam.
+
+        Returns a list of lists: seam_partners[i] contains the vertex indices of
+        every other vertex that occupies the same 3D position as vertex i.
+        Most vertices have an empty partner list (they are interior, not on a seam).
+
+        Uses integer-rounded positions (6 decimal places) as hash keys, which is
+        robust against floating-point loading noise while tight enough that truly
+        distinct vertices are never accidentally grouped together.
+        """
+        from collections import defaultdict
+
+        verts = np.asarray(self._mesh.vertices, dtype=np.float64)
+        n = len(verts)
+
+        # Round each coordinate to 6 dp so float-load noise doesn't prevent grouping
+        rounded = np.round(verts, decimals=6)
+        groups: dict = defaultdict(list)
+        for i in range(n):
+            key = (rounded[i, 0], rounded[i, 1], rounded[i, 2])
+            groups[key].append(i)
+
+        partners: list = [[] for _ in range(n)]
+        seam_verts = 0
+        for indices in groups.values():
+            if len(indices) > 1:
+                seam_verts += len(indices)
+                for i in indices:
+                    partners[i] = [j for j in indices if j != i]
+
+        log.info("MeshPainter: %d seam-duplicate vertices found", seam_verts)
+        return partners
 
     # ------------------------------------------------------------------ #
     # Ray casting                                                          #
@@ -369,6 +465,151 @@ class MeshPainter:
         dirty_y1 = min(self._tex_h, dirty_y1)
         if dirty_x1 > dirty_x0 and dirty_y1 > dirty_y0:
             self._expand_dirty(dirty_x0, dirty_y0, dirty_x1, dirty_y1)
+
+    def sculpt(
+        self,
+        hit_point: np.ndarray,
+        mode: str,
+        radius: float,
+        strength: float,
+    ) -> None:
+        """
+        Apply a sculpt brush at a 3D hit point on the mesh surface.
+
+        Finds all vertices within `radius` world units of `hit_point`, applies
+        a cosine-squared falloff weight (1 at center, 0 at edge, C1 continuous),
+        then deforms them according to `mode`.
+
+        Parameters
+        ----------
+        hit_point : (3,) float array
+            Model-space position of the ray–mesh intersection (from ray_cast_world_pos).
+        mode : str
+            One of "inflate", "deflate", "smooth", "flatten".
+        radius : float
+            World-space brush radius in mesh units.
+        strength : float
+            Maximum displacement per call (scaled by falloff weight).
+        """
+        # Work in float64 for precision; trimesh stores vertices as float64
+        verts = np.asarray(self._mesh.vertices, dtype=np.float64)
+
+        # --- Vertex selection: all vertices within radius ---
+        diffs = verts - hit_point.astype(np.float64)
+        dists = np.linalg.norm(diffs, axis=1)
+        mask = dists < radius
+        if not mask.any():
+            return
+
+        idxs = np.where(mask)[0]
+        d_norm = np.clip(dists[idxs] / radius, 0.0, 1.0)
+
+        # Cosine-squared falloff: smooth curve, 1 at center → 0 at edge,
+        # C1 continuous so there's no sharp boundary artefact on the mesh.
+        weights = np.cos(d_norm * (math.pi / 2.0)) ** 2  # (K,)
+
+        # --- Copy vertices so we can write back cleanly ---
+        new_verts = verts.copy()
+
+        if mode in ("inflate", "deflate"):
+            # Push / pull vertices along their vertex normals.
+            # vertex_normals is a cached trimesh property; we read it fresh each
+            # call so it reflects any deformation from the previous sculpt stroke.
+            sign = 1.0 if mode == "inflate" else -1.0
+            norms = np.asarray(self._mesh.vertex_normals, dtype=np.float64)
+            # Scale each normal by its falloff weight and strength, apply in-place
+            new_verts[idxs] += norms[idxs] * (weights * strength * sign)[:, np.newaxis]
+
+        elif mode == "smooth":
+            # Laplacian smooth: move each affected vertex toward the average
+            # position of its immediate neighbors, weighted by falloff.
+            for i, v_idx in enumerate(idxs):
+                nbrs = self._vertex_neighbors[v_idx]
+                if len(nbrs) == 0:
+                    continue
+                avg = np.mean(new_verts[nbrs], axis=0)
+                # Blend toward avg — strength controls how far it moves per call
+                new_verts[v_idx] += (avg - new_verts[v_idx]) * weights[i] * strength
+
+        elif mode == "flatten":
+            # Project affected vertices toward their shared best-fit plane.
+            # PCA on the affected vertex cloud: the eigenvector corresponding
+            # to the smallest eigenvalue is the plane normal (least variance
+            # direction = direction perpendicular to the flat plane).
+            w_sum = weights.sum()
+            if w_sum < 1e-9:
+                return
+
+            # Weighted centroid of affected vertices
+            centroid = np.average(verts[idxs], axis=0, weights=weights)
+
+            # Weighted covariance matrix
+            diff = verts[idxs] - centroid                          # (K, 3)
+            cov = (diff * weights[:, np.newaxis]).T @ diff / w_sum # (3, 3)
+
+            # Eigen-decompose; eigh returns ascending eigenvalues
+            _, eigenvectors = np.linalg.eigh(cov)
+            plane_normal = eigenvectors[:, 0]  # smallest eigenvalue = plane normal
+
+            # Signed distance of each affected vertex from the plane
+            dots = diff @ plane_normal  # (K,) scalar signed distances
+
+            # Move each vertex toward the plane proportional to falloff × strength
+            new_verts[idxs] -= (
+                plane_normal[np.newaxis, :] *
+                (dots * weights * strength)[:, np.newaxis]
+            )
+
+        # --- Seam reconciliation (prevents mesh splitting) ---
+        #
+        # UV seams duplicate vertices: same 3D position, different UV index.
+        # Two problems arise without this step:
+        #
+        #   1. A seam partner OUTSIDE the brush radius receives no displacement,
+        #      so its side of the seam stays put while the other moves → tear.
+        #
+        #   2. Both seam partners are INSIDE the brush (they always are — they sit
+        #      at the same position so they share the same distance to hit_point).
+        #      Each gets an independent displacement (different vertex normals for
+        #      inflate/deflate, different neighbor sets for smooth) → divergence.
+        #
+        # Fix: after all per-mode displacements are computed, build the full
+        # (N,3) delta array, then for every seam group touching the brush:
+        #   • Average the deltas of all group members (inside AND outside brush).
+        #   • Write that averaged delta back to every member.
+        # This locks all coincident vertices to an identical displacement,
+        # keeping the mesh watertight regardless of brush size or stroke magnitude.
+        delta = new_verts - verts   # (N, 3), zero for vertices outside the brush
+
+        seen_groups: set = set()
+        for v_idx in idxs:
+            partners = self._seam_partners[v_idx]
+            if not partners:
+                continue
+            # Use the smallest index in the group as a dedup key
+            group = [v_idx] + partners
+            group_key = min(group)
+            if group_key in seen_groups:
+                continue
+            seen_groups.add(group_key)
+
+            # Average all members' deltas (partners outside brush have delta=0,
+            # which is correct — they contribute zero and pull the average
+            # slightly inward, but the result stays watertight).
+            avg_delta = np.mean([delta[g] for g in group], axis=0)
+            for g in group:
+                delta[g] = avg_delta
+
+        # Assign back through trimesh's setter to invalidate cached normals,
+        # bounds, and other derived properties that depend on vertex positions.
+        self._mesh.vertices = verts + delta
+        self._sculpt_dirty = True
+
+    def is_sculpt_dirty(self) -> bool:
+        """Return True if sculpt() has modified geometry since the last call."""
+        dirty = self._sculpt_dirty
+        self._sculpt_dirty = False
+        return dirty
 
     # ------------------------------------------------------------------ #
     # Dirty rect tracking                                                  #
@@ -566,15 +807,28 @@ class MeshPainter:
                 faces=faces,
                 process=False,
             )
-            # Re-extract UV coords — needed because the face order may differ
-            # after a mesh operation (safe no-op for sculpt-only restores).
-            self._uvs = self._extract_uvs()
+            # Re-extract UV coords from the new mesh. The reconstructed Trimesh
+            # has no TextureVisuals (we only snapshot positions+faces, not the
+            # visual), so _extract_uvs() will return None. In that case, keep
+            # the existing _uvs — sculpt never changes UV layout, so the stored
+            # array is still correctly aligned to the (unchanged) face topology.
+            new_uvs = self._extract_uvs()
+            if new_uvs is not None:
+                self._uvs = new_uvs
+            # else: retain self._uvs as-is (valid for sculpt-only restores)
 
             # Rebuild BVH so ray_cast() works correctly on restored geometry
             self._rebuild_bvh()
 
             # Rebuild face adjacency for BFS region fill
             self._face_adj = self._build_face_adjacency()
+
+            # Rebuild vertex neighbors for the Smooth sculpt brush
+            self._vertex_neighbors = self._build_vertex_neighbors()
+
+            # Rebuild seam partner groups (topology is identical for sculpt
+            # restores, but rebuild anyway to stay correct after mesh ops)
+            self._seam_partners = self._build_seam_partners()
 
         # Restore texture — replace the PIL buffer with the snapshot copy
         self._albedo_img = albedo.copy()
