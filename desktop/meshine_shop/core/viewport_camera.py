@@ -353,21 +353,36 @@ class ViewportCamera:
         """
         Zoom by moving the camera along a direction.
 
+        Step size is proportional to the distance to the target point so
+        each scroll tick moves the same visual percentage of remaining
+        distance regardless of how close the camera is. This prevents the
+        "accelerating lurch" that fixed-unit dolly produces when close to
+        the model. Factor 0.15 = ~15% of distance per tick at scroll_speed=1.0.
+
         Args:
             ticks:     Scroll wheel ticks. Positive = zoom in, negative = zoom out.
             direction: World-space vector to move along. If None, uses the camera's
                        forward vector. Pass (target_point - position) to zoom toward
                        a specific world point (e.g. what's under the cursor).
         """
+        # Proportional step factor — each tick covers this fraction of the
+        # current distance. Gives consistent visual speed at any zoom level.
+        _PROPORTION = 0.15
+
         if direction is None:
             d = self._forward()
-            self.position += d * (ticks * self.settings.scroll_speed)
+            # Use distance to focal point as the reference distance.
+            dist = max(0.01, float(np.linalg.norm(self.focal_point - self.position)))
+            self.position += d * (ticks * self.settings.scroll_speed * dist * _PROPORTION)
         else:
             norm = float(np.linalg.norm(direction))
             if norm < 1e-8:
                 return
             d = direction / norm
-            delta = d * (ticks * self.settings.scroll_speed)
+            # norm is the distance to the target point — ideal reference for
+            # proportional movement toward exactly what's under the cursor.
+            dist = max(0.01, norm)
+            delta = d * (ticks * self.settings.scroll_speed * dist * _PROPORTION)
             # Move both position and focal_point by the same delta so the
             # orbital relationship (distance, yaw, pitch) stays intact.
             # Without this, orbit after a cursor-targeted zoom snaps because

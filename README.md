@@ -20,7 +20,7 @@ Meshine Shop solves this by unifying the entire pipeline — from photo import (
 | USD Processing | usd-core (Pixar USD) | Reads Object Capture's USDZ output (geometry + PBR textures) for format conversion |
 | Mesh Processing | Open3D | Decimation (QEM), point cloud manipulation, AO ray casting — MIT licensed, fully commercial-friendly |
 | UV Unwrapping | xatlas | Battle-tested automatic UV generation used in production pipelines |
-| 3D Viewport | Qt OpenGL widget + Open3D | GPU-accelerated rendering without browser overhead |
+| 3D Viewport | moderngl (OpenGL 4.1 core) + PySide6 QOpenGLWidget | GPU-accelerated render loop with full GL context control and custom GLSL shaders |
 | Export | trimesh + Assimp CLI | OBJ/GLB via trimesh; FBX via the Assimp CLI (OBJ → FBX conversion) |
 | Mobile Companion | Swift + ARKit (iOS) | LiDAR live capture streaming to desktop (Phase 3) |
 | Streaming Protocol | WebSocket or gRPC | Real-time depth/RGB/pose data from phone to desktop |
@@ -60,11 +60,18 @@ Meshine Shop/
 │   │   │   ├── workspace.py    # Workspace directory management
 │   │   │   ├── exporter.py     # Mesh format conversion + texture embedding
 │   │   │   └── texture_baker.py # PBR texture baking (albedo, normal, AO)
+│   │   ├── core/               # Pipeline logic, engine implementations
+│   │   │   ├── edit_history.py # Undo/redo command stack (UndoStack + ICommand ABC)
+│   │   │   ├── mesh_painter.py # BVH, sculpt brushes, paint buffer, seam-safe deformation
+│   │   │   └── viewport_camera.py # Camera math (view/projection matrices, UE-style navigation)
 │   │   └── ui/                 # Qt widgets, views, styling
-│   │       ├── main_window.py  # Import, Process, Export views
+│   │       ├── main_window.py  # Import, Process, Viewport, Export views
 │   │       ├── drop_zone.py    # Drag-and-drop + folder import
 │   │       ├── processing_queue.py # Live pipeline stage display
 │   │       ├── sidebar.py      # Navigation sidebar
+│   │       ├── viewport.py     # QOpenGLWidget — moderngl render loop, FBO selection, overlays
+│   │       ├── viewport_tools.py # Tool panel (brush, sculpt, polygon select, settings)
+│   │       ├── viewport_layers.py # Layers panel (saved selections, visibility, rename, delete)
 │   │       └── styles.py       # Centralized QSS dark theme
 │   ├── apple_photogrammetry/   # Swift CLI wrapping PhotogrammetrySession
 │   │   ├── Package.swift       # SPM manifest (macOS 14+, RealityKit)
@@ -131,10 +138,47 @@ Meshine Shop/
 - Auto-transition to Export view after pipeline completes
 - Reset button to clear the job and start a new reconstruction
 
+### 3D Viewport (Phase 5 — In Progress)
+
+The viewport sits between the Process and Export pages. The pipeline auto-navigates here after reconstruction completes so the user can inspect and edit the asset before exporting.
+
+**Rendering**
+- OpenGL 4.1 core profile via moderngl inside a PySide6 QOpenGLWidget
+- Diffuse + ambient GLSL shaders: `texture(albedo, uv).rgb * (diffuse * 0.6 + 0.4)` — photo-realistic lighting from a single directional light without shadow maps
+- GPU-uploaded interleaved VBO (position + normal + UV per vertex) with a single draw call per frame
+- Dirty-rect texture streaming: only modified regions are re-uploaded via `glTexSubImage2D` after paint operations
+
+**Camera Navigation (Unreal Engine-style)**
+
+| Input | Behaviour |
+|---|---|
+| RMB + mouse drag | Fly look (yaw/pitch) |
+| RMB + WASD | Move forward/back/left/right |
+| RMB + Q/E | Move down/up |
+| RMB + Shift | 3× speed boost |
+| Alt + LMB drag | Orbit around focal point |
+| Scroll wheel | Dolly along view direction |
+| MMB drag | Pan focal point |
+| F key | Frame mesh — resets camera to see full bounding box |
+
+**Sculpt Brushes**
+- Inflate, Deflate, Smooth, Flatten — real-time deformation applied via trimesh BVH ray casting
+- Seam-safe: edits propagate to duplicate vertices across UV seam boundaries to prevent cracks
+- Undo/redo via a full command stack (`UndoStack` + `ICommand` ABC) — Ctrl+Z / Ctrl+Shift+Z
+
+**Polygon Selection + Layers**
+- Lasso tool: click to place polygon anchor points, Enter or double-click to finalize
+- Face-ID FBO rendering: mesh rendered offscreen with per-triangle 24-bit RGB-encoded face indices (depth-tested so occluded back-faces are automatically excluded)
+- Pixel-based selection: faces whose depth-tested pixels land inside the drawn polygon are selected — robust at all camera angles and triangle sizes
+- **Pending overlay**: screen-space mask texture composited as a teal highlight; visible before saving
+- **Committed overlay**: per-frame 3D anchor reprojection — polygon anchor points are baked to world-space surface positions via barycentric interpolation at save time, then reprojected through the current camera each frame. The highlight stays glued to the model surface from any orbit angle
+- **Back-face culling**: average face normal (world-space) computed at save time; each frame, `dot(avg_normal, camera_pos − centroid) > 0` hides the overlay when the camera is viewing from the back
+- **Layers panel** (left sidebar): each saved polygon selection appears as a named layer row with an eye toggle, color swatch, inline rename (double-click), and delete button
+
 ### UI/UX
 - Charcoal + crimson dark theme with cohesive outlined button styling
 - Sidebar navigation with crimson left-accent active indicator and vertical separator
-- Import / Process / Export views — all content vertically and horizontally centered
+- Import / Process / Viewport / Export views — all content vertically and horizontally centered
 - Quality preset dropdown on Import page; format dropdown on Export page
 - Development file watcher with auto-restart on save
 - Cross-platform targeting (macOS + Windows)
@@ -163,6 +207,17 @@ Meshine Shop/
 - [x] 2k — Selective PBR correction (metallic-mask-guided: organic zones get roughness floor 0.60 + metallic → 0; metal zones preserved as chrome)
 - [x] 2l — Albedo clarity enhancement (shadow lift for dark-subject detail visibility + 1.5× saturation boost)
 
+### Phase 5: 3D Viewport (In Progress)
+- [x] 5a — QOpenGLWidget + moderngl render loop (textured mesh, diffuse shading)
+- [x] 5b — Unreal Engine-style camera navigation (fly, orbit, pan, zoom, frame)
+- [x] 5c — Undo/redo command stack
+- [x] 5d — Sculpt brushes (inflate, deflate, smooth, flatten) with seam-safe deformation
+- [x] 5e — Polygon lasso selection with FBO face-ID rendering and pixel-based face collection
+- [x] 5f — Layer system: save, name, toggle visibility, delete, color swatches, 3D overlay tracking
+- [ ] 5g — Mesh operations (smooth, decimate, fill holes, subdivide, remove floaters)
+- [ ] 5h — Texture projection / direct paint on mesh
+- [ ] 5i — Settings dialog (camera sensitivity, keybindings)
+
 ### Phase 3: LiDAR Live Capture
 - [ ] 3a — iOS companion app (ARKit + LiDAR)
 - [ ] 3b — WebSocket/gRPC streaming protocol
@@ -171,7 +226,6 @@ Meshine Shop/
 
 ### Phase 4: Polish & Packaging
 - [ ] Desktop installers (macOS + Windows)
-- [ ] Quality presets (Mobile / PC / Cinematic)
 - [ ] Batch processing for multiple assets
 - [ ] First-run tutorial and documentation
 

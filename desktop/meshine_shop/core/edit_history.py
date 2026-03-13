@@ -12,6 +12,10 @@ Design decisions:
     - geometry=True/False flag: paint-only operations skip copying vertex/face
       arrays (they're unchanged) so the snapshot only carries the PIL image.
       This halves memory cost for the most frequent operation (brush painting).
+    - uvs are stored alongside geometry (when geometry=True) so that topology-
+      changing mesh operations (decimate, subdivide, fill holes) can be fully
+      undone — without snapshotting uvs, restore_snapshot would fall back to the
+      post-op UV layout on a pre-op topology, causing wrong texture mapping.
     - Redos are cleared on every new push_snapshot() call because a new edit
       branches the timeline — the old redo chain is no longer reachable.
     - No Qt or OpenGL imports — this is pure Python/numpy/PIL so it can be
@@ -22,7 +26,7 @@ from __future__ import annotations
 
 import logging
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 from PIL import Image
@@ -40,9 +44,15 @@ class _Snapshot:
     """
     Immutable record of editor state at one point in time.
 
-    geometry_included indicates whether vertex/face/normal arrays are populated.
-    When False (paint-only snapshot), the mesh geometry fields are all None and
-    only the albedo image is restored on undo.
+    geometry_included indicates whether vertex/face/normal/uv arrays are populated.
+    When False (paint-only snapshot), all mesh geometry fields are None and only
+    the albedo image is restored on undo.
+
+    uvs must be stored alongside geometry because topology-changing mesh operations
+    (decimate, subdivide, fill holes, remove floaters) update _uvs to match the new
+    vertex layout. Without snapshotting uvs, an undo would restore the original
+    geometry but keep the post-op UV array, causing texture coordinates to point at
+    the wrong regions of the albedo image.
     """
     # Whether the geometry arrays are populated in this snapshot.
     geometry_included: bool
@@ -52,6 +62,7 @@ class _Snapshot:
     vertices: np.ndarray | None   # (N, 3) float32
     faces:    np.ndarray | None   # (M, 3) uint32
     normals:  np.ndarray | None   # (N, 3) float32
+    uvs:      np.ndarray | None   # (N, 2) float32 — UV coords matching vertex layout
 
     # Texture state — always included regardless of geometry_included.
     albedo: Image.Image            # PIL Image copy
@@ -101,6 +112,31 @@ class EditHistory:
         return len(self._redos) > 0
 
     # ------------------------------------------------------------------ #
+    # Internal helpers                                                     #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _make_snapshot(painter, geometry: bool) -> _Snapshot:
+        """
+        Build a _Snapshot from the painter's current state.
+
+        Calls painter.get_snapshot_data() which returns deep copies of all
+        mutable arrays. geometry=False skips vertex/face/normal/uv copies for
+        paint-only operations where topology is guaranteed not to change.
+        """
+        verts, faces, norms, uvs, albedo = painter.get_snapshot_data(
+            geometry=geometry
+        )
+        return _Snapshot(
+            geometry_included=geometry,
+            vertices=verts,
+            faces=faces,
+            normals=norms,
+            uvs=uvs,
+            albedo=albedo,
+        )
+
+    # ------------------------------------------------------------------ #
     # Snapshot creation                                                    #
     # ------------------------------------------------------------------ #
 
@@ -117,18 +153,10 @@ class EditHistory:
             The active painter instance — its get_snapshot_data() method is
             called to retrieve deep copies of the current state.
         geometry : bool
-            True  → snapshot vertices, faces, normals + texture (sculpt / mesh ops)
+            True  → snapshot vertices, faces, normals, uvs + texture (sculpt / mesh ops)
             False → snapshot texture only (brush paint / region fill)
         """
-        verts, faces, norms, albedo = painter.get_snapshot_data(geometry=geometry)
-
-        snap = _Snapshot(
-            geometry_included=geometry,
-            vertices=verts,
-            faces=faces,
-            normals=norms,
-            albedo=albedo,
-        )
+        snap = self._make_snapshot(painter, geometry)
         self._undos.append(snap)
 
         # Any new edit invalidates the redo chain — future can't be predicted
@@ -187,14 +215,7 @@ class EditHistory:
         Called by ViewportWidget.undo() just before restoring the undo snapshot,
         so the undone state is preserved for redo.
         """
-        verts, faces, norms, albedo = painter.get_snapshot_data(geometry=geometry)
-        snap = _Snapshot(
-            geometry_included=geometry,
-            vertices=verts,
-            faces=faces,
-            normals=norms,
-            albedo=albedo,
-        )
+        snap = self._make_snapshot(painter, geometry)
         self._redos.append(snap)
 
     def push_undo_only(self, painter, geometry: bool = True) -> None:
@@ -205,14 +226,7 @@ class EditHistory:
         a redo snapshot. Using push_snapshot() would clear _redos before we could
         pop from it, breaking redo entirely.
         """
-        verts, faces, norms, albedo = painter.get_snapshot_data(geometry=geometry)
-        snap = _Snapshot(
-            geometry_included=geometry,
-            vertices=verts,
-            faces=faces,
-            normals=norms,
-            albedo=albedo,
-        )
+        snap = self._make_snapshot(painter, geometry)
         self._undos.append(snap)
         log.debug(
             "EditHistory: push_undo_only (undo_depth=%d, redo_depth=%d)",

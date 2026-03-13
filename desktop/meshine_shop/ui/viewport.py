@@ -43,7 +43,7 @@ except ImportError:
 
 from PySide6.QtCore import Qt, QPoint, QTimer, Signal
 from PySide6.QtGui import (
-    QColor, QCursor, QKeyEvent, QMouseEvent, QPainter, QWheelEvent,
+    QColor, QCursor, QImage, QKeyEvent, QMouseEvent, QPainter, QPen, QPolygon, QWheelEvent,
 )
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import QLabel, QSizePolicy, QVBoxLayout, QWidget
@@ -268,6 +268,235 @@ void main() {
 }
 """
 
+# Flat-color highlight shader — used for polygon selection highlights
+# (pending selection teal overlay + saved layer colored overlays).
+# Simple MVP vertex pass-through with a user-supplied RGBA color uniform.
+HIGHLIGHT_VERT_SHADER = """
+#version 330 core
+
+in vec3 in_position;
+uniform mat4 MVP;
+
+void main() {
+    gl_Position = MVP * vec4(in_position, 1.0);
+    // Push the highlight slightly toward the camera (subtract 0.002 in NDC
+    // depth).  This ensures every highlight fragment has a strictly smaller
+    // depth value than the mesh surface it sits on, so GL_LESS always passes
+    // for front-facing selected faces and fails for back faces (which are much
+    // further from the camera).  Without this push, the mesh and highlight are
+    // at the exact same depth and z-fighting / GL_LEQUAL accumulation causes
+    // shimmering and visible triangle-edge seams inside the selection.
+    gl_Position.z -= 0.002 * gl_Position.w;
+}
+"""
+
+HIGHLIGHT_FRAG_SHADER = """
+#version 330 core
+
+uniform vec4 highlight_color;
+out vec4 out_color;
+
+void main() {
+    out_color = highlight_color;
+}
+"""
+
+# UV-space mask shaders for pixel-accurate selection DISPLAY.
+#
+# After the FBO selection, the polygon is rasterised into a 1024×1024
+# UV-space texture (uv_mask).  The full mesh is then rendered through
+# these shaders; only fragments whose UV coordinate lands on a painted
+# texel are drawn with the highlight colour.  Because the mask lives in
+# UV space (not screen space) the selection looks correct from any camera
+# angle, exactly as in Blender's texture-paint mask overlay.
+UVMASK_VERT_SHADER = """
+#version 330 core
+
+in vec3 in_position;
+in vec2 in_uv;
+
+out vec2 v_uv;
+
+uniform mat4 MVP;
+
+void main() {
+    gl_Position = MVP * vec4(in_position, 1.0);
+    v_uv = in_uv;
+}
+"""
+
+UVMASK_FRAG_SHADER = """
+#version 330 core
+
+in vec2 v_uv;
+out vec4 out_color;
+
+uniform sampler2D uv_mask;
+uniform vec4      highlight_color;
+
+void main() {
+    float m = texture(uv_mask, v_uv).r;
+    // Discard fully-transparent fragments; scale alpha by mask value so the
+    // blurred/dilated edges fade out smoothly — gives a soft, feathered
+    // selection boundary instead of hard triangle edges.
+    if (m < 0.04) discard;
+    out_color = vec4(highlight_color.rgb, highlight_color.a * m);
+}
+"""
+
+# Face-ID shaders for pixel-accurate polygon selection.
+#
+# Instead of testing face centroids (which gives jagged triangle-boundary
+# selections), we render the mesh into an offscreen FBO where every fragment
+# is colored with the unique ID of its face, then read which IDs appear
+# under the pixels of the user's drawn polygon.  Only faces that have at
+# least one visible pixel inside the polygon are selected — this matches
+# how Blender and Maya implement lasso/boundary select.
+#
+# Encoding: face_index+1 packed into 24-bit RGB (background stays (0,0,0,0)).
+# 'flat' interpolation on v_face_id guarantees every fragment in a primitive
+# gets the provoking-vertex value — no float interpolation across the triangle.
+FACEID_VERT_SHADER = """
+#version 330 core
+
+in vec3 in_position;
+in float in_face_id;
+
+flat out float v_face_id;
+
+uniform mat4 MVP;
+
+void main() {
+    gl_Position = MVP * vec4(in_position, 1.0);
+    v_face_id = in_face_id;
+}
+"""
+
+FACEID_FRAG_SHADER = """
+#version 330 core
+
+flat in float v_face_id;
+out vec4 out_color;
+
+void main() {
+    // Store face_index+1 as 24-bit RGB so background (cleared to 0) is
+    // unambiguously different from face 0.
+    int id = int(v_face_id) + 1;
+    float r = float(id & 0xFF)        / 255.0;
+    float g = float((id >> 8)  & 0xFF) / 255.0;
+    float b = float((id >> 16) & 0xFF) / 255.0;
+    out_color = vec4(r, g, b, 1.0);
+}
+"""
+
+# Fullscreen quad vertex shader — used for scene copy and overlay passes.
+# Converts NDC quad positions to UV coordinates for texture sampling.
+QUAD_VERT_SHADER = """
+#version 330 core
+
+in vec2 in_pos;   // NDC position (-1..1)
+out vec2 v_uv;    // UV coordinates (0..1)
+
+void main() {
+    gl_Position = vec4(in_pos, 0.0, 1.0);
+    // NDC (-1..1) → UV (0..1): origin is bottom-left in both spaces
+    v_uv = in_pos * 0.5 + 0.5;
+}
+"""
+
+# Scene copy shader — blits the offscreen FBO color texture straight to
+# the Qt framebuffer with no modification.  Used as the first pass of the
+# composite pipeline before overlays are applied on top.
+COPY_FRAG_SHADER = """
+#version 330 core
+
+uniform sampler2D scene_color;
+in vec2 v_uv;
+out vec4 out_color;
+
+void main() {
+    out_color = texture(scene_color, v_uv);
+}
+"""
+
+# Screen-space polygon overlay shader.
+#
+# Used for both the pending selection (teal) and committed layer highlights.
+# Per-pixel accuracy: each fragment tests:
+#   (a) Is this pixel inside the polygon mask (a rasterized polygon image)?
+#   (b) Is there mesh geometry here? (depth < background threshold)
+# If both — output the highlight color, blended over the existing scene.
+#
+# The mask texture is in PIL/Qt coordinate space (origin top-left), while
+# the scene depth texture is in OpenGL space (origin bottom-left). The
+# v_uv.y is therefore flipped when sampling the mask.
+#
+# Depth threshold: the background gradient is drawn at NDC z=0.9999 with
+# w=1.0, which maps to depth-buffer value ~0.99995. Mesh geometry at
+# typical viewing distances has depth < 0.9995, so that is the threshold.
+SCREEN_OVERLAY_FRAG_SHADER = """
+#version 330 core
+
+uniform sampler2D scene_depth;    // depth texture from offscreen FBO
+uniform sampler2D sel_mask;       // screen-space polygon mask (R8, white=selected)
+uniform vec4      overlay_color;  // RGBA highlight color
+// Projected NDC depth [0,1] of the polygon centroid. Used to occlude the
+// overlay when the polygon is behind mesh geometry (e.g. viewing back side).
+// Pass 0.0 to disable occlusion (pending selections always visible).
+uniform float     poly_depth;
+
+in vec2 v_uv;
+out vec4 out_color;
+
+void main() {
+    float depth = texture(scene_depth, v_uv).r;
+
+    // Flip Y to convert from OpenGL UV space to PIL/Qt screen space before
+    // sampling the mask (mask was rasterized in PIL top-left-origin space).
+    float mask  = texture(sel_mask, vec2(v_uv.x, 1.0 - v_uv.y)).r;
+
+    // Skip background pixels (depth at background gradient ~0.99995) and
+    // pixels outside the polygon mask.
+    if (depth >= 0.9995 || mask < 0.04) discard;
+
+    // Depth occlusion: if scene geometry at this pixel is closer to the camera
+    // than the polygon (e.g. back-face mesh occluding a front-face layer),
+    // discard so the highlight disappears behind the model.
+    // Small epsilon (0.005) prevents z-fighting on the layer's own surface.
+    if (depth < poly_depth - 0.005) discard;
+
+    // Alpha = requested overlay alpha multiplied by mask coverage.
+    // SRC_ALPHA / ONE_MINUS_SRC_ALPHA blending on the destination stacks
+    // multiple layer overlays cleanly without washing out base scene color.
+    float a = overlay_color.a * mask;
+    out_color = vec4(overlay_color.rgb, a);
+}
+"""
+
+# Variant of SCREEN_OVERLAY_FRAG_SHADER without the PIL Y-flip.
+# Used for committed layers where the mask is rendered by OpenGL into an FBO
+# each frame — OpenGL textures are already in bottom-left-origin convention
+# so no coordinate flip is needed when sampling sel_mask.
+SCREEN_OVERLAY_FRAG_SHADER_NOFLIP = """
+#version 330 core
+
+uniform sampler2D scene_depth;
+uniform sampler2D sel_mask;
+uniform vec4      overlay_color;
+
+in vec2 v_uv;
+out vec4 out_color;
+
+void main() {
+    float depth = texture(scene_depth, v_uv).r;
+    // No Y flip — mask was rendered by OpenGL and shares its UV convention.
+    float mask  = texture(sel_mask, v_uv).r;
+    if (depth >= 0.9995 || mask < 0.04) discard;
+    float a = overlay_color.a * mask;
+    out_color = vec4(overlay_color.rgb, a);
+}
+"""
+
 
 class _PlaceholderLabel(QWidget):
     """
@@ -322,6 +551,93 @@ class _DotOverlay(QWidget):
         painter.drawEllipse(1, 1, self.RADIUS * 2, self.RADIUS * 2)
 
 
+class _PolyOverlay(QWidget):
+    """
+    Semi-transparent QPainter overlay that draws the polygon selection in progress.
+
+    Positioned as a full-size child widget over the QOpenGLWidget so it covers
+    the entire render area. Transparent to mouse events — all clicks pass through
+    to the viewport underneath.
+
+    Visual elements:
+    - Solid cyan lines between placed anchor points
+    - Dashed rubber-band line from the last anchor to the current cursor
+    - Small filled dots at each anchor point
+    - Larger circle around the first anchor (shows the "close here" zone when ≥3 pts)
+    - Semi-transparent filled polygon preview when ≥3 points are placed
+    """
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        # Pass all mouse/keyboard events through to the viewport below
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        # Transparent background so the GL content shows through
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.hide()
+        self._points: list[tuple[int, int]] = []
+        self._cursor: tuple[int, int] = (0, 0)
+
+    def set_points(
+        self, points: list[tuple[int, int]], cursor: tuple[int, int]
+    ) -> None:
+        """Update the anchor-point list and rubber-band cursor position."""
+        self._points = list(points)
+        self._cursor = cursor
+        if points:
+            # Always fill the full parent area so lines reach every corner
+            if self.parent():
+                self.resize(self.parent().size())
+            self.show()
+            self.raise_()
+        else:
+            self.hide()
+
+    def paintEvent(self, event) -> None:  # noqa: ARG002
+        if not self._points:
+            return
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        pts = [QPoint(px, py) for px, py in self._points]
+        cyan = QColor(0, 220, 255)
+
+        # --- Semi-transparent fill preview when ≥ 3 points are placed ---
+        if len(pts) >= 3:
+            preview_pts = pts + [QPoint(*self._cursor)]
+            painter.setBrush(QColor(0, 220, 255, 35))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawPolygon(QPolygon(preview_pts))
+
+        # --- Solid lines between consecutive anchor points ---
+        line_pen = QPen(cyan, 1.5)
+        line_pen.setStyle(Qt.PenStyle.SolidLine)
+        painter.setPen(line_pen)
+        for i in range(1, len(pts)):
+            painter.drawLine(pts[i - 1], pts[i])
+
+        # --- Dashed rubber-band line from last anchor to cursor ---
+        if pts:
+            rubber_pen = QPen(QColor(0, 220, 255, 160), 1)
+            rubber_pen.setStyle(Qt.PenStyle.DashLine)
+            painter.setPen(rubber_pen)
+            painter.drawLine(pts[-1], QPoint(*self._cursor))
+
+        # --- Closing-zone circle around the first anchor when ≥ 3 points ---
+        # Gives the user a visible target to click to close the polygon loop.
+        if len(pts) >= 3:
+            painter.setBrush(QColor(0, 220, 255, 50))
+            painter.setPen(QPen(cyan, 1))
+            painter.drawEllipse(pts[0], 12, 12)
+
+        # --- Small filled dots at each anchor point ---
+        painter.setBrush(cyan)
+        painter.setPen(Qt.PenStyle.NoPen)
+        for p in pts:
+            painter.drawEllipse(p, 4, 4)
+
+
 class ViewportWidget(QOpenGLWidget):
     """
     OpenGL 3D viewport — renders the mesh and handles navigation + painting.
@@ -344,6 +660,10 @@ class ViewportWidget(QOpenGLWidget):
     # Emitted whenever the undo/redo stack depth changes so the tools panel
     # can enable/disable the Undo and Redo buttons. Args: (can_undo, can_redo).
     history_changed = Signal(bool, bool)
+
+    # Emitted when a polygon selection is finalized. Arg = number of selected
+    # faces. The layers panel listens to enable the "Save as Layer" button.
+    selection_ready = Signal(int)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -442,6 +762,107 @@ class ViewportWidget(QOpenGLWidget):
         self._lmb_cursor_origin_global: "QPoint | None" = None
         # White dot overlay shown at the click position while LMB is held
         self._dot_overlay = _DotOverlay(self)
+
+        # ------------------------------------------------------------------ #
+        # Polygon selection tool state                                         #
+        # ------------------------------------------------------------------ #
+        # Transparent overlay widget drawn on top of the GL surface while
+        # the user is building a polygon selection (shows anchor points,
+        # connecting lines, rubber-band, and semi-transparent fill preview).
+        self._poly_overlay = _PolyOverlay(self)
+
+        # Anchor points placed so far in widget pixel coords.
+        self._poly_points: list[tuple[int, int]] = []
+        # Current cursor position for the rubber-band line preview.
+        self._poly_cursor: tuple[int, int] = (0, 0)
+
+        # Pending polygon selection — set of face indices inside the last
+        # finalized polygon. Shown as a teal highlight until saved as a layer.
+        # Cleared when the user saves to a layer or switches tools.
+        self._pending_faces: "set[int] | None" = None
+        # True → rebuild the pending highlight VAO on the next paintGL call.
+        self._pending_rebuild: bool = False
+
+        # GL resources for the pending selection highlight (teal overlay).
+        # These are kept for backward compatibility but are no longer used for
+        # the pending display — screen mask textures replaced them.
+        self._pending_vao: "moderngl.VertexArray | None" = None
+        self._pending_vbo: "moderngl.Buffer | None" = None
+
+        # Screen-space polygon mask texture for the pending (unsaved) selection.
+        # A single-channel R8 texture at viewport resolution — white pixels mark
+        # the interior of the drawn polygon. Created in _finalize_poly_selection()
+        # and released when the selection is saved or cancelled. Replaces the old
+        # face-VAO highlight, giving pixel-perfect selection boundaries.
+        self._pending_screen_mask_tex: "moderngl.Texture | None" = None
+
+        # Off-screen scene FBO — all scene elements (background, grid, mesh,
+        # gizmo) render here first. The resulting color + depth textures are then
+        # composited to Qt's framebuffer with selection overlays applied on top.
+        self._scene_fbo:       "moderngl.Framebuffer | None" = None
+        self._scene_color_tex: "moderngl.Texture | None"     = None
+        self._scene_depth_tex: "moderngl.Texture | None"     = None
+
+        # Two-pass composite programs:
+        #   _copy_prog                  — blits scene_color_tex to qt_fbo unchanged
+        #   _screen_overlay_prog        — overlay for PIL masks (pending selection, Y-flipped)
+        #   _screen_overlay_prog_noflip — overlay for OpenGL-rendered masks (committed layers)
+        self._copy_prog:                   "moderngl.Program | None"     = None
+        self._screen_overlay_prog:         "moderngl.Program | None"     = None
+        self._screen_overlay_prog_noflip:  "moderngl.Program | None"     = None
+
+        # Fullscreen quad resources — shared VBO, three VAOs (one per program)
+        self._quad_vbo:            "moderngl.Buffer | None"      = None
+        self._quad_vao_copy:       "moderngl.VertexArray | None" = None
+        self._quad_vao_overlay:    "moderngl.VertexArray | None" = None
+        self._quad_vao_overlay_nf: "moderngl.VertexArray | None" = None  # no-flip variant
+
+        # Reusable 1-channel texture for committed layer mask rendering.
+        # Each frame the polygon anchor points are reprojected through the current
+        # camera, PIL-rasterized, and written into this texture for the overlay pass.
+        self._layer_mask_fbo: "moderngl.Framebuffer | None" = None  # unused, kept for compat
+        self._layer_mask_tex: "moderngl.Texture | None"     = None
+
+        # 3D world-space positions of the polygon anchor points, computed at
+        # finalize time by projecting each screen-space anchor onto the mesh
+        # surface via barycentric interpolation. Transferred to the layer dict
+        # on save so the layer highlight can reproject correctly each frame.
+        self._pending_poly_pts_3d: "list | None" = None
+
+        # Average world-space face normal of the pending selection, used to
+        # determine which side of the model the selection is on. Committed
+        # layers use this to cull the overlay when the camera is on the back
+        # side, so the highlight naturally disappears behind the geometry.
+        self._pending_poly_avg_normal: "np.ndarray | None" = None
+
+        # Saved layers — keyed by integer layer_id assigned at save time.
+        # Each entry: {"name", "faces", "visible", "color", "vao", "vbo"}
+        self._layers: dict[int, dict] = {}
+        self._next_layer_id: int = 0
+        # ID of the layer currently selected in the layers panel — rendered
+        # brighter so the user can see which selection is active.
+        self._active_layer_id: int | None = None
+
+        # Flat-color shader for all selection highlights (pending + layers)
+        self._hl_prog: "moderngl.Program | None" = None
+
+        # UV-space mask shader — renders the full mesh; only fragments whose
+        # UV coordinate lands on a painted texel in uv_mask are drawn.
+        # Gives pixel-accurate selection display from any camera angle.
+        self._uvmask_prog: "moderngl.Program | None" = None
+
+        # Full-mesh VAO bound to _uvmask_prog (pos + uv, reuses _vbo/_ibo).
+        # Created after _vbo upload; None until then.
+        self._hl_mesh_vao: "moderngl.VertexArray | None" = None
+
+        # UV mask texture for the pending (not yet saved) selection.
+        self._pending_uv_mask_tex: "moderngl.Texture | None" = None
+
+        # Face-ID shader — used in _finalize_poly_selection() to render an
+        # offscreen FBO where each fragment carries its triangle's unique ID.
+        # Pixel readback + polygon mask gives Blender-quality pixel-accurate selection.
+        self._faceid_prog: "moderngl.Program | None" = None
+
         # World-space 3D position of the LMB hit point (or miss-anchor point) —
         # re-projected every frame so the dot tracks the model surface as it orbits.
         self._dot_world_pos: "np.ndarray | None" = None
@@ -499,6 +920,18 @@ class ViewportWidget(QOpenGLWidget):
         self._history.clear()
         self.history_changed.emit(False, False)
 
+        # Invalidate all polygon selections and layers — face indices from the
+        # previous mesh are meaningless after loading a new one.
+        self._poly_points.clear()
+        self._poly_overlay.set_points([], (0, 0))
+        self._pending_faces = None
+        self._pending_rebuild = False
+        self._pending_screen_mask_tex = None
+        self._pending_poly_pts_3d = None
+        self._pending_poly_avg_normal = None
+        self._layers.clear()
+        self._next_layer_id = 0
+
         # Create the painter (loads mesh + PIL texture, builds BVH)
         self._painter = MeshPainter(mesh_path, textures_dir)
 
@@ -541,6 +974,9 @@ class ViewportWidget(QOpenGLWidget):
         the next user interaction.
         """
         self._tool = tool
+        # Cancel any in-progress polygon selection when switching away from the tool
+        if tool != "poly_select":
+            self._cancel_poly_selection()
         self._gizmo_axis = None   # clear any in-progress drag when tool switches
         self._gizmo_hover = None
         self.update()             # repaint now — gizmo appears/disappears instantly
@@ -631,7 +1067,7 @@ class ViewportWidget(QOpenGLWidget):
 
         # Restore painter state (geometry + texture or texture only)
         self._painter.restore_snapshot(
-            snap.vertices, snap.faces, snap.normals, snap.albedo
+            snap.vertices, snap.faces, snap.normals, snap.uvs, snap.albedo
         )
 
         if snap.geometry_included:
@@ -672,13 +1108,24 @@ class ViewportWidget(QOpenGLWidget):
         self._gizmo_axis = None
         self._gizmo_hover = None
 
-        # Release mesh GPU resources (environment resources are preserved
-        # across mesh loads and will be rebuilt by initializeGL on re-show)
+        # Clear polygon selection state (pending and layers)
+        self._poly_points.clear()
+        self._poly_overlay.set_points([], (0, 0))
+        self._pending_faces = None
+        self._pending_rebuild = False
+        self._pending_screen_mask_tex = None
+        self._pending_poly_pts_3d = None
+        self._layers.clear()
+        self._next_layer_id = 0
+
+        # Release mesh-specific GPU resources only.  Background gradient and
+        # ground grid (_build_environment) are mesh-independent and only built
+        # once in initializeGL — destroying them here would leave the viewport
+        # permanently black after the first reset.
         if self._ctx is not None:
             self.makeCurrent()
             self._release_gpu_resources()
-            self._release_gizmo()     # explicit teardown (not part of _release_gpu_resources)
-            self._release_environment()
+            self._release_gizmo()
             self.doneCurrent()
 
         self.update()
@@ -721,6 +1168,60 @@ class ViewportWidget(QOpenGLWidget):
             fragment_shader=GIZMO_FRAG_SHADER,
         )
 
+        # Compile flat-color highlight shader (polygon selection overlays)
+        self._hl_prog = self._ctx.program(
+            vertex_shader=HIGHLIGHT_VERT_SHADER,
+            fragment_shader=HIGHLIGHT_FRAG_SHADER,
+        )
+
+        # Compile UV-space mask highlight shader.  Renders the full mesh and
+        # discards any fragment whose UV coordinate is not painted in uv_mask.
+        self._uvmask_prog = self._ctx.program(
+            vertex_shader=UVMASK_VERT_SHADER,
+            fragment_shader=UVMASK_FRAG_SHADER,
+        )
+
+        # Compile face-ID shader for pixel-accurate polygon selection (FBO-based).
+        # Each fragment is written with its triangle's 24-bit RGB-encoded index
+        # so readback + polygon mask gives exact Blender-quality lasso behavior.
+        self._faceid_prog = self._ctx.program(
+            vertex_shader=FACEID_VERT_SHADER,
+            fragment_shader=FACEID_FRAG_SHADER,
+        )
+
+        # Compile fullscreen quad programs for the composite pipeline:
+        #   1. Copy pass     — blit offscreen scene color → Qt framebuffer
+        #   2. Overlay pass  — blend PIL polygon mask (Y-flipped, pending selection)
+        #   3. Overlay noflip — blend OpenGL-rendered face mask (committed layers)
+        self._copy_prog = self._ctx.program(
+            vertex_shader=QUAD_VERT_SHADER,
+            fragment_shader=COPY_FRAG_SHADER,
+        )
+        self._screen_overlay_prog = self._ctx.program(
+            vertex_shader=QUAD_VERT_SHADER,
+            fragment_shader=SCREEN_OVERLAY_FRAG_SHADER,
+        )
+        self._screen_overlay_prog_noflip = self._ctx.program(
+            vertex_shader=QUAD_VERT_SHADER,
+            fragment_shader=SCREEN_OVERLAY_FRAG_SHADER_NOFLIP,
+        )
+
+        # Fullscreen NDC quad (two CCW triangles covering [-1,1]²)
+        _quad_verts = np.array([
+            -1.0, -1.0,   1.0, -1.0,   1.0,  1.0,
+            -1.0, -1.0,   1.0,  1.0,  -1.0,  1.0,
+        ], dtype=np.float32)
+        self._quad_vbo = self._ctx.buffer(_quad_verts.tobytes())
+        self._quad_vao_copy = self._ctx.vertex_array(
+            self._copy_prog, [(self._quad_vbo, "2f", "in_pos")]
+        )
+        self._quad_vao_overlay = self._ctx.vertex_array(
+            self._screen_overlay_prog, [(self._quad_vbo, "2f", "in_pos")]
+        )
+        self._quad_vao_overlay_nf = self._ctx.vertex_array(
+            self._screen_overlay_prog_noflip, [(self._quad_vbo, "2f", "in_pos")]
+        )
+
         # GPU upload is handled in paintGL() via _needs_upload — no upload here.
         # initializeGL() is sometimes called for hidden widgets at startup,
         # before any mesh has loaded, so we defer upload to the first paintGL
@@ -737,7 +1238,35 @@ class ViewportWidget(QOpenGLWidget):
         # Without this, all rendering goes to the wrong framebuffer and the
         # widget surface stays empty (shows Qt's widget background instead).
         qt_fbo = self._ctx.detect_framebuffer(self.defaultFramebufferObject())
-        qt_fbo.use()
+
+        # Use the offscreen scene FBO as the render target when available.
+        # This lets us sample its depth texture in the overlay pass so the
+        # selection highlight is depth-clipped to mesh pixels only.
+        # Falls back to qt_fbo if _scene_fbo is not yet built (e.g. first frame
+        # before resizeGL has been called).
+        has_overlay = (
+            self._scene_fbo is not None
+            and self._scene_color_tex is not None
+            and self._scene_depth_tex is not None
+            and self._copy_prog is not None
+            and self._screen_overlay_prog is not None
+            and self._quad_vao_copy is not None
+            and self._quad_vao_overlay is not None
+        )
+        scene_target = self._scene_fbo if has_overlay else qt_fbo
+        scene_target.use()
+
+        # Local helper: copy the offscreen scene to qt_fbo.
+        # Called before any return from paintGL and before the overlay pass.
+        def _flush_scene() -> None:
+            if not has_overlay:
+                return   # already rendering to qt_fbo — nothing to flush
+            qt_fbo.use()
+            self._ctx.disable(moderngl.DEPTH_TEST)
+            self._scene_color_tex.use(0)
+            self._copy_prog["scene_color"].value = 0
+            self._quad_vao_copy.render()
+            self._ctx.enable(moderngl.DEPTH_TEST)
 
         # Deferred GPU upload: load_mesh() sets _needs_upload=True and calls
         # update(). Qt then calls paintGL() with the context guaranteed current.
@@ -768,7 +1297,7 @@ class ViewportWidget(QOpenGLWidget):
         # Clear depth to 1.0 and color to black; the background gradient quad
         # will immediately overwrite every color pixel, so the clear color
         # doesn't matter visually — we just need a clean depth buffer.
-        qt_fbo.clear(0.0, 0.0, 0.0)
+        scene_target.clear(0.0, 0.0, 0.0)
 
         # --- 1. Background gradient (fullscreen NDC quad) ---
         # Depth test and depth write are disabled so the quad paints every
@@ -778,8 +1307,9 @@ class ViewportWidget(QOpenGLWidget):
             self._bg_vao.render()
             self._ctx.enable(moderngl.DEPTH_TEST)
 
-        # If no camera is ready, stop here — grid + mesh need camera matrices.
+        # If no camera is ready, flush whatever was drawn (background) and stop.
         if self._camera is None:
+            _flush_scene()
             return
 
         # Compute camera matrices shared across grid, mesh, and gizmo
@@ -794,7 +1324,8 @@ class ViewportWidget(QOpenGLWidget):
 
         # --- 2. Mesh (opaque, depth-tested) ---
         if self._painter is None or self._vao is None:
-            # No mesh yet — environment still renders cleanly above
+            # No mesh yet — flush background so it shows on screen
+            _flush_scene()
             return
 
         # Upload any texture pixels painted since the last frame
@@ -875,6 +1406,121 @@ class ViewportWidget(QOpenGLWidget):
 
             self._ctx.disable(moderngl.BLEND)
 
+        # --- 5. Flush scene to Qt framebuffer + screen-space overlay pass ---
+        #
+        # First: copy the offscreen scene (background + grid + mesh + gizmo)
+        # from _scene_fbo to qt_fbo via a simple fullscreen blit.
+        #
+        # Then: for each visible selection (pending polygon or saved layer),
+        # run a second fullscreen pass that composites a per-pixel polygon mask
+        # on top of the scene, clipped to mesh pixels via the depth texture.
+        #
+        # This approach gives pixel-perfect selection boundaries that exactly
+        # match the drawn polygon shape — no triangle-edge jagging, no UV atlas
+        # issues.  Each mask is a grayscale R8 texture rasterized from the
+        # user's polygon at viewport resolution by _finalize_poly_selection().
+        _flush_scene()
+        qt_fbo.use()
+
+        # Run overlay passes only when the composite infrastructure is ready
+        # and there is at least one visible selection to show.
+        _pending_has_overlay  = self._pending_screen_mask_tex is not None
+        _layers_have_overlays = any(
+            layer.get("visible", True) and layer.get("poly_pts_3d") is not None
+            for layer in self._layers.values()
+        )
+        if has_overlay and (_pending_has_overlay or _layers_have_overlays):
+            self._ctx.disable(moderngl.DEPTH_TEST)
+
+            # --- Pending selection: teal/cyan overlay (screen-space PIL mask) ---
+            # Mask rasterized in PIL top-left-origin space → Y-flip shader variant.
+            if _pending_has_overlay:
+                self._ctx.enable(moderngl.BLEND)
+                self._ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
+                self._scene_depth_tex.use(0)
+                self._screen_overlay_prog["scene_depth"].value = 0
+                self._screen_overlay_prog["sel_mask"].value    = 1
+                self._screen_overlay_prog["overlay_color"].write(
+                    np.array([0.1, 0.85, 0.9, 0.55], dtype=np.float32).tobytes()
+                )
+                # Pending selection is always shown — no depth occlusion needed.
+                self._screen_overlay_prog["poly_depth"].value = 0.0
+                self._pending_screen_mask_tex.use(1)
+                self._quad_vao_overlay.render()
+                self._ctx.disable(moderngl.BLEND)
+
+            # --- Committed layer highlights: reproject 3D anchor polygon ---
+            #
+            # Each frame, the polygon's saved 3D world-space anchor points are
+            # projected through the current camera MVP to new screen positions.
+            # PIL rasterizes the reprojected polygon into a fresh mask texture
+            # which is then composited via the depth-clipped overlay shader.
+            #
+            # Result: the drawn polygon shape stays glued to the model surface
+            # from any orbit angle, with pixel-accurate boundaries.
+            w = self.width()
+            h = self.height()
+            if _layers_have_overlays and self._layer_mask_tex is not None:
+                from PIL import Image as _PilL, ImageDraw as _PilDL  # noqa: PLC0415
+                for lid, layer in self._layers.items():
+                    if not layer.get("visible", True):
+                        continue
+                    poly_pts_3d = layer.get("poly_pts_3d")
+                    if not poly_pts_3d or len(poly_pts_3d) < 3:
+                        continue
+
+                    # Back-face cull: skip this layer if the camera is on the
+                    # opposite side of the model from where the selection was made.
+                    # dot(avg_normal, camera_pos - centroid) < 0 means the layer
+                    # surface is facing away — don't render it this frame.
+                    pts_w = np.array(poly_pts_3d, dtype=np.float32)       # (K, 3)
+                    avg_normal = layer.get("avg_normal")
+                    if avg_normal is not None:
+                        centroid_w = np.mean(pts_w, axis=0)
+                        cam_to_surf = centroid_w - self._camera.position.astype(np.float32)
+                        if float(np.dot(avg_normal, cam_to_surf)) > 0.0:
+                            continue  # back-facing — skip this layer
+
+                    # Project 3D anchors → current screen positions
+                    pts4  = np.hstack([pts_w, np.ones((len(pts_w), 1), np.float32)])
+                    lproj = (mvp @ pts4.T).T                               # (K, 4)
+                    lwc   = np.where(np.abs(lproj[:, 3]) < 1e-8, 1e-8, lproj[:, 3])
+                    l_sx  = ((lproj[:, 0] / lwc + 1.0) * 0.5 * w).astype(int)
+                    l_sy  = ((1.0 - (lproj[:, 1] / lwc + 1.0) * 0.5) * h).astype(int)
+
+                    # PIL-rasterize the reprojected polygon (top-left origin)
+                    lmask_pil = _PilL.new("L", (w, h), 0)
+                    _PilDL.Draw(lmask_pil).polygon(
+                        [(int(l_sx[k]), int(l_sy[k])) for k in range(len(l_sx))],
+                        fill=255,
+                    )
+                    # Write directly into the reusable layer mask texture
+                    self._layer_mask_tex.write(
+                        np.array(lmask_pil, dtype=np.uint8).tobytes()
+                    )
+
+                    # Composite onto qt_fbo — Y-flip variant (PIL origin)
+                    qt_fbo.use()
+                    r_, g_, b_, a_ = layer["color"]
+                    if lid == self._active_layer_id:
+                        a_ = min(1.0, a_ * 2.0)
+                    self._ctx.enable(moderngl.BLEND)
+                    self._ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
+                    self._scene_depth_tex.use(0)
+                    self._screen_overlay_prog["scene_depth"].value = 0
+                    self._screen_overlay_prog["sel_mask"].value    = 1
+                    self._screen_overlay_prog["overlay_color"].write(
+                        np.array([r_, g_, b_, a_], dtype=np.float32).tobytes()
+                    )
+                    # Depth occlusion handled by the back-face cull above;
+                    # pass 0.0 here to disable the shader-side depth test.
+                    self._screen_overlay_prog["poly_depth"].value = 0.0
+                    self._layer_mask_tex.use(1)
+                    self._quad_vao_overlay.render()
+                    self._ctx.disable(moderngl.BLEND)
+
+            self._ctx.enable(moderngl.DEPTH_TEST)
+
         # Re-project the 3D dot anchor to screen every frame so the white dot
         # tracks the mesh surface point as the model orbits.
         if self._dot_world_pos is not None and self._dot_overlay.isVisible():
@@ -889,6 +1535,11 @@ class ViewportWidget(QOpenGLWidget):
         """Called by Qt when the widget is resized."""
         if self._ctx is not None:
             self._ctx.viewport = (0, 0, w, h)
+            # Rebuild the offscreen scene FBO at the new size so the depth
+            # texture matches the viewport — needed for the overlay depth test.
+            self._rebuild_scene_fbo(w, h)
+        # Keep the poly overlay sized to match the viewport
+        self._poly_overlay.resize(self.size())
         self.update()
 
     # ------------------------------------------------------------------ #
@@ -919,6 +1570,15 @@ class ViewportWidget(QOpenGLWidget):
             self._ibo,
         )
 
+        # UV-mask highlight VAO: reuses the same VBO/IBO but only binds
+        # in_position (3f) and in_uv (2f), skipping the 12-byte normal (12x).
+        if self._uvmask_prog is not None:
+            self._hl_mesh_vao = self._ctx.vertex_array(
+                self._uvmask_prog,
+                [(self._vbo, "3f 12x 2f", "in_position", "in_uv")],
+                self._ibo,
+            )
+
     def _upload_texture_full(self) -> None:
         """Upload the full albedo texture to a moderngl Texture (GPU)."""
         if self._albedo_tex is not None:
@@ -944,7 +1604,7 @@ class ViewportWidget(QOpenGLWidget):
         then rebuilds them from the current painter state.
         """
         # Release geometry buffers only — _albedo_tex is intentionally preserved
-        for attr in ("_vao", "_vbo", "_ibo"):
+        for attr in ("_vao", "_vbo", "_ibo", "_hl_mesh_vao"):
             resource = getattr(self, attr, None)
             if resource is not None:
                 try:
@@ -963,6 +1623,12 @@ class ViewportWidget(QOpenGLWidget):
             [(self._vbo, "3f 3f 2f", "in_position", "in_normal", "in_uv")],
             self._ibo,
         )
+        if self._uvmask_prog is not None:
+            self._hl_mesh_vao = self._ctx.vertex_array(
+                self._uvmask_prog,
+                [(self._vbo, "3f 12x 2f", "in_position", "in_uv")],
+                self._ibo,
+            )
 
     def _refresh_dirty_texture(self) -> None:
         """
@@ -989,9 +1655,55 @@ class ViewportWidget(QOpenGLWidget):
         # moderngl Texture.write() maps to glTexSubImage2D when viewport given
         self._albedo_tex.write(patch_bytes, viewport=(x, y, w, h))
 
+    def _rebuild_scene_fbo(self, w: int, h: int) -> None:
+        """
+        (Re)build the offscreen scene FBO at the given pixel dimensions.
+
+        Called from resizeGL() whenever the viewport size changes. The FBO
+        contains a color texture (RGBA8) and a depth texture — both are
+        needed by the screen-space overlay composite pass. Releases any
+        previously allocated resources before allocating new ones.
+
+        Must be called with the GL context current.
+        """
+        if self._ctx is None or w <= 0 or h <= 0:
+            return
+
+        # Release existing attachments before reallocating at new size
+        for attr in ("_scene_fbo", "_scene_color_tex", "_scene_depth_tex"):
+            res = getattr(self, attr, None)
+            if res is not None:
+                try:
+                    res.release()
+                except Exception:
+                    pass
+            setattr(self, attr, None)
+
+        # RGBA8 color texture + depth texture — color for the copy pass,
+        # depth for the overlay's mesh-pixel clipping test.
+        self._scene_color_tex = self._ctx.texture((w, h), 4)
+        self._scene_depth_tex = self._ctx.depth_texture((w, h))
+        self._scene_fbo = self._ctx.framebuffer(
+            color_attachments=[self._scene_color_tex],
+            depth_attachment=self._scene_depth_tex,
+        )
+
+        # Single-channel layer mask texture — written each frame by PIL-rasterizing
+        # the committed layer's polygon after reprojecting its 3D anchor points
+        # through the current camera. 1-channel (R8) matches the overlay shader's
+        # sel_mask sampler and minimises per-frame upload bandwidth.
+        if self._layer_mask_tex is not None:
+            try:
+                self._layer_mask_tex.release()
+            except Exception:
+                pass
+            self._layer_mask_tex = None
+        self._layer_mask_tex = self._ctx.texture((w, h), 1)
+        log.debug("ViewportWidget: scene FBO rebuilt at %dx%d", w, h)
+
     def _release_gpu_resources(self) -> None:
         """Release mesh GPU buffers and textures (called on each new mesh load)."""
-        for attr in ("_vao", "_vbo", "_ibo", "_albedo_tex"):
+        for attr in ("_hl_mesh_vao", "_vao", "_vbo", "_ibo", "_albedo_tex"):
             resource = getattr(self, attr, None)
             if resource is not None:
                 try:
@@ -1002,6 +1714,11 @@ class ViewportWidget(QOpenGLWidget):
         # Note: gizmo ring buffers are NOT released here. _upload_mesh() calls
         # _release_gpu_resources() and we want the gizmo to survive a mesh upload.
         # Gizmo teardown is handled explicitly in reset() and _release_environment().
+
+        # Release polygon selection highlight resources — face indices are
+        # invalidated whenever the mesh geometry changes (new load or op).
+        self._release_pending_vao()
+        self._release_layer_vaos()
 
     def _build_environment(self) -> None:
         """
@@ -1392,6 +2109,23 @@ class ViewportWidget(QOpenGLWidget):
                     self._gizmo_axis = axis
                 return  # rotate tool owns LMB entirely (gizmo or no-op)
 
+            # --- Polygon select: click places anchor points ---
+            # Each LMB click records a screen-space anchor. When the user
+            # clicks within 15px of the first anchor (loop close) we finalize.
+            # Completely owns LMB while active — never falls through to orbit.
+            if self._tool == "poly_select":
+                ix, iy = int(x), int(y)
+                if len(self._poly_points) >= 3:
+                    # Check if clicking near the first point to close the loop
+                    fx, fy = self._poly_points[0]
+                    if math.hypot(ix - fx, iy - fy) < 15:
+                        self._finalize_poly_selection()
+                        return
+                self._poly_points.append((ix, iy))
+                self._poly_overlay.set_points(self._poly_points, (ix, iy))
+                self._poly_overlay.update()
+                return  # poly select owns LMB entirely
+
             # --- Tool mode: LMB activates the tool on the mesh only ---
             # Region fill fires on press (single click); brush starts its first
             # stroke here and continues on drag via mouseMoveEvent.
@@ -1501,6 +2235,11 @@ class ViewportWidget(QOpenGLWidget):
                         self.setCursor(Qt.CursorShape.BlankCursor)
                         self._orbit_skip_one = True
 
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
+        """Finalize the polygon selection on double-click (requires ≥ 3 anchors)."""
+        if self._tool == "poly_select" and len(self._poly_points) >= 3:
+            self._finalize_poly_selection()
+
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         x, y = int(event.position().x()), int(event.position().y())
 
@@ -1559,6 +2298,14 @@ class ViewportWidget(QOpenGLWidget):
                     self._gizmo_hover = new_hover
                     self.update()  # repaint to show/clear ring highlight
 
+        elif self._tool == "poly_select":
+            # Update the rubber-band line from the last anchor to the cursor.
+            # Fires on every move regardless of button state — live preview.
+            self._poly_cursor = (x, y)
+            if self._poly_points:
+                self._poly_overlay.set_points(self._poly_points, (x, y))
+                self._poly_overlay.update()
+
         elif self._tool == "brush" and self._lmb_held:
             # Tool active — brush stroke on drag; orbit is suspended.
             # Clicking or dragging over empty space does nothing (ray_cast
@@ -1600,6 +2347,10 @@ class ViewportWidget(QOpenGLWidget):
             _SCULPT_TOOLS = {"inflate", "deflate", "smooth", "flatten"}
             if self._tool in _SCULPT_TOOLS and self._painter is not None:
                 self._painter._rebuild_bvh()
+            # Poly select tool owns LMB — no cursor restoration logic needed.
+            if self._tool == "poly_select":
+                self._lmb_cursor_origin_global = None
+                return
             # Clear gizmo drag state — drag is complete, hover re-evaluates on next move
             if self._gizmo_axis is not None:
                 self._gizmo_axis = None
@@ -1684,6 +2435,12 @@ class ViewportWidget(QOpenGLWidget):
         # Track alt modifier
         if key == Qt.Key.Key_Alt:
             self._alt_held = True
+
+        # Escape cancels an in-progress polygon selection (clears anchor points)
+        if key == Qt.Key.Key_Escape:
+            if self._tool == "poly_select" and self._poly_points:
+                self._cancel_poly_selection()
+                return
 
         # Frame mesh on F
         if key == Qt.Key.Key_F and self._camera is not None and self._painter is not None:
@@ -1856,3 +2613,474 @@ class ViewportWidget(QOpenGLWidget):
                 self._needs_mesh_upload = True
 
         self.update()  # triggers paintGL → _refresh_dirty_texture / VBO re-upload
+
+    # ------------------------------------------------------------------ #
+    # Polygon selection helpers                                            #
+    # ------------------------------------------------------------------ #
+
+    def _cancel_poly_selection(self) -> None:
+        """
+        Cancel the in-progress polygon selection, discarding all anchor points.
+
+        Called when Escape is pressed while placing anchors, or when the tool
+        is switched away from poly_select.
+        """
+        self._poly_points.clear()
+        self._poly_overlay.set_points([], (0, 0))
+        self._poly_overlay.update()
+
+    def _finalize_poly_selection(self) -> None:
+        """
+        Close the polygon and determine exactly which mesh faces fall inside it.
+
+        Uses FBO-based face-ID rendering for pixel-accurate selection — the same
+        technique used by Blender, Maya, and other professional 3D tools:
+
+          1.  Render the mesh into a temporary offscreen FBO where every fragment
+              is colored with its triangle's unique 24-bit RGB-encoded face index.
+              Depth testing is active so only front-facing, unoccluded fragments
+              are written — back-faces and hidden geometry are automatically excluded.
+
+          2.  Rasterize the user's polygon into a 1-channel mask image using
+              QPainter.drawPolygon().
+
+          3.  Read back the FBO pixels and collect every unique face ID that
+              appears under a masked pixel.  Because the test is per-pixel rather
+              than per-centroid, partial-triangle coverage at the selection boundary
+              is captured correctly — no jagged triangle-boundary artifacts.
+
+        No-op if fewer than 3 anchor points are placed, or if no mesh / GL context
+        is available.
+        """
+        if len(self._poly_points) < 3 or self._painter is None or self._camera is None:
+            return
+        if self._ctx is None or self._faceid_prog is None:
+            return
+
+        w, h = self.width(), self.height()
+        if w == 0 or h == 0:
+            return
+
+        # Build Qt polygon from the screen-space anchor points collected during
+        # the click sequence.  Used both for the mask rasterization and the
+        # final containment test (belt-and-suspenders safety).
+        qpoly = QPolygon([QPoint(px, py) for px, py in self._poly_points])
+
+        # ------------------------------------------------------------------ #
+        # 1.  Build face-ID VBO                                               #
+        # ------------------------------------------------------------------ #
+        # Interleaved layout: [x, y, z, face_id] (float32) per vertex.
+        # Each face's 3 vertices all carry the same float face_index so the
+        # 'flat' GLSL qualifier propagates the provoking-vertex value to every
+        # fragment without interpolation artifacts.
+        faces_arr = np.asarray(self._painter._mesh.faces, dtype=np.int32)   # (M, 3)
+        verts_arr = np.asarray(self._painter._mesh.vertices, dtype=np.float32)  # (N, 3)
+        n_faces   = len(faces_arr)
+
+        tri_verts = verts_arr[faces_arr.reshape(-1)]                          # (M*3, 3)
+        face_ids  = np.repeat(np.arange(n_faces, dtype=np.float32), 3)       # (M*3,)
+        vbo_data  = np.hstack([tri_verts, face_ids[:, np.newaxis]])           # (M*3, 4)
+
+        # Compute full MVP: projection × view × model-rotation
+        aspect = w / h
+        view   = self._camera.get_view_matrix()
+        proj   = self._camera.get_projection_matrix(aspect)
+        model  = self._model_mat_4x4()
+        mvp    = (proj @ view @ model.astype(np.float64)).astype(np.float32)
+
+        # ------------------------------------------------------------------ #
+        # 2.  Render face IDs into offscreen FBO                              #
+        # ------------------------------------------------------------------ #
+        selected: set[int] = set()
+        self.makeCurrent()
+        fbo_tex   = None
+        fbo_depth = None
+        fbo       = None
+        faceid_vao = None
+        faceid_vbo = None
+        try:
+            # RGBA8 color attachment — background cleared to (0,0,0,0).
+            # Encoded face IDs start at 1 so background is unambiguously
+            # distinguishable from face index 0.
+            fbo_tex   = self._ctx.texture((w, h), 4)
+            fbo_depth = self._ctx.depth_renderbuffer((w, h))
+            fbo       = self._ctx.framebuffer(
+                color_attachments=[fbo_tex],
+                depth_attachment=fbo_depth,
+            )
+            fbo.use()
+            fbo.clear(0.0, 0.0, 0.0, 0.0)
+
+            # Depth test ON → occluded back-faces lose the depth race and are
+            # overwritten by the front-facing fragment.  No explicit back-face
+            # cull needed: correct depth values handle it automatically.
+            self._ctx.enable(moderngl.DEPTH_TEST)
+
+            faceid_vbo = self._ctx.buffer(vbo_data.tobytes())
+            faceid_vao = self._ctx.vertex_array(
+                self._faceid_prog,
+                [(faceid_vbo, "3f 1f", "in_position", "in_face_id")],
+            )
+            # OpenGL expects column-major (Fortran order) — .T before .tobytes()
+            # matches how the main shader receives the MVP uniform.
+            self._faceid_prog["MVP"].write(mvp.T.tobytes())
+            faceid_vao.render()
+
+            # ----------------------------------------------------------------#
+            # 3.  Read back pixels                                             #
+            # ----------------------------------------------------------------#
+            # dtype='f1' is the moderngl format code for normalized RGBA8 —
+            # reads GL_UNSIGNED_BYTE values (0-255) into raw bytes.
+            # dtype='u1' is for integer attachments and fails on normalized ones.
+            raw    = fbo.read(components=4, dtype="f1")   # flat RGBA uint8 bytes
+            pixels = np.frombuffer(raw, dtype=np.uint8).reshape(h, w, 4)
+            # OpenGL origin is bottom-left; Qt/screen origin is top-left.
+            pixels = np.flipud(pixels)
+
+            # ----------------------------------------------------------------#
+            # 4.  Rasterize polygon mask via PIL                               #
+            # ----------------------------------------------------------------#
+            # PIL ImageDraw.polygon is more reliable than QImage.bits() in
+            # PySide6 (where the bits() VoidPtr / buffer protocol varies by
+            # version). PIL is already a project dependency.
+            from PIL import Image as _PilImg, ImageDraw as _PilDraw  # noqa: PLC0415
+            mask_pil = _PilImg.new("L", (w, h), 0)
+            _PilDraw.Draw(mask_pil).polygon(
+                [(px, py) for px, py in self._poly_points], fill=255
+            )
+            mask = np.array(mask_pil, dtype=np.uint8) > 0   # bool (H, W)
+
+            # ----------------------------------------------------------------#
+            # 5.  Decode face IDs from pixels under the polygon mask          #
+            # ----------------------------------------------------------------#
+            # Keep only pixels that: (a) are inside the drawn polygon, and
+            # (b) were actually rendered (alpha > 0, i.e. not background).
+            in_poly = mask & (pixels[:, :, 3] > 0)   # (H, W) bool
+
+            # Diagnostic: log key counts to debug second-polygon selection failures
+            log.info(
+                "POLY_SEL_DIAG: mask_px=%d rendered_px=%d overlap_px=%d n_faces=%d",
+                int(np.sum(mask)),
+                int(np.sum(pixels[:, :, 3] > 0)),
+                int(np.sum(in_poly)),
+                n_faces,
+            )
+
+            # Decode all rendered pixels — needed for face selection and 3D anchors.
+            all_r   = pixels[:, :, 0].astype(np.int32)
+            all_g   = pixels[:, :, 1].astype(np.int32)
+            all_b   = pixels[:, :, 2].astype(np.int32)
+            all_ids = (all_r | (all_g << 8) | (all_b << 16)) - 1
+            if np.any(in_poly):
+                # ---- Pixel-based face selection ----
+                #
+                # Select faces by which ones have rendered pixels INSIDE the
+                # polygon mask. This is direct and robust: any face whose
+                # depth-tested FBO fragment lands inside the drawn polygon is
+                # included, regardless of where its vertices project. The
+                # vertex-projection approach ("any vertex inside") failed when
+                # all three corners of a face projected outside the drawn polygon
+                # even though the triangle interior crossed it — producing
+                # face_hit=0 for valid polygons on certain camera angles.
+                in_poly_ids = all_ids[in_poly]   # face IDs at masked pixels
+                in_poly_valid = in_poly_ids[
+                    (in_poly_ids >= 0) & (in_poly_ids < n_faces)
+                ]
+                unique_fids = np.unique(in_poly_valid)
+                selected: set[int] = set(int(f) for f in unique_fids)
+                log.info(
+                    "POLY_SEL_DIAG: in_poly_valid=%d unique_fids=%d selected=%d",
+                    len(in_poly_valid),
+                    len(unique_fids),
+                    len(selected),
+                )
+
+                # ---- Average face normal for back-face culling ----
+                #
+                # Compute the mean surface normal (world-space) of all selected
+                # faces. Committed layer rendering uses this each frame to skip
+                # drawing the highlight when the camera is on the back side —
+                # dot(avg_normal, camera_pos - centroid) < 0 means the layer is
+                # facing away from the viewer.
+                if selected:
+                    sel_face_norms = np.asarray(
+                        self._painter._mesh.face_normals, dtype=np.float32
+                    )[list(selected)]                        # (K, 3) local space
+                    avg_local = sel_face_norms.mean(axis=0)
+                    n_len = float(np.linalg.norm(avg_local))
+                    if n_len > 1e-8:
+                        avg_local /= n_len
+                    # Rotate to world space using the current model rotation
+                    avg_world = (self._model_rot.astype(np.float32) @ avg_local)
+                    self._pending_poly_avg_normal = avg_world
+                else:
+                    self._pending_poly_avg_normal = None
+
+                # ---- 3D anchor points for committed layer tracking ----
+                #
+                # Project each polygon anchor point onto the mesh surface using
+                # barycentric interpolation against the face-ID FBO render. The
+                # resulting world-space positions are stored and reprojected
+                # through the current camera each frame when the committed layer
+                # is drawn, keeping the highlight glued to the model surface
+                # from any orbit angle without drifting.
+                poly_pts_3d: list = []
+                for (px_a, py_a) in self._poly_points:
+                    ax = int(np.clip(px_a, 0, w - 1))
+                    ay = int(np.clip(py_a, 0, h - 1))
+                    fid = int(all_ids[ay, ax])
+                    if not (0 <= fid < n_faces):
+                        # Anchor missed mesh — search nearby for closest hit
+                        sr = 15
+                        _sy0, _sy1 = max(0, ay - sr), min(h, ay + sr)
+                        _sx0, _sx1 = max(0, ax - sr), min(w, ax + sr)
+                        _win = all_ids[_sy0:_sy1, _sx0:_sx1]
+                        _hits = _win[(_win >= 0) & (_win < n_faces)]
+                        fid = int(_hits[0]) if len(_hits) > 0 else -1
+                    if fid < 0:
+                        continue
+                    # Project the face's 3 vertices to screen space so we can
+                    # compute barycentric coordinates at the anchor position.
+                    fv  = verts_arr[faces_arr[fid]]                         # (3, 3)
+                    fv4 = np.hstack([fv, np.ones((3, 1), np.float32)])      # (3, 4)
+                    fp  = (mvp @ fv4.T).T                                   # (3, 4)
+                    fwc = np.where(np.abs(fp[:, 3]) < 1e-8, 1e-8, fp[:, 3])
+                    fsx = (fp[:, 0] / fwc + 1.0) * 0.5 * w
+                    fsy = (1.0 - (fp[:, 1] / fwc + 1.0) * 0.5) * h
+                    # Barycentric coordinates of the anchor inside the triangle
+                    s0  = np.array([fsx[0], fsy[0]])
+                    s1  = np.array([fsx[1], fsy[1]])
+                    s2  = np.array([fsx[2], fsy[2]])
+                    pt  = np.array([float(ax), float(ay)])
+                    v0, v1, v2 = s1 - s0, s2 - s0, pt - s0
+                    d00, d01, d11 = float(v0 @ v0), float(v0 @ v1), float(v1 @ v1)
+                    d20, d21      = float(v2 @ v0), float(v2 @ v1)
+                    denom = d00 * d11 - d01 * d01
+                    if abs(denom) < 1e-6:
+                        bu = bv = bw = 1.0 / 3.0
+                    else:
+                        bv = (d11 * d20 - d01 * d21) / denom
+                        bw = (d00 * d21 - d01 * d20) / denom
+                        bu = 1.0 - bv - bw
+                    bu, bv, bw = max(0.0, bu), max(0.0, bv), max(0.0, bw)
+                    s = bu + bv + bw
+                    if s > 1e-8:
+                        bu, bv, bw = bu / s, bv / s, bw / s
+                    p_world = bu * fv[0] + bv * fv[1] + bw * fv[2]
+                    poly_pts_3d.append(p_world.tolist())
+                self._pending_poly_pts_3d = (
+                    poly_pts_3d if len(poly_pts_3d) >= 3 else None
+                )
+
+                # ---- Screen-space mask texture (pixel-accurate display) ----
+                #
+                # Upload the polygon mask (built in step 4 for face containment
+                # testing) directly as a GPU texture. The SCREEN_OVERLAY_FRAG
+                # samples this per-pixel mask alongside the scene depth texture
+                # to composite a pixel-perfect selection highlight onto the
+                # scene — no UV atlas required, no triangle-edge artifacts.
+                #
+                # The mask is in PIL/Qt screen-space (origin top-left). The
+                # overlay shader flips v_uv.y when sampling it to match OpenGL's
+                # bottom-left convention; this is handled in the shader itself.
+                try:
+                    mask_data = np.array(mask_pil, dtype=np.uint8)
+                    # Release any previous pending mask before uploading new one
+                    if self._pending_screen_mask_tex is not None:
+                        try:
+                            self._pending_screen_mask_tex.release()
+                        except Exception:
+                            pass
+                        self._pending_screen_mask_tex = None
+                    pending_mask = self._ctx.texture((w, h), 1, mask_data.tobytes())
+                    pending_mask.filter = (moderngl.LINEAR, moderngl.LINEAR)
+                    self._pending_screen_mask_tex = pending_mask
+                    log.debug(
+                        "ViewportWidget: screen mask uploaded (%dx%d, %d selected faces)",
+                        w, h, len(selected),
+                    )
+                except Exception:
+                    log.exception("ViewportWidget: screen mask upload failed")
+                    self._pending_screen_mask_tex = None
+
+        except Exception:
+            log.exception("ViewportWidget: face-ID selection FBO render failed")
+        finally:
+            # Release all temporary GL resources regardless of success/failure
+            for res in (faceid_vao, faceid_vbo, fbo, fbo_tex, fbo_depth):
+                if res is not None:
+                    try:
+                        res.release()
+                    except Exception:
+                        pass
+            self.doneCurrent()
+
+        # ------------------------------------------------------------------ #
+        # 6.  Commit or discard result                                        #
+        # ------------------------------------------------------------------ #
+        # Clear anchor points and overlay regardless of whether any faces were
+        # selected — the polygon is consumed either way.
+        self._poly_points.clear()
+        self._poly_overlay.set_points([], (0, 0))
+        self._poly_overlay.update()
+
+        if not selected:
+            return
+
+        self._pending_faces = selected
+        self.update()
+        self.selection_ready.emit(len(selected))
+
+    def _build_face_vao(
+        self, face_indices: "set[int]"
+    ) -> "tuple[moderngl.VertexArray, moderngl.Buffer]":
+        """
+        Build a flat-position VAO from a set of face indices.
+
+        Extracts the 3D vertex positions for each selected face into a flat
+        (K*3, 3) array and uploads to a moderngl Buffer. Returns (vao, vbo)
+        bound to _hl_prog so the selection can be drawn with the highlight shader.
+
+        Must be called with the GL context current (inside paintGL or after
+        makeCurrent()).
+        """
+        faces_arr = np.asarray(self._painter._mesh.faces)          # (M, 3)
+        verts_arr = np.asarray(self._painter._mesh.vertices, dtype=np.float32)  # (N, 3)
+
+        sel       = np.array(sorted(face_indices), dtype=np.int64)
+        tri_verts = verts_arr[faces_arr[sel].reshape(-1)]           # (K*3, 3)
+
+        vbo = self._ctx.buffer(tri_verts.tobytes())
+        vao = self._ctx.vertex_array(
+            self._hl_prog, [(vbo, "3f", "in_position")]
+        )
+        return vao, vbo
+
+    def _release_pending_vao(self) -> None:
+        """Release the pending selection GPU resources (VAO, VBO, and screen mask)."""
+        for attr in ("_pending_vao", "_pending_vbo", "_pending_screen_mask_tex"):
+            resource = getattr(self, attr, None)
+            if resource is not None:
+                try:
+                    resource.release()
+                except Exception:
+                    pass
+            setattr(self, attr, None)
+
+    def _release_layer_vaos(self) -> None:
+        """Release any legacy GPU resources stored in layer dicts."""
+        for layer in self._layers.values():
+            # Release any legacy VAO/texture resources (face_vao, screen_mask_tex etc.)
+            # that may exist from prior code versions. Current layers only store
+            # poly_pts_3d (plain Python list) which needs no GPU release.
+            for key in ("face_vao", "face_vbo", "screen_mask_tex", "vao", "vbo", "uv_mask_tex"):
+                resource = layer.get(key)
+                if resource is not None:
+                    try:
+                        resource.release()
+                    except Exception:
+                        pass
+
+    # ------------------------------------------------------------------ #
+    # Public API — polygon selection layers                                #
+    # ------------------------------------------------------------------ #
+
+    def get_face_count(self) -> int:
+        """Return the total face count of the loaded mesh, or 0."""
+        if self._painter is None:
+            return 0
+        return len(self._painter._mesh.faces)
+
+    def save_pending_as_layer(
+        self, name: str, color: "tuple[float, float, float, float]"
+    ) -> int:
+        """
+        Promote the pending polygon selection to a named, persistent layer.
+
+        Builds a highlight VAO from the pending face set, assigns a unique
+        layer_id, and stores it in _layers so it renders each frame.
+        Clears the pending selection highlight.
+
+        Parameters
+        ----------
+        name  : Human-readable label for the layer row.
+        color : RGBA color (0.0–1.0 each) for the layer highlight overlay.
+
+        Returns the new layer_id, or -1 if there is no pending selection or
+        the GL context is unavailable.
+        """
+        if not self._pending_faces or self._ctx is None or self._painter is None:
+            return -1
+
+        layer_id = self._next_layer_id
+        self._next_layer_id += 1
+
+        # Transfer the 3D anchor points and face normal from the pending selection.
+        # poly_pts_3d → reprojected through current camera each frame
+        # avg_normal  → used to cull the layer when facing away from camera
+        poly_pts_3d = self._pending_poly_pts_3d
+        self._pending_poly_pts_3d = None
+        avg_normal = self._pending_poly_avg_normal
+        self._pending_poly_avg_normal = None
+
+        self._layers[layer_id] = {
+            "name":         name,
+            "faces":        set(self._pending_faces),  # kept for future painting ops
+            "visible":      True,
+            "color":        color,
+            "poly_pts_3d":  poly_pts_3d,   # 3D anchors → reproject each frame
+            "avg_normal":   avg_normal,    # world-space face normal for culling
+        }
+
+        # Discard the pending teal highlight now that it's been promoted
+        self._pending_faces = None
+        self._release_pending_vao()
+        self.update()
+
+        return layer_id
+
+    def set_active_layer(self, layer_id: int) -> None:
+        """
+        Mark a layer as the active selection (chosen in the layers panel).
+
+        The active layer renders with boosted alpha so it stands out visually
+        from other saved layers. Clears the previous active layer's boost.
+
+        Called by ViewportView when the layers panel emits layer_selected.
+        """
+        self._active_layer_id = layer_id
+        self.update()
+
+    def set_layer_visibility(self, layer_id: int, visible: bool) -> None:
+        """Toggle a saved layer's highlight overlay on or off."""
+        if layer_id in self._layers:
+            self._layers[layer_id]["visible"] = visible
+            self.update()
+
+    def delete_layer(self, layer_id: int) -> None:
+        """Remove a saved layer and release its GPU highlight resources."""
+        if layer_id not in self._layers:
+            return
+        layer = self._layers.pop(layer_id)
+        if self._ctx is not None:
+            self.makeCurrent()
+            for key in ("face_vao", "face_vbo", "screen_mask_tex", "vao", "vbo", "uv_mask_tex"):
+                resource = layer.get(key)
+                if resource is not None:
+                    try:
+                        resource.release()
+                    except Exception:
+                        pass
+            self.doneCurrent()
+        self.update()
+
+    def get_pending_face_count(self) -> int:
+        """Return the face count of the pending polygon selection, or 0."""
+        return len(self._pending_faces) if self._pending_faces else 0
+
+    def clear_pending_selection(self) -> None:
+        """Discard the pending polygon selection without saving it as a layer."""
+        self._pending_faces = None
+        self._pending_rebuild = False
+        self._release_pending_vao()
+        self.update()

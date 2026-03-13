@@ -291,6 +291,26 @@ class ViewportView(QWidget):
         self.tools.sculpt_radius_changed.connect(self.viewport.set_sculpt_radius)
         self.tools.sculpt_strength_changed.connect(self.viewport.set_sculpt_strength)
 
+        # Polygon selection → layers panel
+        self.viewport.selection_ready.connect(self.layers.set_pending_selection)
+        self.layers.save_layer_requested.connect(self._on_save_layer)
+        self.layers.layer_visibility_changed.connect(self.viewport.set_layer_visibility)
+        self.layers.layer_deleted.connect(self.viewport.delete_layer)
+        # Clicking a layer row selects it in the panel and highlights it on the model
+        self.layers.layer_selected.connect(self.viewport.set_active_layer)
+
+    def _on_save_layer(self, name: str, color: tuple) -> None:
+        """
+        Save the viewport's pending polygon selection as a named layer.
+
+        Called when the layers panel emits save_layer_requested. Delegates
+        to the viewport, which builds the highlight VAO and returns the new
+        layer_id. Then adds the row to the layers panel.
+        """
+        layer_id = self.viewport.save_pending_as_layer(name, color)
+        if layer_id >= 0:
+            self.layers.add_layer(layer_id, name, color)
+
     def set_mesh_ready(self, workspace: WorkspacePaths) -> None:
         """
         Load the pipeline output into the viewport.
@@ -321,6 +341,7 @@ class ViewportView(QWidget):
     def reset(self) -> None:
         """Clear the viewport and return to the placeholder state."""
         self.viewport.reset()
+        self.layers.reset()
 
 
 class ExportView(QWidget):

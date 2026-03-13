@@ -784,6 +784,14 @@ class ViewportToolsPanel(QWidget):
         self._region_btn.setFixedSize(40, 40)
         tool_row.addWidget(self._region_btn)
 
+        # Polygon select tool — click to place anchor points defining a custom boundary
+        self._poly_btn = QPushButton("⬡")
+        self._poly_btn.setObjectName("tool_button")
+        self._poly_btn.setCheckable(True)
+        self._poly_btn.setToolTip("Polygon Select — click to place anchor points")
+        self._poly_btn.setFixedSize(40, 40)
+        tool_row.addWidget(self._poly_btn)
+
         # Rotate tool — shows gizmo rings for X/Y/Z axis rotation
         self._rotate_btn = QPushButton("⟳")
         self._rotate_btn.setObjectName("tool_button")
@@ -885,6 +893,7 @@ class ViewportToolsPanel(QWidget):
         # tool is active.
         self._brush_btn.clicked.connect(self._on_brush_clicked)
         self._region_btn.clicked.connect(self._on_region_clicked)
+        self._poly_btn.clicked.connect(self._on_poly_clicked)
         self._rotate_btn.clicked.connect(self._on_rotate_clicked)
 
         # Wire sculpt button click handlers
@@ -1043,6 +1052,14 @@ class ViewportToolsPanel(QWidget):
         else:
             self.tool_changed.emit("")
 
+    def _on_poly_clicked(self) -> None:
+        """Toggle polygon select on/off; deactivate all other tools if active."""
+        if self._poly_btn.isChecked():
+            self._deactivate_all_except(self._poly_btn)
+            self.tool_changed.emit("poly_select")
+        else:
+            self.tool_changed.emit("")
+
     def _on_rotate_clicked(self) -> None:
         """Toggle rotate on/off; deactivate all other tools if active."""
         if self._rotate_btn.isChecked():
@@ -1086,7 +1103,7 @@ class ViewportToolsPanel(QWidget):
     def _deactivate_all_except(self, keep: QPushButton) -> None:
         """Uncheck all tool buttons except the given one."""
         for btn in (
-            self._brush_btn, self._region_btn, self._rotate_btn,
+            self._brush_btn, self._region_btn, self._poly_btn, self._rotate_btn,
             self._inflate_btn, self._deflate_btn,
             self._smooth_btn, self._flatten_btn,
         ):

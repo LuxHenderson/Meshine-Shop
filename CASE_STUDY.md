@@ -194,7 +194,41 @@ The quality difference is the same as the difference between a 70K-sample textur
 
 **Lesson:** Vertex-space interpolation for texture baking is fundamentally a different technique from texel-space sampling, and produces qualitatively inferior results no matter how fine the mesh is. If the goal is to preserve the full resolution of a high-quality source texture, you must sample per-texel, not per-vertex. The distinction matters most when the source texture has high-frequency detail that isn't correlated with mesh geometry — which is nearly always the case for photographic textures.
 
-*More challenges will be documented as development progresses through Phase 3.*
+### Challenge: Polygon selection overlay drifted when orbiting
+
+**Problem:** The first polygon selection implementation froze the overlay as a screen-space bitmap — it looked correct immediately after drawing, but as soon as the camera orbited, the highlight stayed fixed on screen while the mesh moved underneath it. The selection appeared to "float" in screen space rather than being attached to the geometry.
+
+**Solution:** A two-layer approach. The pending (unsaved) selection stays screen-space — it's intentionally temporary and the user hasn't committed it yet, so freezing it in place is acceptable and cheap. The committed (saved) layer gets 3D anchor points: at save time, each polygon vertex is projected onto the mesh surface via face-ID FBO lookup and barycentric interpolation, recording a world-space 3D position on the mesh surface. Each frame, those positions are reprojected through the current camera's MVP and PIL-rasterized into a fresh screen-space mask for compositing. The highlight follows the model surface from any orbit angle without drifting.
+
+**Lesson:** Screen-space overlays and 3D-space overlays have fundamentally different tracking behavior under camera movement. If the goal is to show a highlight "painted on" a 3D surface, the highlight data must live in 3D (or be efficiently derivable from 3D at each frame). A screen-space freeze is fine for transient UI feedback; it's wrong for anything meant to represent a persistent surface property.
+
+---
+
+### Challenge: Polygon selection highlight visible from behind the model
+
+**Problem:** After implementing 3D anchor reprojection, the committed layer overlay correctly tracked the model surface. But it was visible from any camera angle — including the back of the model. A selection made on the front of a figure's chest was visible as a floating colored shape when orbiting to view from behind, clipping through the mesh geometry.
+
+**First approach — depth texture occlusion:** Added a `poly_depth` uniform to the overlay shader and sampled the scene's depth buffer at each overlay pixel. In theory, if the scene depth at a pixel was shallower than the polygon's depth, the overlay should be discarded. In practice, this was fragile — the polygon centroid depth was a poor representative for a polygon spanning a curved surface, causing the overlay to partially disappear when zoomed close from the front and still bleed through from behind at distance.
+
+**Final solution — face normal back-face cull:** At save time, compute the mean face normal (in world space) of all selected faces. Each frame, evaluate `dot(avg_normal, camera_pos − polygon_centroid)`. If this is positive, the surface is pointing away from the camera — skip rendering that layer entirely. This is a clean, camera-distance-independent check that matches how real-time renderers determine back-face visibility. Zero per-pixel shader work required.
+
+**Lesson:** Depth buffer occlusion is powerful but fragile when used for non-geometry overlays that don't naturally participate in the depth pass. For the specific case of "is this polygon on the front or back of the model," a surface normal dot product is more semantically correct and orders of magnitude simpler.
+
+---
+
+### Challenge: Polygon face selection failed at certain camera angles
+
+**Problem:** The "any vertex inside polygon" approach to face selection — project every visible face's three vertices to screen space, check which ones fall inside the drawn polygon mask — worked correctly for the first several layers but failed intermittently with `selected=0` on later attempts. The diagnostic logs confirmed the FBO render was working (hundreds of valid face pixels inside the polygon), and the PIL mask overlapped the rendered pixels, but `face_hit` was all-False. The teal overlay showed the drawn shape correctly, but the Save button stayed greyed out.
+
+**Root cause:** The "any vertex inside" heuristic fails when all three corners of a face project *outside* the drawn polygon even though the triangle's interior covers the polygon area. This is geometrically common when: (a) the polygon is drawn smaller than the triangle's screen-space footprint, or (b) the mesh is viewed at an oblique angle where large triangles span wide screen areas. In those cases, the lasso correctly captures the face's pixels, but no vertex touches the polygon boundary → `face_hit=0` → empty selection.
+
+**Solution:** Changed from vertex-projection selection to pixel-based selection. The face-ID FBO already renders every visible face with its index encoded as a 24-bit RGB color, depth-tested so only front-facing fragments survive. Any face whose encoded pixels appear inside the drawn polygon mask is selected — directly, without any vertex projection step. This removes the corner-intersection requirement entirely: a face is selected if any of its rendered fragments lands inside the lasso, which is the most natural and correct definition of "this face is inside the selection."
+
+**Lesson:** The "any vertex inside" heuristic is a performance optimization for when ray-casting every pixel is too expensive. When a pixel-accurate ground truth (the face-ID FBO) is already available — as it is here — use it directly. The vertex projection step was both slower and less correct than just reading the pixels we'd already rendered.
+
+---
+
+*More challenges will be documented as development progresses.*
 
 ## Results and Impact
 
@@ -328,6 +362,20 @@ The quality difference is the same as the difference between a 70K-sample textur
 - **Failed first approach — global gamma lift:** Applying `value^(1/2.2)` to all pixels raised the overall brightness but turned dark leather into grey-white and blew out skin. The costume lost all character. The subject (Edward Scissorhands figure) has INTENTIONALLY dark leather — making it pale was wrong
 - **Solution — shadow lift:** A linear ramp applied only below a threshold: `lift = shadow_lift * max(0, threshold - value) / threshold`. With `shadow_lift=0.22` and `shadow_threshold=0.35`: near-black costume (0.08–0.15) gets a proportional lift to ~0.23–0.26, making texture grain and surface detail visible. Pixels at 0.35 and above — skin tones, highlights, metal surfaces — receive zero lift and are completely unchanged. The costume stays dark; the detail inside the darkness becomes readable
 - **Saturation boost (1.5×):** Dark desaturated colours (navy, dark brown) gain visible hue distinction after the lift amplifies colour differences that existed below perceptual threshold at near-black brightness
+
+### Phase 5 — 3D Viewport
+
+The viewport replaces the direct pipeline→export flow with an interactive inspection and editing layer between reconstruction and export.
+
+**Rendering pipeline:** The textured mesh is rendered in a PySide6 QOpenGLWidget via moderngl (OpenGL 4.1 core profile). An interleaved VBO stores position, normal, and UV per vertex. A single draw call renders the full mesh per frame with a diffuse + ambient GLSL shader that uses the baked albedo as the color source. Dirty-rect texture streaming (`glTexSubImage2D` on only the modified region) keeps paint operations responsive at 4096×4096 texture resolution.
+
+**Camera navigation:** Unreal Engine-style controls — RMB+WASD fly, Alt+LMB orbit around a focal point, scroll zoom, MMB pan. A `ViewportCamera` class owns all camera state and produces view/projection matrices independently of Qt. A 60Hz QTimer drives the fly loop when RMB is held and movement keys are active.
+
+**Sculpt brushes:** Four brushes (inflate, deflate, smooth, flatten) operate via BVH ray casting from the mouse position to find the hit point, then apply a radius-weighted displacement to nearby vertices. UV seam deduplication ensures edits propagate symmetrically across seam-split vertex pairs — without this, sculpting near UV seams would open visible cracks in the mesh.
+
+**Undo/redo:** A full command stack with an `ICommand` ABC (execute, undo, description). Sculpt operations snapshot the pre/post vertex position arrays; the stack replays or reverses them on Ctrl+Z / Ctrl+Shift+Z.
+
+**Polygon selection and layers:** The lasso tool uses FBO-based face-ID selection (the same technique as Blender and Maya). A temporary framebuffer renders the mesh with each triangle's index encoded as a 24-bit RGB color. A PIL polygon raster of the drawn lasso is intersected with the FBO pixels to collect selected face indices. Saved layers persist as 3D anchor points reprojected each frame through the current camera — the highlight tracks the model surface correctly from any orbit angle. Back-face culling via face normal dot product hides layers when viewing from the opposite side.
 
 ## What I'd Improve
 

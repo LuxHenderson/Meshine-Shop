@@ -420,6 +420,56 @@ QWidget#viewport_layers_panel {
     border-right: 1px solid #3a3a3a;
 }
 
+/* Save as Layer button */
+QPushButton#save_layer_btn {
+    background-color: #2a2a2a;
+    color: #e0e0e0;
+    border: 1px solid #3a3a3a;
+    border-radius: 4px;
+    padding: 6px 8px;
+    font-size: 12px;
+}
+QPushButton#save_layer_btn:hover  { background-color: #333333; border-color: #dc3545; }
+QPushButton#save_layer_btn:pressed { background-color: #1e1e1e; }
+QPushButton#save_layer_btn:disabled { color: #555555; border-color: #2a2a2a; }
+
+/* Layer eye visibility toggle button */
+QPushButton#layer_eye_btn {
+    background: transparent;
+    color: #888888;
+    border: none;
+    font-size: 12px;
+    padding: 0;
+}
+QPushButton#layer_eye_btn:hover { color: #e0e0e0; }
+
+/* Layer delete button */
+QPushButton#layer_delete_btn {
+    background: transparent;
+    color: #666666;
+    border: none;
+    font-size: 14px;
+    font-weight: bold;
+    padding: 0;
+}
+QPushButton#layer_delete_btn:hover { color: #dc3545; }
+
+/* Layer name label */
+QLabel#layer_name_label {
+    color: #d4d4d4;
+    font-size: 12px;
+}
+
+/* Layer name inline editor */
+QLineEdit#layer_name_edit {
+    background-color: #1e1e1e;
+    color: #e0e0e0;
+    border: 1px solid #dc3545;
+    border-radius: 2px;
+    padding: 1px 3px;
+    font-size: 12px;
+}
+
 /* ===== Viewport Tools Panel ===== */
 /* The 200px fixed-width right panel on the Viewport page. Slightly darker
    surface than the main canvas, with a left border to separate it from the

@@ -523,22 +523,38 @@ class MeshPainter:
         elif mode == "smooth":
             # Laplacian smooth: move each affected vertex toward the average
             # position of its immediate neighbors, weighted by falloff.
+            #
+            # The strength slider is calibrated for inflate/deflate (0.001–0.05
+            # world-unit displacement per call). For smooth, the effective
+            # per-call movement is `strength × weight × |avg − pos|`. Because
+            # |avg − pos| is near-zero on any mesh that isn't completely jagged,
+            # the raw strength value produces microscopic displacements that look
+            # like nothing is happening on drag. Scaling by ×20 maps the slider's
+            # midpoint (~0.025) to a 50% blend per call — immediately visible and
+            # still controllable from subtle (low end) to aggressive (high end).
+            blend = min(strength * 20.0, 1.0)
             for i, v_idx in enumerate(idxs):
                 nbrs = self._vertex_neighbors[v_idx]
                 if len(nbrs) == 0:
                     continue
                 avg = np.mean(new_verts[nbrs], axis=0)
-                # Blend toward avg — strength controls how far it moves per call
-                new_verts[v_idx] += (avg - new_verts[v_idx]) * weights[i] * strength
+                new_verts[v_idx] += (avg - new_verts[v_idx]) * weights[i] * blend
 
         elif mode == "flatten":
             # Project affected vertices toward their shared best-fit plane.
             # PCA on the affected vertex cloud: the eigenvector corresponding
             # to the smallest eigenvalue is the plane normal (least variance
             # direction = direction perpendicular to the flat plane).
+            #
+            # Same scaling issue as smooth: `dots` (distance from plane) is
+            # tiny on any near-flat surface, so raw strength × dots approaches
+            # zero and produces invisible drag results. Scale ×20 for the same
+            # reason — maps slider midpoint to a 50% projection per call.
             w_sum = weights.sum()
             if w_sum < 1e-9:
                 return
+
+            blend = min(strength * 20.0, 1.0)
 
             # Weighted centroid of affected vertices
             centroid = np.average(verts[idxs], axis=0, weights=weights)
@@ -554,10 +570,10 @@ class MeshPainter:
             # Signed distance of each affected vertex from the plane
             dots = diff @ plane_normal  # (K,) scalar signed distances
 
-            # Move each vertex toward the plane proportional to falloff × strength
+            # Move each vertex toward the plane proportional to falloff × blend
             new_verts[idxs] -= (
                 plane_normal[np.newaxis, :] *
-                (dots * weights * strength)[:, np.newaxis]
+                (dots * weights * blend)[:, np.newaxis]
             )
 
         # --- Seam reconciliation (prevents mesh splitting) ---
@@ -737,27 +753,22 @@ class MeshPainter:
 
     def get_snapshot_data(
         self, geometry: bool = True
-    ) -> tuple[
-        "np.ndarray | None",
-        "np.ndarray | None",
-        "np.ndarray | None",
-        "Image.Image",
-    ]:
+    ) -> tuple:
         """
         Return deep copies of the current editor state for a history snapshot.
 
-        Called by EditHistory.push_snapshot() before each destructive operation.
+        Called by EditHistory._make_snapshot() before each destructive operation.
 
         Parameters
         ----------
         geometry : bool
-            True  → copy vertices, faces, and normals (needed for sculpt/mesh ops)
-            False → skip geometry copies (paint-only operations don't change it)
+            True  → copy vertices, faces, normals, uvs + texture (sculpt / mesh ops)
+            False → skip all geometry/UV copies (paint-only operations don't change them)
 
         Returns
         -------
-        (vertices_copy, faces_copy, normals_copy, albedo_copy)
-        Geometry arrays are None when geometry=False.
+        (vertices_copy, faces_copy, normals_copy, uvs_copy, albedo_copy)
+        Geometry arrays (including uvs) are None when geometry=False.
         """
         if geometry:
             # Deep copy all geometry arrays so the snapshot is fully independent
@@ -767,20 +778,26 @@ class MeshPainter:
             # vertex_normals is a lazily-computed trimesh property — force
             # evaluation before copying so we capture the current normals.
             norms = np.array(self._mesh.vertex_normals, dtype=np.float32, copy=True)
+            # Snapshot UVs: topology-changing mesh ops (decimate, fill
+            # holes) update _uvs to match the new vertex layout. Without snapshotting
+            # them here, undo would restore the old geometry with the new UV array,
+            # causing texture coordinates to map to the wrong albedo regions.
+            uvs = self._uvs.copy() if self._uvs is not None else None
         else:
-            verts = faces = norms = None
+            verts = faces = norms = uvs = None
 
         # Always copy the PIL image — it is mutable and paint strokes modify it
         # in place, so a reference copy would be invalidated immediately.
         albedo = self._albedo_img.copy()
 
-        return verts, faces, norms, albedo
+        return verts, faces, norms, uvs, albedo
 
     def restore_snapshot(
         self,
         vertices: "np.ndarray | None",
         faces: "np.ndarray | None",
         normals: "np.ndarray | None",
+        uvs: "np.ndarray | None",
         albedo: "Image.Image",
     ) -> None:
         """
@@ -795,6 +812,9 @@ class MeshPainter:
         vertices, faces, normals : arrays or None
             When not None, the mesh geometry is replaced and the BVH + face
             adjacency are rebuilt from scratch to match the new topology.
+        uvs : array or None
+            UV coordinate array to restore alongside geometry. Must match the
+            vertex layout of the restored mesh. None for paint-only snapshots.
         albedo : PIL Image
             The texture buffer to restore. Always provided.
         """
@@ -807,28 +827,18 @@ class MeshPainter:
                 faces=faces,
                 process=False,
             )
-            # Re-extract UV coords from the new mesh. The reconstructed Trimesh
-            # has no TextureVisuals (we only snapshot positions+faces, not the
-            # visual), so _extract_uvs() will return None. In that case, keep
-            # the existing _uvs — sculpt never changes UV layout, so the stored
-            # array is still correctly aligned to the (unchanged) face topology.
-            new_uvs = self._extract_uvs()
-            if new_uvs is not None:
-                self._uvs = new_uvs
-            # else: retain self._uvs as-is (valid for sculpt-only restores)
 
-            # Rebuild BVH so ray_cast() works correctly on restored geometry
-            self._rebuild_bvh()
+            # Restore the UV array from the snapshot. The reconstructed Trimesh
+            # has no TextureVisuals so _extract_uvs() always returns None here.
+            # Using the snapshotted uvs guarantees the UV layout matches the
+            # restored topology exactly — critical after topology-changing ops.
+            if uvs is not None:
+                self._uvs = uvs.copy()
+            # If uvs is None (old snapshot without uv field), fall back to
+            # current _uvs (valid for sculpt-only restores where topology is same)
 
-            # Rebuild face adjacency for BFS region fill
-            self._face_adj = self._build_face_adjacency()
-
-            # Rebuild vertex neighbors for the Smooth sculpt brush
-            self._vertex_neighbors = self._build_vertex_neighbors()
-
-            # Rebuild seam partner groups (topology is identical for sculpt
-            # restores, but rebuild anyway to stay correct after mesh ops)
-            self._seam_partners = self._build_seam_partners()
+            # Rebuild all topology caches for the restored mesh
+            self._rebuild_topology()
 
         # Restore texture — replace the PIL buffer with the snapshot copy
         self._albedo_img = albedo.copy()
@@ -837,6 +847,22 @@ class MeshPainter:
         # Mark texture as fully dirty so the full texture is reuploaded to the
         # GPU (the caller reads get_dirty_rect() or calls get_texture_rgba()).
         self._dirty = (0, 0, self._tex_w, self._tex_h)
+
+    def _rebuild_topology(self) -> None:
+        """
+        Rebuild all topology-derived caches after any mesh change.
+
+        Called after restore_snapshot() and after every mesh operation that
+        modifies vertex positions, face count, or connectivity. Rebuilds:
+          - BVH (ray–triangle intersector)
+          - Face adjacency dict (for BFS region fill)
+          - Vertex neighbor lists (for Smooth sculpt brush)
+          - Seam partner groups (for seam-safe sculpt deformation)
+        """
+        self._rebuild_bvh()
+        self._face_adj = self._build_face_adjacency()
+        self._vertex_neighbors = self._build_vertex_neighbors()
+        self._seam_partners = self._build_seam_partners()
 
     def _rebuild_bvh(self) -> None:
         """
@@ -851,6 +877,223 @@ class MeshPainter:
             if trimesh.ray.has_embree
             else trimesh.ray.ray_triangle.RayMeshIntersector(self._mesh)
         )
+
+    # ------------------------------------------------------------------ #
+    # Mesh operations                                                      #
+    # ------------------------------------------------------------------ #
+
+    def mesh_smooth(self, iterations: int = 5) -> None:
+        """
+        Apply Taubin smoothing to the entire mesh.
+
+        Taubin smoothing alternates between a positive and a negative Laplacian
+        pass, which reduces noise without the shrinkage that plain Laplacian
+        smoothing causes. Vertex count and face topology are unchanged, so UV
+        coordinates remain valid and no UV transfer is needed.
+
+        Parameters
+        ----------
+        iterations : int
+            Number of Taubin iteration pairs (each pair = one shrink + one inflate).
+            Typical useful range: 1–20.
+        """
+        import trimesh.smoothing as _smooth
+
+        # filter_taubin modifies mesh.vertices in-place and invalidates trimesh cache.
+        # It processes every vertex independently without knowing about UV-seam
+        # duplicates, so it will move the two sides of each seam by slightly
+        # different amounts (different neighbour sets on each side), tearing the
+        # mesh open exactly like the sculpt brush did before the seam fix.
+        _smooth.filter_taubin(self._mesh, lamb=0.5, nu=-0.53, iterations=iterations)
+
+        # Seam reconciliation — same logic as the sculpt seam fix:
+        # For every UV-seam group, replace every member's position with the
+        # group average so both sides of the seam end up at the same point.
+        verts = np.asarray(self._mesh.vertices, dtype=np.float64)
+        seen_groups: set = set()
+        for i, partners in enumerate(self._seam_partners):
+            if not partners:
+                continue
+            group = [i] + partners
+            group_key = min(group)
+            if group_key in seen_groups:
+                continue
+            seen_groups.add(group_key)
+            # Average the post-smooth positions of all seam-duplicate vertices
+            avg_pos = np.mean([verts[g] for g in group], axis=0)
+            for g in group:
+                verts[g] = avg_pos
+
+        # Write back through the trimesh setter to invalidate cached normals/bounds
+        self._mesh.vertices = verts
+
+        log.info("MeshPainter: Taubin smooth (%d iterations)", iterations)
+
+        # Topology unchanged — only BVH needs rebuilding (vertex positions changed)
+        self._rebuild_bvh()
+        self._seam_partners = self._build_seam_partners()
+
+    def mesh_remove_floaters(self, min_faces: int = 100) -> None:
+        """
+        Remove disconnected mesh components smaller than a face-count threshold.
+
+        Photogrammetry often produces small disconnected fragments (floaters) that
+        are noise artefacts. This splits the mesh into connected components and
+        discards any whose face count is below min_faces, keeping the main body
+        of the object intact.
+
+        UV coordinates for the removed vertices are simply discarded; the remaining
+        vertices keep their original UV indices.
+
+        Parameters
+        ----------
+        min_faces : int
+            Any component with fewer triangles than this is removed.
+            If every component is below the threshold, only the largest is kept
+            to avoid accidentally deleting the entire mesh.
+        """
+        components = self._mesh.split(only_watertight=False)
+        if not components:
+            return
+
+        # Keep components at or above the threshold
+        keep = [c for c in components if len(c.faces) >= min_faces]
+
+        # Safety net: if the threshold would remove everything, keep the largest
+        if not keep:
+            keep = [max(components, key=lambda m: len(m.faces))]
+            log.warning(
+                "MeshPainter: remove_floaters min_faces=%d too high — "
+                "keeping largest component (%d faces)",
+                min_faces, len(keep[0].faces),
+            )
+
+        if len(keep) == len(components):
+            log.info("MeshPainter: remove_floaters — nothing to remove")
+            return
+
+        # Concatenate retained components into one mesh
+        new_mesh = trimesh.util.concatenate(keep) if len(keep) > 1 else keep[0]
+
+        # Transfer UVs: the new mesh is a subset of the original vertices.
+        # Use KD-tree nearest-vertex lookup to map new vertices back to their
+        # original UV coordinates (exact match for unmodified vertices).
+        self._uvs = self._transfer_uvs_by_position(
+            new_mesh,
+            source_verts=np.asarray(self._mesh.vertices, dtype=np.float64),
+        )
+        self._mesh = new_mesh
+
+        removed = sum(len(c.faces) for c in components) - len(new_mesh.faces)
+        log.info(
+            "MeshPainter: removed %d floater triangles, kept %d",
+            removed, len(new_mesh.faces),
+        )
+        self._rebuild_topology()
+
+    def mesh_fill_holes(self) -> None:
+        """
+        Fill open boundary loops in the mesh.
+
+        Photogrammetry meshes frequently have holes where the scanner had no
+        coverage (e.g. the underside of an object). trimesh.repair.fill_holes
+        identifies open boundary edges and adds triangles to close them.
+
+        New vertices introduced to fill holes are appended to the end of the
+        vertex array and are assigned UV (0, 0) — the filled patch won't have
+        correct texture, but the mesh becomes watertight for export.
+        """
+        n_verts_before = len(self._mesh.vertices)
+        trimesh.repair.fill_holes(self._mesh)
+        n_new = len(self._mesh.vertices) - n_verts_before
+
+        # Extend UV array with (0, 0) entries for new hole-fill vertices
+        if n_new > 0 and self._uvs is not None:
+            new_uvs = np.zeros((n_new, 2), dtype=np.float32)
+            self._uvs = np.vstack([self._uvs, new_uvs])
+            log.info("MeshPainter: fill_holes added %d vertices (UV set to 0,0)", n_new)
+        else:
+            log.info("MeshPainter: fill_holes — no new vertices added")
+
+        self._rebuild_topology()
+
+    def mesh_decimate(self, target_faces: int) -> None:
+        """
+        Reduce polygon count via quadric error decimation.
+
+        Uses trimesh's simplify_quadric_decimation which is a fast CPU-side
+        quadric error metric decimator. After decimation the vertex layout is
+        completely new, so UVs are transferred via KD-tree nearest-original-
+        vertex lookup — each new vertex inherits the UV of the closest original
+        vertex. This is accurate for moderate decimation where new vertices
+        remain geometrically close to their originals.
+
+        Parameters
+        ----------
+        target_faces : int
+            Desired triangle count in the output mesh. Clamped to at least 4
+            (minimum valid mesh) and at most the current face count.
+        """
+        current_faces = len(self._mesh.faces)
+        target_faces = max(4, min(target_faces, current_faces))
+
+        if target_faces >= current_faces:
+            log.info("MeshPainter: decimate skipped — target >= current (%d)", current_faces)
+            return
+
+        # Snapshot source positions for UV transfer before the mesh changes
+        source_verts = np.asarray(self._mesh.vertices, dtype=np.float64).copy()
+
+        decimated = self._mesh.simplify_quadric_decimation(target_faces)
+        log.info(
+            "MeshPainter: decimated %d → %d faces",
+            current_faces, len(decimated.faces),
+        )
+
+        # Transfer UVs from original vertex positions to decimated vertex positions
+        self._uvs = self._transfer_uvs_by_position(decimated, source_verts=source_verts)
+        self._mesh = decimated
+        self._rebuild_topology()
+
+    def _transfer_uvs_by_position(
+        self,
+        new_mesh: "trimesh.Trimesh",
+        source_verts: "np.ndarray",
+    ) -> "np.ndarray | None":
+        """
+        Build a UV array for new_mesh by mapping each vertex to the nearest
+        vertex in source_verts via KD-tree, then copying that vertex's UV.
+
+        Used after topology-changing operations (decimate, remove
+        floaters) where the new mesh shares approximate 3D positions with the
+        original but has a different vertex index layout.
+
+        Parameters
+        ----------
+        new_mesh : trimesh.Trimesh
+            The mesh whose vertices need UV coordinates.
+        source_verts : (N, 3) float64
+            Original vertex positions to build the KD-tree from.
+
+        Returns
+        -------
+        (M, 2) float32 UV array aligned to new_mesh.vertices, or None if the
+        source mesh has no UV data.
+        """
+        if self._uvs is None:
+            return None
+
+        from scipy.spatial import cKDTree
+
+        # Build KD-tree on original vertex positions for fast nearest-neighbour query
+        tree = cKDTree(source_verts)
+
+        new_verts = np.asarray(new_mesh.vertices, dtype=np.float64)
+        # k=1 → single nearest neighbour; returns (distances, indices)
+        _, idx = tree.query(new_verts, k=1, workers=-1)
+
+        # Map each new vertex to its nearest source vertex's UV
+        return self._uvs[idx].astype(np.float32)
 
     # ------------------------------------------------------------------ #
     # Persistence                                                          #
