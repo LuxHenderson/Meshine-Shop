@@ -736,6 +736,8 @@ class ViewportToolsPanel(QWidget):
     opacity_changed = Signal(float)
     # Emitted when the user clicks the "Reset Rotation" button
     reset_rotation_requested = Signal()
+    # Emitted when the user clicks "Normalize Scale"
+    normalize_scale_requested = Signal()
     # Emitted when Undo / Redo buttons are clicked
     undo_requested = Signal()
     redo_requested = Signal()
@@ -764,85 +766,68 @@ class ViewportToolsPanel(QWidget):
         tools_header.setObjectName("tools_section_header")
         layout.addWidget(tools_header)
 
-        tool_row = QHBoxLayout()
-        tool_row.setSpacing(6)
-
-        # Checkable tool buttons — manually exclusive so clicking an active
-        # button deactivates it (no tool selected). A QButtonGroup with
-        # exclusive=True would prevent un-checking the active button.
-        self._brush_btn = QPushButton("🖌")
-        self._brush_btn.setObjectName("tool_button")
-        self._brush_btn.setCheckable(True)
-        self._brush_btn.setToolTip("Brush — paint on the mesh surface")
-        self._brush_btn.setFixedSize(40, 40)
-        tool_row.addWidget(self._brush_btn)
-
-        self._region_btn = QPushButton("⬤")
-        self._region_btn.setObjectName("tool_button")
-        self._region_btn.setCheckable(True)
-        self._region_btn.setToolTip("Region Select — flood-fill a connected region")
-        self._region_btn.setFixedSize(40, 40)
-        tool_row.addWidget(self._region_btn)
+        # --- Tool row 1: Polygon Select | Flatten | Inflate ---
+        # Column layout: Poly/Rotate | Flatten/Smooth | Inflate/Deflate
+        tool_row1 = QHBoxLayout()
+        tool_row1.setSpacing(6)
 
         # Polygon select tool — click to place anchor points defining a custom boundary
         self._poly_btn = QPushButton("⬡")
         self._poly_btn.setObjectName("tool_button")
         self._poly_btn.setCheckable(True)
         self._poly_btn.setToolTip("Polygon Select — click to place anchor points")
-        self._poly_btn.setFixedSize(40, 40)
-        tool_row.addWidget(self._poly_btn)
+        self._poly_btn.setFixedSize(54, 54)
+        tool_row1.addWidget(self._poly_btn)
 
-        # Rotate tool — shows gizmo rings for X/Y/Z axis rotation
-        self._rotate_btn = QPushButton("⟳")
-        self._rotate_btn.setObjectName("tool_button")
-        self._rotate_btn.setCheckable(True)
-        self._rotate_btn.setToolTip("Rotate — drag the X/Y/Z rings to rotate the mesh")
-        self._rotate_btn.setFixedSize(40, 40)
-        tool_row.addWidget(self._rotate_btn)
-
-        tool_row.addStretch()
-        layout.addLayout(tool_row)
-
-        # ------------------------------------------------------------------ #
-        # Sculpt brush buttons — second tool row                              #
-        # ------------------------------------------------------------------ #
-        sculpt_row = QHBoxLayout()
-        sculpt_row.setSpacing(6)
-
-        # Inflate: push vertices outward along their normals
-        self._inflate_btn = QPushButton("▲")
-        self._inflate_btn.setObjectName("tool_button")
-        self._inflate_btn.setCheckable(True)
-        self._inflate_btn.setToolTip("Inflate — push surface outward along normals")
-        self._inflate_btn.setFixedSize(36, 36)
-        sculpt_row.addWidget(self._inflate_btn)
-
-        # Deflate: pull vertices inward along their normals
-        self._deflate_btn = QPushButton("▼")
-        self._deflate_btn.setObjectName("tool_button")
-        self._deflate_btn.setCheckable(True)
-        self._deflate_btn.setToolTip("Deflate — pull surface inward along normals")
-        self._deflate_btn.setFixedSize(36, 36)
-        sculpt_row.addWidget(self._deflate_btn)
-
-        # Smooth: Laplacian vertex averaging
-        self._smooth_btn = QPushButton("≋")
-        self._smooth_btn.setObjectName("tool_button")
-        self._smooth_btn.setCheckable(True)
-        self._smooth_btn.setToolTip("Smooth — average vertex positions (Laplacian)")
-        self._smooth_btn.setFixedSize(36, 36)
-        sculpt_row.addWidget(self._smooth_btn)
-
-        # Flatten: project vertices onto best-fit plane (PCA)
+        # Flatten: project vertices onto best-fit plane (PCA) — sits above Smooth
         self._flatten_btn = QPushButton("⊥")
         self._flatten_btn.setObjectName("tool_button")
         self._flatten_btn.setCheckable(True)
         self._flatten_btn.setToolTip("Flatten — level surface to best-fit plane")
-        self._flatten_btn.setFixedSize(36, 36)
-        sculpt_row.addWidget(self._flatten_btn)
+        self._flatten_btn.setFixedSize(54, 54)
+        tool_row1.addWidget(self._flatten_btn)
 
-        sculpt_row.addStretch()
-        layout.addLayout(sculpt_row)
+        # Inflate: push vertices outward along their normals — sits above Deflate
+        self._inflate_btn = QPushButton("▲")
+        self._inflate_btn.setObjectName("tool_button")
+        self._inflate_btn.setCheckable(True)
+        self._inflate_btn.setToolTip("Inflate — push surface outward along normals")
+        self._inflate_btn.setFixedSize(54, 54)
+        tool_row1.addWidget(self._inflate_btn)
+
+        tool_row1.addStretch()
+        layout.addLayout(tool_row1)
+
+        # --- Tool row 2: Rotate | Smooth | Deflate ---
+        tool_row2 = QHBoxLayout()
+        tool_row2.setSpacing(6)
+
+        # Rotate tool — sits below Polygon Select
+        self._rotate_btn = QPushButton("⟳")
+        self._rotate_btn.setObjectName("tool_button")
+        self._rotate_btn.setCheckable(True)
+        self._rotate_btn.setToolTip("Rotate — drag the X/Y/Z rings to rotate the mesh")
+        self._rotate_btn.setFixedSize(54, 54)
+        tool_row2.addWidget(self._rotate_btn)
+
+        # Smooth: Laplacian vertex averaging — sits below Flatten
+        self._smooth_btn = QPushButton("≋")
+        self._smooth_btn.setObjectName("tool_button")
+        self._smooth_btn.setCheckable(True)
+        self._smooth_btn.setToolTip("Smooth — average vertex positions (Laplacian)")
+        self._smooth_btn.setFixedSize(54, 54)
+        tool_row2.addWidget(self._smooth_btn)
+
+        # Deflate: pull vertices inward along their normals — sits below Inflate
+        self._deflate_btn = QPushButton("▼")
+        self._deflate_btn.setObjectName("tool_button")
+        self._deflate_btn.setCheckable(True)
+        self._deflate_btn.setToolTip("Deflate — pull surface inward along normals")
+        self._deflate_btn.setFixedSize(54, 54)
+        tool_row2.addWidget(self._deflate_btn)
+
+        tool_row2.addStretch()
+        layout.addLayout(tool_row2)
 
         # Sculpt strength slider
         str_row = QHBoxLayout()
@@ -890,9 +875,8 @@ class ViewportToolsPanel(QWidget):
 
         # Wire click handlers — each button manages mutual exclusivity and
         # emits tool_changed("") when toggled off so the viewport knows no
-        # tool is active.
-        self._brush_btn.clicked.connect(self._on_brush_clicked)
-        self._region_btn.clicked.connect(self._on_region_clicked)
+        # tool is active. Brush and region are wired below where their buttons
+        # are created (in the color section).
         self._poly_btn.clicked.connect(self._on_poly_clicked)
         self._rotate_btn.clicked.connect(self._on_rotate_clicked)
 
@@ -909,6 +893,44 @@ class ViewportToolsPanel(QWidget):
         div1.setFrameShape(QFrame.Shape.HLine)
         div1.setObjectName("tools_divider")
         layout.addWidget(div1)
+
+        # ------------------------------------------------------------------ #
+        # Brush / Region Select — live in the color section since they use   #
+        # the color, size, and opacity controls directly below.              #
+        # ------------------------------------------------------------------ #
+        brush_row = QHBoxLayout()
+        brush_row.setSpacing(6)
+
+        # Checkable tool buttons — manually exclusive (same logic as other tools).
+        self._brush_btn = QPushButton("🖌")
+        self._brush_btn.setObjectName("tool_button")
+        self._brush_btn.setCheckable(True)
+        self._brush_btn.setToolTip("Brush — paint on the mesh surface")
+        self._brush_btn.setFixedSize(54, 54)
+        brush_row.addWidget(self._brush_btn)
+
+        self._region_btn = QPushButton("⬤")
+        self._region_btn.setObjectName("tool_button")
+        self._region_btn.setCheckable(True)
+        self._region_btn.setToolTip("Region Select — flood-fill a connected region")
+        self._region_btn.setFixedSize(54, 54)
+        brush_row.addWidget(self._region_btn)
+
+        # Erase tool — restores original baked texture pixels within the brush radius
+        self._erase_btn = QPushButton("◌")
+        self._erase_btn.setObjectName("tool_button")
+        self._erase_btn.setCheckable(True)
+        self._erase_btn.setToolTip("Erase — restore original texture under the brush")
+        self._erase_btn.setFixedSize(54, 54)
+        brush_row.addWidget(self._erase_btn)
+
+        # Wire brush/region/erase click handlers here since buttons are defined here
+        self._brush_btn.clicked.connect(self._on_brush_clicked)
+        self._region_btn.clicked.connect(self._on_region_clicked)
+        self._erase_btn.clicked.connect(self._on_erase_clicked)
+
+        brush_row.addStretch()
+        layout.addLayout(brush_row)
 
         # ------------------------------------------------------------------ #
         # Color swatch                                                         #
@@ -1016,6 +1038,21 @@ class ViewportToolsPanel(QWidget):
         layout.addWidget(self._reset_rot_btn)
 
         # ------------------------------------------------------------------ #
+        # Normalize Scale button — rescales mesh so longest axis = 1.0 unit. #
+        # Ensures consistent scale across export targets (UE5, Blender,       #
+        # web viewers, AR/VR platforms) that do not handle scale on import.   #
+        # ------------------------------------------------------------------ #
+        self._normalize_btn = QPushButton("⤢  Normalize Scale")
+        self._normalize_btn.setObjectName("reset_rotation_btn")  # reuse QSS style
+        self._normalize_btn.setToolTip(
+            "Rescale mesh so its longest axis = 1.0 unit\n"
+            "Recommended before exporting to web, AR/VR, or any platform\n"
+            "that does not handle scale at import."
+        )
+        self._normalize_btn.clicked.connect(self.normalize_scale_requested.emit)
+        layout.addWidget(self._normalize_btn)
+
+        # ------------------------------------------------------------------ #
         # Divider above gear button                                            #
         # ------------------------------------------------------------------ #
         div2 = QFrame()
@@ -1100,10 +1137,19 @@ class ViewportToolsPanel(QWidget):
         else:
             self.tool_changed.emit("")
 
+    def _on_erase_clicked(self) -> None:
+        """Toggle erase on/off; deactivate all other tools if active."""
+        if self._erase_btn.isChecked():
+            self._deactivate_all_except(self._erase_btn)
+            self.tool_changed.emit("erase")
+        else:
+            self.tool_changed.emit("")
+
     def _deactivate_all_except(self, keep: QPushButton) -> None:
         """Uncheck all tool buttons except the given one."""
         for btn in (
-            self._brush_btn, self._region_btn, self._poly_btn, self._rotate_btn,
+            self._brush_btn, self._region_btn, self._erase_btn,
+            self._poly_btn, self._rotate_btn,
             self._inflate_btn, self._deflate_btn,
             self._smooth_btn, self._flatten_btn,
         ):

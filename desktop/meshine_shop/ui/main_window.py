@@ -281,6 +281,8 @@ class ViewportView(QWidget):
         self.tools.opacity_changed.connect(self.viewport.set_brush_opacity)
         # Reset Rotation button → snap mesh back to original orientation
         self.tools.reset_rotation_requested.connect(self.viewport.reset_model_rotation)
+        # Normalize Scale button → rescale mesh so longest axis = 1.0 unit
+        self.tools.normalize_scale_requested.connect(self.viewport.normalize_scale)
         # Undo/Redo buttons and Cmd+Z shortcuts
         self.tools.undo_requested.connect(self.viewport.undo)
         self.tools.redo_requested.connect(self.viewport.redo)
@@ -295,9 +297,33 @@ class ViewportView(QWidget):
         self.viewport.selection_ready.connect(self.layers.set_pending_selection)
         self.layers.save_layer_requested.connect(self._on_save_layer)
         self.layers.layer_visibility_changed.connect(self.viewport.set_layer_visibility)
+        self.layers.layer_color_changed.connect(self.viewport.set_layer_color)
         self.layers.layer_deleted.connect(self.viewport.delete_layer)
         # Clicking a layer row selects it in the panel and highlights it on the model
         self.layers.layer_selected.connect(self.viewport.set_active_layer)
+
+        # Texture projection — apply a texture image onto the selected layer's UV faces
+        self.layers.project_texture_requested.connect(self._on_project_texture)
+
+    def _on_project_texture(
+        self,
+        layer_id: int,
+        texture_path: str,
+        rotate: float,
+        scale: float,
+        offset_x: float,
+        offset_y: float,
+    ) -> None:
+        """
+        Forward a texture projection request from the layers panel to the viewport.
+
+        Called when the user clicks "Apply to Layer" in the texture projection
+        section. Delegates to ViewportWidget.project_texture_to_layer(), which
+        snapshots the albedo for undo then runs MeshPainter.project_texture().
+        """
+        self.viewport.project_texture_to_layer(
+            layer_id, texture_path, rotate, scale, offset_x, offset_y
+        )
 
     def _on_save_layer(self, name: str, color: tuple) -> None:
         """

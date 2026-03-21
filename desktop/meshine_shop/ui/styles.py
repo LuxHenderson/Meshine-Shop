@@ -420,6 +420,29 @@ QWidget#viewport_layers_panel {
     border-right: 1px solid #3a3a3a;
 }
 
+/* Polyhaven link button — flat muted text link style to keep visual weight low */
+QPushButton#polyhaven_btn {
+    background: transparent;
+    color: #4a88c7;
+    border: none;
+    padding: 0;
+    font-size: 10px;
+    text-decoration: underline;
+}
+QPushButton#polyhaven_btn:hover { color: #6ba8e0; }
+
+/* Compact slider label (Rotate, Scale, Off X, Off Y) in the texture section */
+QLabel#slider_label {
+    color: #999999;
+    font-size: 11px;
+}
+
+/* Numeric value readout next to each material control slider */
+QLabel#slider_value {
+    color: #d4d4d4;
+    font-size: 11px;
+}
+
 /* Save as Layer button */
 QPushButton#save_layer_btn {
     background-color: #2a2a2a;
@@ -433,15 +456,19 @@ QPushButton#save_layer_btn:hover  { background-color: #333333; border-color: #dc
 QPushButton#save_layer_btn:pressed { background-color: #1e1e1e; }
 QPushButton#save_layer_btn:disabled { color: #555555; border-color: #2a2a2a; }
 
-/* Layer eye visibility toggle button */
+/* Layer visibility toggle button — matches tool_button aesthetic at row scale */
 QPushButton#layer_eye_btn {
     background: transparent;
     color: #888888;
-    border: none;
-    font-size: 12px;
+    border: 1px solid #3a3a3a;
+    border-radius: 3px;
+    font-size: 11px;
     padding: 0;
 }
-QPushButton#layer_eye_btn:hover { color: #e0e0e0; }
+QPushButton#layer_eye_btn:hover {
+    background: #333333;
+    color: #e0e0e0;
+}
 
 /* Layer delete button */
 QPushButton#layer_delete_btn {

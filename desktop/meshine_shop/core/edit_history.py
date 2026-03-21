@@ -65,7 +65,12 @@ class _Snapshot:
     uvs:      np.ndarray | None   # (N, 2) float32 — UV coords matching vertex layout
 
     # Texture state — always included regardless of geometry_included.
-    albedo: Image.Image            # PIL Image copy
+    # albedo stores the base layer (brush strokes only, no projected layer textures).
+    # layer_textures / layer_visible capture per-layer texture projection state so
+    # undoing a texture projection correctly removes it from the composite display.
+    albedo: Image.Image            # PIL Image copy of _albedo_base
+    layer_textures: dict | None = None  # {layer_id: Image copy} or None if unchanged
+    layer_visible:  dict | None = None  # {layer_id: bool} or None if unchanged
 
 
 class EditHistory:
@@ -124,8 +129,8 @@ class EditHistory:
         mutable arrays. geometry=False skips vertex/face/normal/uv copies for
         paint-only operations where topology is guaranteed not to change.
         """
-        verts, faces, norms, uvs, albedo = painter.get_snapshot_data(
-            geometry=geometry
+        verts, faces, norms, uvs, albedo, layer_textures, layer_visible = (
+            painter.get_snapshot_data(geometry=geometry)
         )
         return _Snapshot(
             geometry_included=geometry,
@@ -134,6 +139,8 @@ class EditHistory:
             normals=norms,
             uvs=uvs,
             albedo=albedo,
+            layer_textures=layer_textures,
+            layer_visible=layer_visible,
         )
 
     # ------------------------------------------------------------------ #

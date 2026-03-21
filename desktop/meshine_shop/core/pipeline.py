@@ -97,9 +97,13 @@ STAGE_DISPLAY_NAMES = {
 #               cinematics, close-up stills, and game engine hero assets
 #               where frame-rate budget is generous.
 QUALITY_PRESETS = {
-    "Mobile (15K triangles)": 15_000,
-    "PC (65K triangles)": 65_000,
+    "Mobile (15K triangles)":    15_000,
+    "PC (65K triangles)":        65_000,
     "Cinematic (200K triangles)": 200_000,
+    # Ultra: maximum-fidelity preset — 400K triangles + 8K×8K UV atlas.
+    # Intended for hero assets, close-up cinematics, and portfolio renders.
+    # Requires a powerful CPU/GPU and takes significantly longer to process.
+    "Ultra (400K triangles)":   400_000,
 }
 
 # Export format options presented to the user in the Export view.

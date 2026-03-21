@@ -68,6 +68,8 @@ def create_best_engine(
     #   Cinematic (200K tri) → 4096×4096 — 4× more texels for fine skin/surface detail
     if "Mobile" in quality_preset:
         texture_size = 1024
+    elif "Ultra" in quality_preset:
+        texture_size = 8192   # 8K×8K — 4× more texels than Cinematic
     elif "Cinematic" in quality_preset:
         texture_size = 4096
     else:

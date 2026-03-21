@@ -20,8 +20,14 @@ all visual design centralized in one place (styles.py) and makes
 future theme changes trivial.
 """
 
+import logging
+import subprocess
+from pathlib import Path
+
 from PySide6.QtWidgets import QMainWindow, QHBoxLayout, QVBoxLayout, QWidget, QStatusBar, QFrame
 from PySide6.QtCore import Qt
+
+log = logging.getLogger(__name__)
 
 from meshine_shop.ui.sidebar import Sidebar
 from meshine_shop.ui.main_window import MainContent
@@ -280,6 +286,12 @@ class MeshineShopApp(QMainWindow):
         from PySide6.QtWidgets import QMessageBox
 
         try:
+            # If the viewport has active shader-projection layers, bake them
+            # onto albedo.png before exporting so projected textures are
+            # embedded in the mesh file rather than existing only as GPU state.
+            viewport = self.main_content.viewport_view.viewport
+            viewport.save_baked_albedo()
+
             # Pass the workspace so the exporter can locate baked textures
             # (workspace/textures/albedo.png etc.) and embed them in the export.
             # export_mesh returns the actual output path — for GLB this is
@@ -336,3 +348,43 @@ class MeshineShopApp(QMainWindow):
 
         # Update the status bar.
         self.statusBar().showMessage("Ready")
+
+    def closeEvent(self, event) -> None:
+        """
+        Move all pipeline job workspaces to the macOS Trash on app close.
+
+        Job workspaces accumulate at ~/MeshineShop/workspaces/ and each one
+        can be several hundred MB. Trashing them on exit keeps disk usage clean
+        between sessions.
+
+        NOTE: When the "Previous Jobs" feature is implemented this behaviour
+        must be replaced with a proper job persistence mechanism so that saved
+        jobs survive across sessions. See memory: project_previous_jobs_feature.
+        """
+        workspaces_dir = Path.home() / "MeshineShop" / "workspaces"
+        if workspaces_dir.exists():
+            job_dirs = sorted(workspaces_dir.glob("job_*"))
+            if job_dirs:
+                # Use AppleScript to move each job folder to the macOS Trash,
+                # matching the same mechanism the user sees in Finder.
+                for job_dir in job_dirs:
+                    try:
+                        subprocess.run(
+                            [
+                                "osascript", "-e",
+                                f'tell application "Finder" to move '
+                                f'(POSIX file "{job_dir}") to trash',
+                            ],
+                            check=False,
+                            capture_output=True,
+                        )
+                    except Exception:
+                        log.warning("closeEvent: could not trash %s", job_dir)
+                log.info("closeEvent: moved %d job workspace(s) to trash", len(job_dirs))
+
+        # Cancel any running worker before the window closes
+        if self._worker is not None:
+            self._worker.cancel()
+            self._worker.wait(3000)
+
+        super().closeEvent(event)

@@ -228,6 +228,68 @@ The quality difference is the same as the difference between a 70K-sample textur
 
 ---
 
+### Challenge: UV-atlas texture projection produced the wrong shape and wrong quality
+
+**Problem:** The first texture projection implementation baked painted textures into the UV atlas using a CPU rasterizer — computing world-space positions at every UV texel, projecting them into the source texture's image plane, and sampling. The shape of the projection came out completely wrong: a circular texture appeared as an irregular blob that didn't match the polygon the user had drawn. Separately, the baked export texture looked pixelated ("Doom quality") at 4K.
+
+**Why the shape was wrong:** UV-atlas baking projects through UV space, not screen space. The UV island for a set of faces is an arbitrary 2D unfolding of a curved 3D surface — there is no geometric relationship between the polygon the user drew in the viewport and the island's position in the UV atlas. Projecting the source texture into UV space produced a shape dictated by xatlas's arbitrary island layout, not by the user's polygon.
+
+**Why the quality was bad:** Even with the correct projection math, the CPU rasterizer was working per-UV-texel at 4096×4096 resolution. Each UV triangle covering only a handful of pixels. At those scales, nearest-pixel sampling without antialiasing produces blocky results, and the barycentric precision at such small triangles isn't sufficient for clean edges.
+
+**Solution:** Moved texture projection entirely out of the UV atlas and into an OpenGL GLSL second render pass. The projection now runs as a real-time shader at GPU framerate. Planar UV coordinates are computed in the fragment shader from world-space vertex positions using a projection frame (Right, Up, Normal vectors) passed as uniforms. The source texture is uploaded as a trilinear `LINEAR_MIPMAP_LINEAR` moderngl texture — the GPU handles all filtering and mip selection. Shape is now exactly what OpenGL renders, not what xatlas's UV layout dictates. Quality is GPU-native.
+
+**Lesson:** UV-atlas baking and real-time shader projection are fundamentally different approaches. UV-atlas baking is the right tool when you need persistent, resolution-independent texture data at export time. Shader projection is the right tool for interactive viewport preview — it operates in the same space where the user drew the selection. When the two approaches don't agree on the shape, shader projection wins because it's the ground truth the user sees.
+
+---
+
+### Challenge: Shader projection was invisible — layer disappeared after importing a texture
+
+**Problem:** After moving to GLSL shader projection, importing a texture caused the layer to disappear entirely from the viewport. The layer still appeared in the layers panel with its eye toggle, but toggling visibility had no effect — nothing was rendered. The base mesh was visible; the projection pass produced no output.
+
+**Root cause:** The projection pass re-draws the same faces as the base mesh pass at exactly the same depth. OpenGL's default depth function is `GL_LESS` — it discards any fragment whose depth equals the depth already in the buffer. Since the projection pass and the base pass cover the same geometry, every projection fragment has depth == buffer depth → fails `GL_LESS` → discarded. The GPU receives the draw call, runs the shaders, then throws away 100% of the output.
+
+**Solution:** Set `ctx.depth_func = "<="` (GL_LEQUAL) before the projection pass and restore `"<"` after. LEQUAL passes fragments with depth equal to the buffer, allowing the projection to composite on top of the already-drawn base geometry. This is a standard pattern in layered OpenGL rendering — any second pass over the same geometry requires LEQUAL or a depth bias.
+
+**Lesson:** OpenGL's depth test operates per-fragment, not per-draw-call. When two passes render the same geometry, the second pass needs either LEQUAL depth, a depth bias, or stencil routing to survive the depth test. The failure mode (100% invisible output) looks identical to a shader compile error, a VAO binding error, or a missing uniform — always check the depth function first when a second pass is mysteriously invisible.
+
+---
+
+### Challenge: Projected texture shape still wrong at face boundaries
+
+**Problem:** After the depth fix made the projection visible, the projected texture appeared on the mesh but its shape was limited to whole-face granularity. The user's polygon selection was sharp in the face-ID FBO, but the projected texture filled entire faces — including portions that extended outside the drawn polygon. At face resolution, a curved surface selection looked ragged and chunky rather than matching the exact drawn shape.
+
+**Solution:** Added a per-frame screen-space polygon mask. Each frame, the lasso polygon's 3D world-space anchor points are reprojected through the live MVP matrix to screen coordinates, and the resulting polygon is PIL-rasterized into a single-channel texture bound to unit 2 in the projection fragment shader. The shader samples this mask at `gl_FragCoord / viewport_size` (with Y-flip for OpenGL's bottom-left origin) and multiplies the projection alpha by the mask value. Fragments outside the drawn polygon receive zero alpha and are fully transparent — clipping the projection to the exact drawn polygon boundary at sub-pixel accuracy.
+
+**Why this works:** The face-ID FBO can only select at whole-face granularity — a face is either selected or not. But the screen-space mask operates at pixel granularity, clipping the GPU-rendered projection output to any arbitrary shape regardless of face size. The drawn polygon clips the projection; the face selection controls which geometry the projection is applied to. Both are necessary.
+
+**Lesson:** Face selection and shape masking are separate concerns that require separate mechanisms. Face selection determines what geometry participates; the polygon mask determines the visible shape within that geometry. Combining them into the face-selection step (as the vertex-projection approach implicitly did) conflates two geometrically different operations.
+
+---
+
+### Challenge: Export texture looked pixelated despite GPU projection looking correct
+
+**Problem:** After shader projection worked correctly at viewport quality, the user exported a GLB and viewed it in a glTF viewer. The projected texture on the exported model appeared "Doom quality" — heavily pixelated, with large blocky regions, far below the source texture quality. The viewport showed crisp projection; the exported file showed artifacts.
+
+**Root cause:** Export baking — the process of baking GPU shader state into the UV atlas PNG — must be done in CPU numpy, not in GL, because the export happens after the GL context may no longer be active and the atlas is a static file format. The initial export bake ran at 1× resolution (4096×4096 atlas) and rasterized UV triangles individually. Many UV triangles at that scale are only a few pixels large, so the bilinear sampling of the source texture hit low-frequency regions with large steps between samples — classic aliasing.
+
+**Solution:** Implemented 2× supersampling in `bake_projections_to_atlas()`. The CPU bake runs internally at `W0*2, H0*2` (8192×8192 for a Cinematic atlas), then LANCZOS-downsamples to the final atlas size. Supersampling means each output texel averages from 4 samples at full atlas resolution — eliminating the aliasing at UV triangle boundaries and producing smooth edges at export. Additionally, added the Ultra preset (400K triangles, 8K UV atlas) for maximum-fidelity hero assets, which reduces the UV triangle aliasing problem by giving each triangle more texels to work with.
+
+**Lesson:** GPU and CPU rendering produce equivalent mathematical results but at very different sample densities. The GPU renders at display resolution (thousands of pixels per projected region) with hardware bilinear filtering and mipmaps. The CPU bake works per UV texel with manual bilinear sampling — far fewer samples per projected region. When the two need to produce the same output, supersampling bridges the gap by increasing the effective CPU sample rate.
+
+---
+
+### Challenge: Layer overlay disappearing from camera distance
+
+**Problem:** After the viewport was working well, the layer overlays (committed polygon selections) were disappearing when the camera was far from the mesh. Close up, the overlay was always visible. From further back, it would intermittently vanish or partially disappear, seemingly at random with camera distance.
+
+**Root cause:** Both overlay shaders (the committed layer shader and the screen overlay shader) contained a fragment discard for background: `if (depth >= 0.9995) discard`. This was intended to prevent the overlay from drawing over background fragments (sky, empty viewport). With the OpenGL projection near=0.01, far=1000, mesh faces at approximately 20 units from the camera produce depth values near 0.9995 — exactly the discard threshold. As the camera backed up, more mesh pixels crossed the threshold and were discarded along with the intended background.
+
+**Solution:** Raised the discard threshold from `0.9995` to `0.9999`. At far=1000, a depth value of 0.9999 corresponds to geometry at approximately 100 units from the camera — well beyond any typical close-up or medium-distance orbit distance. The overlay now remains visible at all practical camera distances.
+
+**Lesson:** Depth buffer values are not linear in camera distance — they compress heavily toward 1.0 at the far plane due to the perspective divide. A threshold that looks "close to 1.0" (0.9995) can correspond to geometry at only 20 units of world distance with typical near/far plane settings. Always derive depth thresholds from the actual camera parameters rather than choosing a value that looks like "near 1.0."
+
+---
+
 *More challenges will be documented as development progresses.*
 
 ## Results and Impact
@@ -377,6 +439,8 @@ The viewport replaces the direct pipeline→export flow with an interactive insp
 
 **Polygon selection and layers:** The lasso tool uses FBO-based face-ID selection (the same technique as Blender and Maya). A temporary framebuffer renders the mesh with each triangle's index encoded as a 24-bit RGB color. A PIL polygon raster of the drawn lasso is intersected with the FBO pixels to collect selected face indices. Saved layers persist as 3D anchor points reprojected each frame through the current camera — the highlight tracks the model surface correctly from any orbit angle. Back-face culling via face normal dot product hides layers when viewing from the opposite side.
 
+**Shader-based texture projection:** Textures are projected onto the mesh surface via a GLSL second render pass. The projection frame (Right, Up, Normal vectors) is passed as shader uniforms; planar UV coordinates are computed in the fragment shader from world-space vertex positions. Source textures are uploaded as trilinear mipmap GPU textures for maximum sampling quality. A per-frame screen-space polygon mask — rasterized from the layer's 3D anchor points through the live MVP — clips the projection to the exact drawn polygon shape at sub-pixel accuracy. At export time, `bake_projections_to_atlas()` implements the same shader math in numpy with 2× supersampling + LANCZOS downsample, baking GPU projection state into the UV atlas PNG so the exported GLB/OBJ/FBX carries the user's painted result.
+
 ## What I'd Improve
 
 *This section will be updated as development reveals areas for iteration.*
@@ -390,6 +454,7 @@ The viewport replaces the direct pipeline→export flow with an interactive insp
 - **Systems architecture:** Choosing the right tools for each layer of a complex application — not defaulting to the most popular option, but the most effective one for the domain.
 - **Pipeline design:** Breaking a multi-stage computational workflow into discrete, observable, resumable steps — the same pattern used in data engineering, CI/CD, and game asset pipelines.
 - **Cross-language integration:** Bridging Python, Swift, and C++ (via COLMAP) across a single application using clean subprocess protocols and abstract interfaces — without resorting to fragile FFI or binding generators.
-- **Full-stack thinking:** From low-level GPU compute (COLMAP, Metal via Object Capture) to high-level UI/UX (Qt theming, drag-and-drop interaction) to developer experience (file watcher, Poetry, monorepo structure).
+- **GPU programming:** GLSL shader authoring, moderngl context management, multi-pass rendering, depth test configuration, screen-space masking, and the bridging of GPU render state to persistent CPU-side data for export.
+- **Full-stack thinking:** From low-level GPU compute (COLMAP, Metal via Object Capture, custom GLSL shaders) to high-level UI/UX (Qt theming, drag-and-drop interaction, viewport tools) to developer experience (file watcher, Poetry, monorepo structure).
 - **Scope management:** Phased delivery with standalone value at each milestone — not trying to build everything at once, but shipping incrementally while maintaining a coherent architecture.
 - **Technical writing:** Every module is documented with what it does and why it exists. The codebase is designed to be read, not just executed.

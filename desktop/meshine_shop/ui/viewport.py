@@ -455,9 +455,12 @@ void main() {
     // sampling the mask (mask was rasterized in PIL top-left-origin space).
     float mask  = texture(sel_mask, vec2(v_uv.x, 1.0 - v_uv.y)).r;
 
-    // Skip background pixels (depth at background gradient ~0.99995) and
-    // pixels outside the polygon mask.
-    if (depth >= 0.9995 || mask < 0.04) discard;
+    // Skip background pixels (depth buffer cleared to exactly 1.0 — the
+    // background gradient quad renders with depth test disabled so it never
+    // writes depth). With near=0.01 / far=1000, mesh pixels reach ~0.9999
+    // at ~100 units from camera, so 0.9999 safely keeps all mesh geometry
+    // while still discarding true background (depth = 1.0).
+    if (depth >= 0.9999 || mask < 0.04) discard;
 
     // Depth occlusion: if scene geometry at this pixel is closer to the camera
     // than the polygon (e.g. back-face mesh occluding a front-face layer),
@@ -491,9 +494,126 @@ void main() {
     float depth = texture(scene_depth, v_uv).r;
     // No Y flip — mask was rendered by OpenGL and shares its UV convention.
     float mask  = texture(sel_mask, v_uv).r;
-    if (depth >= 0.9995 || mask < 0.04) discard;
+    // Same threshold as the Y-flip variant — see comment above.
+    if (depth >= 0.9999 || mask < 0.04) discard;
     float a = overlay_color.a * mask;
     out_color = vec4(overlay_color.rgb, a);
+}
+"""
+
+# ---------------------------------------------------------------------------
+# Shader-based planar texture projection
+# ---------------------------------------------------------------------------
+#
+# These shaders implement view-independent planar texture projection directly
+# on the GPU. Rather than baking the projection into the UV atlas (which
+# creates jagged seam artifacts), we render only the selected faces in a
+# second pass using world-space position to compute planar UVs per fragment.
+#
+# Advantages over UV-atlas baking:
+#   - Shape exactly matches the face selection — no UV fragmentation
+#   - GPU bilinear + trilinear mipmap filtering — no aliasing grain
+#   - Sliders update as live uniforms — no rebaking per adjustment
+#   - Export bake is deferred to save time, done only once at export
+
+PROJ_VERT_SHADER = """
+#version 330 core
+
+in vec3 in_position;
+
+uniform mat4 MVP;
+
+// World-space position passed to fragment shader for planar UV computation.
+// Model matrix = identity (mesh lives in world space already) so in_position
+// is the world position without any further transform needed.
+out vec3 v_world_pos;
+
+void main() {
+    v_world_pos = in_position;
+    gl_Position = MVP * vec4(in_position, 1.0);
+}
+"""
+
+PROJ_FRAG_SHADER = """
+#version 330 core
+
+// Planar projection orthonormal frame (world space)
+uniform vec3  proj_right;     // R vector — horizontal axis of projection plane
+uniform vec3  proj_up;        // U vector — vertical axis (Y-down image convention)
+
+// Normalization bounds — map projected world coords to [0, 1] at scale=1.0
+uniform float proj_r_min;     // leftmost projected R coordinate (world units)
+uniform float proj_r_range;   // total width of projection extent (world units)
+uniform float proj_u_min;     // topmost projected U coordinate (world units)
+uniform float proj_u_range;   // total height of projection extent (world units)
+
+// Material transform — matches the layers panel slider values
+uniform float proj_scale;     // uniform scale (1.0 = texture fills selection)
+uniform float proj_cos;       // cos(rotate_deg) — pre-computed on CPU each frame
+uniform float proj_sin;       // sin(rotate_deg)
+uniform float proj_offset_x;  // horizontal shift in normalized [0,1] space
+uniform float proj_offset_y;  // vertical shift in normalized [0,1] space
+uniform float proj_opacity;   // overall blend opacity (0.0 – 1.0)
+
+// Projection source texture (bound to texture unit 1)
+uniform sampler2D proj_tex;
+
+// Screen-space polygon mask (bound to texture unit 2).
+// Rasterized each frame from the layer's poly_pts_3d so the projected
+// texture is clipped to the exact shape the user drew — not just the
+// rough union of selected face triangles.
+uniform sampler2D layer_mask;
+
+// Viewport dimensions — used to convert gl_FragCoord to [0,1] UV for mask lookup.
+// gl_FragCoord uses OpenGL bottom-left origin; PIL mask uses top-left, so Y is flipped.
+uniform float viewport_w;
+uniform float viewport_h;
+
+in  vec3 v_world_pos;
+out vec4 f_color;
+
+void main() {
+    // Step 1: Project world-space fragment position onto the (R, U) plane.
+    // dot(p, R) is the scalar projection along the right axis;
+    // dot(p, U) is the scalar projection along the up axis.
+    float r = dot(v_world_pos, proj_right);
+    float u = dot(v_world_pos, proj_up);
+
+    // Step 2: Normalize to [0, 1] within the selection bounding box.
+    // At scale=1.0 the texture fills the entire selection with no waste.
+    float pu = (r - proj_r_min) / proj_r_range;
+    float pv = (u - proj_u_min) / proj_u_range;
+
+    // Step 3: Apply material transform.
+    // Center the UV around (0.5, 0.5), apply scale, rotate, re-center.
+    // Matches the CPU math in mesh_painter.py setup_layer_projection().
+    float pu_c = pu - 0.5 - proj_offset_x;
+    float pv_c = pv - 0.5 - proj_offset_y;
+    pu_c /= proj_scale;
+    pv_c /= proj_scale;
+    float pu_r = pu_c * proj_cos - pv_c * proj_sin;
+    float pv_r = pu_c * proj_sin + pv_c * proj_cos;
+
+    // Wrap to [0, 1] for seamless tiling
+    float tex_u = fract(pu_r + 0.5);
+    float tex_v = fract(pv_r + 0.5);
+
+    // Step 4: Sample source texture. GPU handles bilinear + trilinear mipmap
+    // filtering automatically — no aliasing grain, no "Doom look".
+    vec4 tex_color = texture(proj_tex, vec2(tex_u, tex_v));
+
+    // Step 5: Clip to the exact drawn polygon via the screen-space mask.
+    // Y is flipped because gl_FragCoord is bottom-left but PIL mask is top-left.
+    vec2 screen_uv = vec2(gl_FragCoord.x / viewport_w, 1.0 - gl_FragCoord.y / viewport_h);
+    float mask = texture(layer_mask, screen_uv).r;
+
+    tex_color.a *= mask * proj_opacity;
+
+    // Discard fully transparent fragments so depth buffer is not dirtied
+    // and the albedo texture shows through around the projection edges.
+    if (tex_color.a < 0.004) discard;
+
+    f_color = tex_color;
 }
 """
 
@@ -675,6 +795,14 @@ class ViewportWidget(QOpenGLWidget):
 
         # Mesh rendering resources (released and rebuilt on each mesh load)
         self._prog: moderngl.Program | None = None
+
+        # Shader-based planar projection pass (second render pass per frame).
+        # Renders only the selected faces with GPU texture projection — no
+        # UV atlas baking, no PIL compositing. Shape = exact face selection.
+        self._proj_prog: "moderngl.Program | None" = None
+        # Per-layer GPU resources: {layer_id: {gpu_tex, ibo, vao, params, visible}}
+        self._proj_layers: dict[int, dict] = {}
+
         self._vao: moderngl.VertexArray | None = None
         self._vbo: moderngl.Buffer | None = None
         self._ibo: moderngl.Buffer | None = None
@@ -1065,10 +1193,30 @@ class ViewportWidget(QOpenGLWidget):
         if self._painter is None:
             return
 
-        # Restore painter state (geometry + texture or texture only)
+        # Restore painter state (geometry + texture or texture only).
+        # layer_textures / layer_visible are included in the snapshot so undoing
+        # a texture projection correctly removes it from the composite display.
         self._painter.restore_snapshot(
-            snap.vertices, snap.faces, snap.normals, snap.uvs, snap.albedo
+            snap.vertices, snap.faces, snap.normals, snap.uvs, snap.albedo,
+            layer_textures=getattr(snap, "layer_textures", None),
+            layer_visible=getattr(snap, "layer_visible", None),
         )
+
+        # Sync _proj_layers with painter state after undo/redo.
+        # If the restored snapshot predates a projection, painter._layer_projections
+        # will no longer contain that layer_id — release the stale GPU resources.
+        self.makeCurrent()
+        for lid in list(self._proj_layers.keys()):
+            if lid not in self._painter._layer_projections:
+                pdata = self._proj_layers.pop(lid, {})
+                for key in ("gpu_tex", "ibo", "vao"):
+                    res = pdata.get(key)
+                    if res is not None:
+                        try:
+                            res.release()
+                        except Exception:
+                            pass
+        self.doneCurrent()
 
         if snap.geometry_included:
             # Geometry changed — need a full VBO/VAO rebuild.
@@ -1090,6 +1238,52 @@ class ViewportWidget(QOpenGLWidget):
         """
         self._model_rot = np.eye(3, dtype=np.float32)
         self._gizmo_axis = None
+        self.update()
+
+    def normalize_scale(self) -> None:
+        """
+        Rescale the mesh so its longest bounding-box axis equals 1.0 unit.
+
+        This is a destructive geometry edit (vertices are modified in place)
+        and is undoable via the normal undo stack. It ensures that meshes
+        exported to platforms without import-time scale controls (web viewers,
+        AR/VR runtimes, etc.) arrive at a predictable neutral size.
+
+        The centroid stays at the same world position — only the scale changes.
+        """
+        if self._painter is None:
+            return
+
+        # Snapshot current state for undo before modifying geometry
+        self._history.push_snapshot(self._painter, geometry=True)
+        self.history_changed.emit(self._history.can_undo, self._history.can_redo)
+
+        # Compute the longest extent of the current bounding box
+        bbox_min, bbox_max = self._painter.get_bbox()
+        extents = bbox_max - bbox_min                         # (3,) per-axis lengths
+        longest = float(np.max(extents))
+        if longest < 1e-9:
+            log.warning("normalize_scale: degenerate mesh (zero extent) — skipped")
+            return
+
+        scale_factor = 1.0 / longest
+
+        # Scale vertices around their centroid so the mesh stays centered
+        centroid = (bbox_min + bbox_max) * 0.5
+        verts = np.asarray(self._painter._mesh.vertices, dtype=np.float64)
+        verts = (verts - centroid) * scale_factor + centroid
+        self._painter._mesh.vertices = verts
+
+        # Rebuild BVH so ray-cast / sculpt stay accurate after the scale change
+        self._painter._rebuild_bvh()
+
+        # Update centroid and grid floor to reflect the new bounding box
+        new_min, new_max = self._painter.get_bbox()
+        self._mesh_centroid = ((new_min + new_max) * 0.5).astype(np.float32)
+        self._grid_y = float(new_min[1])
+
+        # Flag GPU buffers for rebuild on next paintGL call
+        self._needs_upload = True
         self.update()
 
     def reset(self) -> None:
@@ -1204,6 +1398,13 @@ class ViewportWidget(QOpenGLWidget):
         self._screen_overlay_prog_noflip = self._ctx.program(
             vertex_shader=QUAD_VERT_SHADER,
             fragment_shader=SCREEN_OVERLAY_FRAG_SHADER_NOFLIP,
+        )
+
+        # Compile shader-based planar projection program.
+        # Second render pass draws only selected faces with world-space planar UVs.
+        self._proj_prog = self._ctx.program(
+            vertex_shader=PROJ_VERT_SHADER,
+            fragment_shader=PROJ_FRAG_SHADER,
         )
 
         # Fullscreen NDC quad (two CCW triangles covering [-1,1]²)
@@ -1345,6 +1546,85 @@ class ViewportWidget(QOpenGLWidget):
         self._albedo_tex.use(0)
         self._vao.render()
 
+        # --- 2b. Shader projection layers (second pass, selected faces only) ---
+        # Each active projection layer is rendered over the albedo using planar
+        # UV projection computed in world space. This gives a perfect shape
+        # (exactly the face selection) with full GPU bilinear/mipmap quality.
+        if (self._proj_layers and self._proj_prog is not None
+                and self._layer_mask_tex is not None):
+            from PIL import Image as _PilProj, ImageDraw as _PilDProj  # noqa: PLC0415
+            self._ctx.enable(moderngl.BLEND)
+            self._ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
+            # Switch to LEQUAL so the projection pass (which re-draws the same
+            # faces as the base mesh pass) passes the depth test. The default
+            # GL_LESS discards fragments at equal depth, making the layer invisible.
+            self._ctx.depth_func = "<="
+            w_vp = float(self.width())
+            h_vp = float(self.height())
+            self._proj_prog["MVP"].write(mvp.T.tobytes())
+            self._proj_prog["proj_tex"].value   = 1   # source texture on unit 1
+            self._proj_prog["layer_mask"].value = 2   # polygon mask on unit 2
+            self._proj_prog["viewport_w"].value = w_vp
+            self._proj_prog["viewport_h"].value = h_vp
+
+            for lid, pdata in self._proj_layers.items():
+                if not pdata.get("visible", True):
+                    continue
+
+                # --- Rasterize the polygon mask for this layer ---
+                # Reproject poly_pts_3d through the live MVP so the mask always
+                # matches the current camera angle, then PIL-fill into _layer_mask_tex.
+                # Back-face cull: if the polygon surface faces away from the camera,
+                # skip rendering this layer entirely.
+                layer       = self._layers.get(lid, {})
+                poly_pts_3d = layer.get("poly_pts_3d")
+                if poly_pts_3d and len(poly_pts_3d) >= 3:
+                    pts_w = np.array(poly_pts_3d, dtype=np.float32)
+                    avg_normal = layer.get("avg_normal")
+                    if avg_normal is not None:
+                        centroid_w  = np.mean(pts_w, axis=0)
+                        cam_to_surf = centroid_w - self._camera.position.astype(np.float32)
+                        if float(np.dot(avg_normal, cam_to_surf)) > 0.0:
+                            continue  # back-facing — skip
+                    pts4  = np.hstack([pts_w, np.ones((len(pts_w), 1), np.float32)])
+                    lproj = (mvp @ pts4.T).T
+                    lwc   = np.where(np.abs(lproj[:, 3]) < 1e-8, 1e-8, lproj[:, 3])
+                    l_sx  = ((lproj[:, 0] / lwc + 1.0) * 0.5 * w_vp).astype(int)
+                    l_sy  = ((1.0 - (lproj[:, 1] / lwc + 1.0) * 0.5) * h_vp).astype(int)
+                    lmask = _PilProj.new("L", (int(w_vp), int(h_vp)), 0)
+                    _PilDProj.Draw(lmask).polygon(
+                        [(int(l_sx[k]), int(l_sy[k])) for k in range(len(l_sx))],
+                        fill=255,
+                    )
+                    self._layer_mask_tex.write(np.array(lmask, dtype=np.uint8).tobytes())
+                else:
+                    # No polygon data — fill mask with white (no clipping)
+                    self._layer_mask_tex.write(
+                        bytes([255] * (int(w_vp) * int(h_vp)))
+                    )
+
+                pr  = pdata["params"]
+                p   = self._proj_prog
+                p["proj_right"].write(pr["right"].tobytes())
+                p["proj_up"].write(pr["up"].tobytes())
+                p["proj_r_min"].value    = pr["r_min"]
+                p["proj_r_range"].value  = pr["r_range"]
+                p["proj_u_min"].value    = pr["u_min"]
+                p["proj_u_range"].value  = pr["u_range"]
+                p["proj_scale"].value    = pr["scale"]
+                p["proj_cos"].value      = pr["cos"]
+                p["proj_sin"].value      = pr["sin"]
+                p["proj_offset_x"].value = pr["offset_x"]
+                p["proj_offset_y"].value = pr["offset_y"]
+                p["proj_opacity"].value  = pr["opacity"]
+                pdata["gpu_tex"].use(1)
+                self._layer_mask_tex.use(2)
+                pdata["vao"].render()
+
+            # Restore default depth function and clean up state
+            self._ctx.depth_func = "<"
+            self._ctx.disable(moderngl.BLEND)
+
         # --- 3. Ground grid (alpha-blended, depth-tested, drawn AFTER mesh) ---
         # Rendering the grid after the mesh lets the depth buffer handle both
         # viewing angles correctly automatically:
@@ -1426,8 +1706,12 @@ class ViewportWidget(QOpenGLWidget):
         # and there is at least one visible selection to show.
         _pending_has_overlay  = self._pending_screen_mask_tex is not None
         _layers_have_overlays = any(
-            layer.get("visible", True) and layer.get("poly_pts_3d") is not None
-            for layer in self._layers.values()
+            layer.get("visible", True)
+            and layer.get("poly_pts_3d") is not None
+            # Layers with an active shader projection skip the color highlight
+            # overlay — the projected texture IS the visual for these layers.
+            and lid not in self._proj_layers
+            for lid, layer in self._layers.items()
         )
         if has_overlay and (_pending_has_overlay or _layers_have_overlays):
             self._ctx.disable(moderngl.DEPTH_TEST)
@@ -1464,6 +1748,11 @@ class ViewportWidget(QOpenGLWidget):
                 from PIL import Image as _PilL, ImageDraw as _PilDL  # noqa: PLC0415
                 for lid, layer in self._layers.items():
                     if not layer.get("visible", True):
+                        continue
+                    # Skip the colored highlight overlay when a shader projection
+                    # exists for this layer — the projected texture IS the visual
+                    # and the opaque highlight would cover it completely.
+                    if lid in self._proj_layers:
                         continue
                     poly_pts_3d = layer.get("poly_pts_3d")
                     if not poly_pts_3d or len(poly_pts_3d) < 3:
@@ -1579,6 +1868,9 @@ class ViewportWidget(QOpenGLWidget):
                 self._ibo,
             )
 
+        # Rebuild projection VAOs to point at the new VBO
+        self._rebuild_proj_vaos()
+
     def _upload_texture_full(self) -> None:
         """Upload the full albedo texture to a moderngl Texture (GPU)."""
         if self._albedo_tex is not None:
@@ -1629,6 +1921,54 @@ class ViewportWidget(QOpenGLWidget):
                 [(self._vbo, "3f 12x 2f", "in_position", "in_uv")],
                 self._ibo,
             )
+
+        # Rebuild projection VAOs to point at the new VBO
+        self._rebuild_proj_vaos()
+
+    def _rebuild_proj_vaos(self) -> None:
+        """
+        Rebuild projection VAOs after a VBO change (sculpt op or new mesh load).
+
+        The interleaved VBO is recreated by _upload_mesh() and _upload_mesh_only()
+        whenever the mesh geometry changes. Any VAO that references the old VBO
+        is stale and must be rebuilt. Textures and IBOs are reused unchanged.
+        """
+        if self._proj_prog is None or self._vbo is None or not self._proj_layers:
+            return
+        face_arr = np.asarray(self._painter._mesh.faces, dtype=np.int32)
+        for lid, pdata in self._proj_layers.items():
+            # Release the stale VAO (it referenced the old VBO)
+            old_vao = pdata.get("vao")
+            if old_vao is not None:
+                try:
+                    old_vao.release()
+                except Exception:
+                    pass
+
+            # Rebuild IBO from current face array (face indices may have shifted
+            # after sculpt-induced mesh operations like remove-floaters).
+            params    = pdata.get("params", {})
+            face_set  = params.get("face_set")
+            if face_set is None:
+                continue
+            sel_idx      = np.array(sorted(face_set), dtype=np.int32)
+            sel_ibo_data = face_arr[sel_idx].flatten().astype(np.uint32)
+            old_ibo = pdata.get("ibo")
+            if old_ibo is not None:
+                try:
+                    old_ibo.release()
+                except Exception:
+                    pass
+            new_ibo = self._ctx.buffer(sel_ibo_data.tobytes())
+
+            # Rebuild VAO bound to the new VBO
+            new_vao = self._ctx.vertex_array(
+                self._proj_prog,
+                [(self._vbo, "3f 20x", "in_position")],
+                new_ibo,
+            )
+            pdata["ibo"] = new_ibo
+            pdata["vao"] = new_vao
 
     def _refresh_dirty_texture(self) -> None:
         """
@@ -2306,8 +2646,8 @@ class ViewportWidget(QOpenGLWidget):
                 self._poly_overlay.set_points(self._poly_points, (x, y))
                 self._poly_overlay.update()
 
-        elif self._tool == "brush" and self._lmb_held:
-            # Tool active — brush stroke on drag; orbit is suspended.
+        elif self._tool in ("brush", "erase") and self._lmb_held:
+            # Tool active — brush/erase stroke on drag; orbit is suspended.
             # Clicking or dragging over empty space does nothing (ray_cast
             # returns None inside _handle_paint).
             self._handle_paint(x, y)
@@ -2595,6 +2935,9 @@ class ViewportWidget(QOpenGLWidget):
             self._painter.paint_brush(
                 uv, self._paint_color, self._brush_size, self._brush_opacity
             )
+        elif self._tool == "erase":
+            # Restore original baked texture pixels under the brush
+            self._painter.erase_brush(uv, self._brush_size, self._brush_opacity)
         elif self._tool == "region":
             self._painter.fill_region(face_idx, self._paint_color)
         elif self._tool in _SCULPT_TOOLS:
@@ -3051,19 +3394,33 @@ class ViewportWidget(QOpenGLWidget):
         self._active_layer_id = layer_id
         self.update()
 
-    def set_layer_visibility(self, layer_id: int, visible: bool) -> None:
-        """Toggle a saved layer's highlight overlay on or off."""
+    def set_layer_color(self, layer_id: int, color: "tuple[float, float, float, float]") -> None:
+        """Update the RGBA highlight color of a saved layer in real-time."""
         if layer_id in self._layers:
-            self._layers[layer_id]["visible"] = visible
+            self._layers[layer_id]["color"] = color
             self.update()
 
+    def set_layer_visibility(self, layer_id: int, visible: bool) -> None:
+        """Toggle a saved layer's highlight overlay and projected texture on or off."""
+        if layer_id in self._layers:
+            self._layers[layer_id]["visible"] = visible
+        # Toggle shader projection layer visibility (no GPU teardown needed —
+        # the paintGL pass simply skips layers where visible=False).
+        if layer_id in self._proj_layers:
+            self._proj_layers[layer_id]["visible"] = visible
+        # Also sync painter visibility state for undo/redo consistency.
+        if self._painter is not None:
+            self._painter.set_layer_texture_visible(layer_id, visible)
+        self.update()
+
     def delete_layer(self, layer_id: int) -> None:
-        """Remove a saved layer and release its GPU highlight resources."""
+        """Remove a saved layer and release all associated GPU resources."""
         if layer_id not in self._layers:
             return
         layer = self._layers.pop(layer_id)
         if self._ctx is not None:
             self.makeCurrent()
+            # Release highlight/selection GPU resources
             for key in ("face_vao", "face_vbo", "screen_mask_tex", "vao", "vbo", "uv_mask_tex"):
                 resource = layer.get(key)
                 if resource is not None:
@@ -3071,8 +3428,178 @@ class ViewportWidget(QOpenGLWidget):
                         resource.release()
                     except Exception:
                         pass
+            # Release projection GPU resources (texture + IBO + VAO)
+            pdata = self._proj_layers.pop(layer_id, None)
+            if pdata is not None:
+                for key in ("gpu_tex", "ibo", "vao"):
+                    res = pdata.get(key)
+                    if res is not None:
+                        try:
+                            res.release()
+                        except Exception:
+                            pass
             self.doneCurrent()
+        if self._painter is not None:
+            self._painter.remove_layer_texture(layer_id)
         self.update()
+
+    def project_texture_to_layer(
+        self,
+        layer_id: int,
+        texture_path: str,
+        rotate: float,
+        scale: float,
+        offset_x: float,
+        offset_y: float,
+    ) -> None:
+        """
+        Set up a shader-based planar texture projection for a saved layer.
+
+        Replaces the old UV-atlas baking approach. Rather than rasterizing the
+        projection into the PIL albedo buffer (which produced jagged UV-seam
+        artifacts), this method:
+
+            1. Calls painter.setup_layer_projection() to compute the projection
+               frame (normal, right, up, normalization bounds) and store params.
+            2. Uploads the source texture to GPU as a trilinear-mipmap texture
+               on texture unit 1.
+            3. Builds a face-subset index buffer (IBO) containing only the
+               selected faces so the projection pass draws exactly those faces.
+            4. Builds a VAO binding in_position from the existing interleaved VBO.
+            5. Stores all GPU resources in _proj_layers[layer_id].
+
+        The projection is rendered in paintGL() as a second pass over the mesh
+        — shape is perfect (matches face selection in 3D), quality is GPU-filtered.
+
+        Parameters
+        ----------
+        layer_id     : Layer whose face set defines the projection area.
+        texture_path : Absolute path to the source texture (PNG, JPG …).
+        rotate       : Counter-clockwise rotation in degrees.
+        scale        : Uniform scale (1.0 = fill selection exactly).
+        offset_x     : Horizontal shift (-1.0 to 1.0).
+        offset_y     : Vertical shift (-1.0 to 1.0).
+        """
+        import math as _math
+        if self._painter is None or layer_id not in self._layers:
+            log.warning(
+                "project_texture_to_layer: layer %d not found or no painter", layer_id
+            )
+            return
+        if self._ctx is None or self._proj_prog is None or self._vbo is None:
+            log.warning("project_texture_to_layer: GL context not ready")
+            return
+
+        # Load source texture from disk
+        try:
+            from PIL import Image as _Image
+            texture_img = _Image.open(texture_path)
+        except Exception as e:
+            log.warning("project_texture_to_layer: could not load %s: %s", texture_path, e)
+            return
+
+        # Snapshot BEFORE applying projection so it is undoable.
+        # geometry=False — only the projection layer state changes, not vertices.
+        self._history.push_snapshot(self._painter, geometry=False)
+        self.history_changed.emit(self._history.can_undo, self._history.can_redo)
+
+        face_set = self._layers[layer_id]["faces"]
+
+        # Compute projection frame and store in painter._layer_projections.
+        params = self._painter.setup_layer_projection(
+            layer_id,
+            face_set,
+            texture_img,
+            rotate_deg=rotate,
+            scale=scale,
+            offset_x=offset_x,
+            offset_y=offset_y,
+        )
+        if params is None:
+            log.warning("project_texture_to_layer: setup_layer_projection returned None")
+            return
+
+        # ------------------------------------------------------------------
+        # Build GPU resources for this projection layer.
+        # Make GL context current (required for moderngl buffer/texture ops).
+        # ------------------------------------------------------------------
+        self.makeCurrent()
+
+        # Upload source texture to GPU with trilinear mipmap filtering.
+        # LINEAR_MIPMAP_LINEAR (trilinear) is the highest quality filter mode —
+        # eliminates the aliasing grain that plagues nearest-neighbor and even
+        # plain bilinear sampling at minification scales.
+        tex_rgba = texture_img.convert("RGBA")
+        tw, th   = tex_rgba.size
+        gpu_tex  = self._ctx.texture((tw, th), 4, data=tex_rgba.tobytes())
+        gpu_tex.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
+        gpu_tex.build_mipmaps()
+
+        # Build face-subset index buffer: only the selected faces are rendered
+        # in the projection pass so pixels outside the selection are untouched.
+        face_arr        = np.asarray(self._painter._mesh.faces, dtype=np.int32)
+        sel_face_idx    = np.array(sorted(face_set), dtype=np.int32)
+        sel_ibo_data    = face_arr[sel_face_idx].flatten().astype(np.uint32)
+        proj_ibo        = self._ctx.buffer(sel_ibo_data.tobytes())
+
+        # Build VAO: bind only in_position (first 3 floats of interleaved VBO).
+        # The interleaved VBO layout is [pos(3f), normal(3f), uv(2f)] = 32 bytes.
+        # "3f 20x" = 3 floats then skip 20 bytes (normal 12b + uv 8b).
+        proj_vao = self._ctx.vertex_array(
+            self._proj_prog,
+            [(self._vbo, "3f 20x", "in_position")],
+            proj_ibo,
+        )
+
+        # Release old GPU resources for this layer if re-projecting
+        old = self._proj_layers.get(layer_id)
+        if old is not None:
+            for key in ("gpu_tex", "ibo", "vao"):
+                res = old.get(key)
+                if res is not None:
+                    try:
+                        res.release()
+                    except Exception:
+                        pass
+
+        self._proj_layers[layer_id] = {
+            "gpu_tex": gpu_tex,
+            "ibo":     proj_ibo,
+            "vao":     proj_vao,
+            "params":  params,
+            "visible": True,
+        }
+        self.doneCurrent()
+
+        # Repaint — projection pass runs next frame
+        self.update()
+
+    def save_baked_albedo(self) -> bool:
+        """
+        Bake all visible shader projection layers onto the UV atlas and write
+        the result to albedo.png on disk.
+
+        Called by the app layer just before export_mesh() so that projected
+        textures are embedded in the exported file rather than existing only
+        as GPU-side runtime state.
+
+        Returns True if the bake was performed and saved, False if there was
+        nothing to bake (no painter, no projection layers) — in which case
+        the existing albedo.png is used unchanged.
+        """
+        if self._painter is None:
+            return False
+        if not self._proj_layers and not self._painter._layer_projections:
+            return False
+
+        log.info("ViewportWidget: baking %d projection layer(s) for export",
+                 len(self._painter._layer_projections))
+        baked = self._painter.bake_projections_to_atlas()
+        self._painter._albedo_path.parent.mkdir(parents=True, exist_ok=True)
+        baked.save(str(self._painter._albedo_path), format="PNG")
+        log.info("ViewportWidget: baked albedo saved to %s",
+                 self._painter._albedo_path)
+        return True
 
     def get_pending_face_count(self) -> int:
         """Return the face count of the pending polygon selection, or 0."""

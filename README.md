@@ -14,7 +14,7 @@ Meshine Shop solves this by unifying the entire pipeline — from photo import (
 |---|---|---|
 | Language | Python 3.11 | Direct access to the ML/CV/3D ecosystem without bridging |
 | Desktop Framework | PySide6 (Qt) | Industry-standard for professional 3D tools (Blender, Maya, Substance use Qt). Native OpenGL support for the 3D viewport |
-| Photogrammetry (macOS) | Apple Object Capture (RealityKit) | Metal-accelerated, ~50K vertices at full detail with PBR textures. Accessed via Swift CLI subprocess |
+| Photogrammetry (macOS) | Apple Object Capture (RealityKit) | Metal-accelerated, ~250K vertices at full detail with PBR textures. Accessed via Swift CLI subprocess |
 | Photogrammetry (Windows) | COLMAP (via pycolmap) | CUDA-accelerated dense reconstruction. Cross-platform fallback on all systems |
 | Swift CLI Bridge | Swift Package Manager | Wraps Apple's PhotogrammetrySession API — a Swift-only API that cannot be accessed via PyObjC |
 | USD Processing | usd-core (Pixar USD) | Reads Object Capture's USDZ output (geometry + PBR textures) for format conversion |
@@ -39,7 +39,7 @@ The application uses an **engine-agnostic design** — a `ReconstructionEngine` 
 
 | Platform | Engine | Acceleration | Output Quality |
 |---|---|---|---|
-| macOS + Apple Silicon | Apple Object Capture | Metal GPU + Neural Engine | ~50K vertices, PBR textures |
+| macOS + Apple Silicon | Apple Object Capture | Metal GPU + Neural Engine | ~250K vertices, PBR textures |
 | Windows + NVIDIA GPU | COLMAP | CUDA | Dense reconstruction, high quality |
 | Any (fallback) | COLMAP | CPU | Sparse reconstruction, lower quality |
 
@@ -59,17 +59,16 @@ Meshine Shop/
 │   │   │   ├── pipeline.py     # Stage definitions and constants
 │   │   │   ├── workspace.py    # Workspace directory management
 │   │   │   ├── exporter.py     # Mesh format conversion + texture embedding
-│   │   │   └── texture_baker.py # PBR texture baking (albedo, normal, AO)
-│   │   ├── core/               # Pipeline logic, engine implementations
+│   │   │   ├── texture_baker.py # PBR texture baking (albedo, normal, AO)
 │   │   │   ├── edit_history.py # Undo/redo command stack (UndoStack + ICommand ABC)
-│   │   │   ├── mesh_painter.py # BVH, sculpt brushes, paint buffer, seam-safe deformation
+│   │   │   ├── mesh_painter.py # BVH, sculpt brushes, paint buffer, projection bake
 │   │   │   └── viewport_camera.py # Camera math (view/projection matrices, UE-style navigation)
 │   │   └── ui/                 # Qt widgets, views, styling
 │   │       ├── main_window.py  # Import, Process, Viewport, Export views
 │   │       ├── drop_zone.py    # Drag-and-drop + folder import
 │   │       ├── processing_queue.py # Live pipeline stage display
 │   │       ├── sidebar.py      # Navigation sidebar
-│   │       ├── viewport.py     # QOpenGLWidget — moderngl render loop, FBO selection, overlays
+│   │       ├── viewport.py     # QOpenGLWidget — moderngl render loop, projection shaders, overlays
 │   │       ├── viewport_tools.py # Tool panel (brush, sculpt, polygon select, settings)
 │   │       ├── viewport_layers.py # Layers panel (saved selections, visibility, rename, delete)
 │   │       └── styles.py       # Centralized QSS dark theme
@@ -93,10 +92,10 @@ Meshine Shop/
 
 **Centralized QSS theming:** All visual styling lives in a single `styles.py` file rather than being scattered across widgets. This makes theme changes trivial and keeps UI code focused on layout and behavior.
 
-## Current Features (Phase 1 + Phase 2a–2l Complete)
+## Current Features (Phase 1 + Phase 2 Complete, Phase 5 Viewport In Progress)
 
 ### Reconstruction Engines
-- **Apple Object Capture** (macOS): Metal-accelerated reconstruction producing ~250K vertices at `full` detail with PBR textures (diffuse, normal, roughness, AO, metallic) via RealityKit's PhotogrammetrySession API. Quality preset controls detail level: Mobile → `reduced`, PC/Cinematic → `full`
+- **Apple Object Capture** (macOS): Metal-accelerated reconstruction producing ~250K vertices at `full` detail with PBR textures (diffuse, normal, roughness, AO, metallic) via RealityKit's PhotogrammetrySession API. Quality preset controls detail level: Mobile → `reduced`, PC/Cinematic/Ultra → `full`
 - **COLMAP** (cross-platform): Full SfM/MVS pipeline with CUDA acceleration on Windows; CPU fallback on all systems
 - Engine factory auto-detects the best engine at startup — no user configuration needed
 
@@ -105,7 +104,7 @@ Meshine Shop/
 - Browse Folder button for native directory picker as an alternative to drag-and-drop
 - Recursive folder scanning — automatically finds all supported images in nested directories
 - Clear button to reset file selection before processing
-- Quality preset selector (Mobile / PC / Cinematic) to choose target polygon budget before processing
+- Quality preset selector (Mobile / PC / Cinematic / Ultra) to choose target polygon budget before processing
 - Supported formats: JPEG, PNG, TIFF, HEIC (automatic HEIC-to-JPEG conversion for iPhone photos)
 
 ### Processing
@@ -114,31 +113,32 @@ Meshine Shop/
 - Live processing queue with per-stage status indicators (pending / running / done / error)
 - Real-time progress messages in the queue and status bar
 - USDZ-to-PLY format conversion via Pixar USD library (for Object Capture output)
-- **Mesh decimation** (Phase 2a): Open3D quadric error metrics (QEM) decimation to quality preset triangle targets — MIT licensed, production-safe
-- **UV unwrapping** (Phase 2b): xatlas automatic UV atlas generation — non-overlapping islands packed into [0,1]² space; output is OBJ with embedded UV coordinates
-- **Texture baking** (Phase 2c): five PBR maps baked onto the UV-mapped mesh — albedo, normal, AO, roughness, metallic. Saved to workspace/textures/
-- **PBR material estimation** (Phase 2d): roughness and metallic maps derived from image-space HSV analysis of the baked albedo (COLMAP path). Roughness: `specularity = V × (1 − S)`, blended with AO crevice factor. Metallic: soft threshold on desaturated high-value pixels
-- **Mesh geometry improvements** (Phase 2f): isolated floating mesh fragments removed before decimation (connected component analysis); Laplacian smoothing pre-decimation reduces reconstruction noise; polygon budgets raised to Mobile (15K), PC (65K), Cinematic (200K)
-- **Texel-space PBR baking** (Phase 2g): Apple Object Capture path bakes all five USDZ maps (albedo, normal, AO, roughness, metallic) at texel-space resolution using BVH surface proximity + Cramér's-rule barycentric UV interpolation. For each output texel, the nearest surface point on the original 250K-triangle USDZ mesh is found via trimesh's ProximityQuery; barycentric coordinates locate that point within its USDZ triangle; the per-face-vertex USDZ UV is interpolated at those weights, then sampled from the original texture. This replaces an earlier nearest-vertex KD-tree approach that caused a "Voronoi mosaic" artifact (each texel mapped to its closest vertex UV → flat colour per Voronoi cell → blocky polygon patches visible at all zoom levels). Texture dilation (4px) applied to all maps to prevent UV island seam bleeding
-- **Apple Object Capture quality control** (Phase 2h): quality preset now controls the Object Capture detail level — Mobile uses `reduced` (~25K source polys, faster), PC/Cinematic use `full` (~250K source polys, maximum detail)
-- **Vertex tangent embedding** (Phase 2i): pre-computed MikkTSpace-compatible TANGENT vectors embedded in every GLB with a normal map — required by glTF 2.0 spec for correct normal map decoding across all viewers
-- **Preset-scaled texture resolution** (Phase 2j): texture baking resolution now scales with quality preset — Mobile → 1024×1024, PC → 2048×2048, Cinematic → 4096×4096. Cinematic captures get 4× the texel density, directly recovering fine skin pores and surface microdetail that were invisible at 2048
-- **Selective PBR correction** (Phase 2k): Apple Object Capture's roughness and metallic maps are calibrated for RealityKit — raw values produce chrome/liquid-metal in standard glTF renderers. Correction uses the metallic map as a surface-type mask: organic zones (leather, skin, fabric) get roughness floor 0.60 and metallic clamped to 0; genuine metal zones (scissors, buckles, rivets — metallic > 0.30) are left untouched so chrome parts render as chrome
-- **Albedo clarity enhancement** (Phase 2l): photogrammetry captures albedo under real-world lighting, crushing dark subjects to near-black sRGB values that decode to near-zero linear in PBR renderers. Shadow lift (`shadow_lift=0.22`, `shadow_threshold=0.35`) raises only sub-threshold pixels proportionally — dark leather becomes visible without brightening skin or highlights. 1.5× saturation boost amplifies colour differences in lifted dark areas
+- **Mesh decimation**: Open3D quadric error metrics (QEM) decimation to quality preset triangle targets — MIT licensed, production-safe
+- **UV unwrapping**: xatlas automatic UV atlas generation — non-overlapping islands packed into [0,1]² space; output is OBJ with embedded UV coordinates
+- **Texture baking**: five PBR maps baked onto the UV-mapped mesh — albedo, normal, AO, roughness, metallic. Saved to workspace/textures/
+- **PBR material estimation**: roughness and metallic maps derived from image-space HSV analysis of the baked albedo (COLMAP path). Roughness: `specularity = V × (1 − S)`, blended with AO crevice factor. Metallic: soft threshold on desaturated high-value pixels
+- **Mesh geometry improvements**: isolated floating mesh fragments removed before decimation (connected component analysis); Laplacian smoothing pre-decimation reduces reconstruction noise; polygon budgets: Mobile (15K), PC (65K), Cinematic (200K), Ultra (400K)
+- **Texel-space PBR baking**: Apple Object Capture path bakes all five USDZ maps (albedo, normal, AO, roughness, metallic) at texel-space resolution using BVH surface proximity + Cramér's-rule barycentric UV interpolation. For each output texel, the nearest surface point on the original 250K-triangle USDZ mesh is found via trimesh ProximityQuery; barycentric coordinates locate that point within its USDZ triangle; the per-face-vertex USDZ UV is interpolated at those weights, then sampled from the original texture. Texture dilation (4px) applied to all maps to prevent UV island seam bleeding
+- **Apple Object Capture quality control**: quality preset controls the Object Capture detail level — Mobile uses `reduced` (~25K source polys, faster), PC/Cinematic/Ultra use `full` (~250K source polys, maximum detail)
+- **Vertex tangent embedding**: pre-computed MikkTSpace-compatible TANGENT vectors embedded in every GLB with a normal map — required by glTF 2.0 spec for correct normal map decoding across all viewers
+- **Preset-scaled texture resolution**: Mobile → 1024×1024, PC → 2048×2048, Cinematic → 4096×4096, Ultra → 8192×8192. Ultra's 8K UV atlas delivers 4× the texel density of Cinematic, enabling sub-millimeter surface detail and skin microstructure
+- **Selective PBR correction**: Apple Object Capture's roughness and metallic maps are calibrated for RealityKit — raw values produce chrome/liquid-metal in standard glTF renderers. Correction uses the metallic map as a surface-type mask: organic zones (leather, skin, fabric) get roughness floor 0.60 and metallic clamped to 0; genuine metal zones (scissors, buckles, rivets — metallic > 0.30) are left untouched so chrome parts render as chrome
+- **Albedo clarity enhancement**: shadow lift (`shadow_lift=0.22`, `shadow_threshold=0.35`) raises only sub-threshold pixels proportionally — dark leather becomes visible without brightening skin or highlights. 1.5× saturation boost amplifies colour differences in lifted dark areas
 
 ### Export
 - Mesh export to OBJ (.obj), glTF Binary (.glb), and FBX (.fbx)
-- Source mesh is the UV-mapped OBJ (Phase 2b output) — UV coordinates preserved in all exports
-- **Full PBR export** (Phase 2c–2d): all five maps (albedo, normal, AO, roughness, metallic) included when present
+- Source mesh is the UV-mapped OBJ — UV coordinates preserved in all exports
+- **Full PBR export**: all five maps (albedo, normal, AO, roughness, metallic) included when present
   - **GLB**: all textures embedded as a self-contained PBR material per the glTF 2.0 spec — roughness and metallic packed into a single `metallicRoughnessTexture` (G=roughness, B=metallic). Vertex tangents embedded (TANGENT attribute) so normal maps render correctly in all glTF viewers without runtime approximation
   - **OBJ**: bundle folder with `.obj`, `.mtl` (using `map_Pr`/`map_Pm` PBR extension directives), and all five PNG maps
-  - **FBX** (Phase 2e): bundle folder with `mesh.fbx` + all five PNG maps — textures delivered externally per Unreal Engine and Maya convention. Requires `assimp` CLI on PATH (`brew install assimp`)
+  - **FBX**: bundle folder with `mesh.fbx` + all five PNG maps — textures delivered externally per Unreal Engine and Maya convention. Requires `assimp` CLI on PATH (`brew install assimp`)
+- **Viewport projection baking**: if the user has applied shader-based texture projections in the viewport, those layers are baked onto the albedo atlas before export — the exported GLB/OBJ/FBX carries the painted result, not raw GPU state
 - Export view shows mesh stats and which PBR maps are available before exporting
 - Format selector dropdown with native save dialog
 - Auto-transition to Export view after pipeline completes
 - Reset button to clear the job and start a new reconstruction
 
-### 3D Viewport (Phase 5 — In Progress)
+### 3D Viewport
 
 The viewport sits between the Process and Export pages. The pipeline auto-navigates here after reconstruction completes so the user can inspect and edit the asset before exporting.
 
@@ -175,11 +175,20 @@ The viewport sits between the Process and Export pages. The pipeline auto-naviga
 - **Back-face culling**: average face normal (world-space) computed at save time; each frame, `dot(avg_normal, camera_pos − centroid) > 0` hides the overlay when the camera is viewing from the back
 - **Layers panel** (left sidebar): each saved polygon selection appears as a named layer row with an eye toggle, color swatch, inline rename (double-click), and delete button
 
+**Shader-Based Texture Projection**
+- Textures are projected onto the mesh via a dedicated GLSL second render pass — planar UV projection entirely in world-space, not UV-atlas space
+- Projection frame (Right, Up, Normal vectors) passed as shader uniforms; planar UVs computed in the fragment shader at GPU framerate
+- Source textures uploaded as trilinear mipmap `LINEAR_MIPMAP_LINEAR` moderngl textures for highest quality sampling at all distances and angles
+- **Screen-space polygon mask**: the drawn lasso polygon is rasterized each frame from its 3D world-space anchor points through the live MVP and bound to the projection shader as a sampler. The shader discards projected fragments outside the polygon shape — the projection clips exactly to the drawn selection boundary, not to full face boundaries
+- **Depth test fix**: the projection pass re-draws the same faces as the base pass at equal depth. OpenGL's default `GL_LESS` discards equal-depth fragments (making the projection invisible). Fixed by setting `depth_func = "<="` before the projection pass and restoring `"<"` after
+- Each projection layer is independent: separate face-subset IBO, separate texture, separate screen-space mask, toggled via the layers panel eye icon
+- **Export baking**: at export time, `bake_projections_to_atlas()` in `mesh_painter.py` implements the shader math in numpy — per-face UV triangle rasterization, barycentric interpolation of 3D positions, planar UV computation, bilinear texture sampling, alpha compositing. Runs at 2× supersampling resolution then LANCZOS downsamples to atlas size for anti-aliased results
+
 ### UI/UX
 - Charcoal + crimson dark theme with cohesive outlined button styling
-- Sidebar navigation with crimson left-accent active indicator and vertical separator
+- Top navigation bar with crimson active indicator and horizontal separator
 - Import / Process / Viewport / Export views — all content vertically and horizontally centered
-- Quality preset dropdown on Import page; format dropdown on Export page
+- Quality preset dropdown on Import page (Mobile / PC / Cinematic / Ultra); format dropdown on Export page
 - Development file watcher with auto-restart on save
 - Cross-platform targeting (macOS + Windows)
 
@@ -193,7 +202,7 @@ The viewport sits between the Process and Export pages. The pipeline auto-naviga
 - [x] 1e — Apple Object Capture integration (macOS high-quality reconstruction)
 - [x] 1f — UI refinements (folder import, browse button, consistent styling)
 
-### Phase 2: Game-Ready Optimization
+### Phase 2: Game-Ready Optimization (Complete)
 - [x] 2a — Mesh decimation with quality presets
 - [x] 2b — Automatic UV unwrapping (xatlas)
 - [x] 2c — Texture baking (albedo, normals, AO)
@@ -203,7 +212,7 @@ The viewport sits between the Process and Export pages. The pipeline auto-naviga
 - [x] 2g — Texel-space PBR baking from USDZ (full resolution sampling + texture dilation for all 5 maps)
 - [x] 2h — Apple Object Capture quality control (detail level tied to quality preset)
 - [x] 2i — Vertex tangent embedding in GLB (MikkTSpace-compatible TANGENT attribute for correct normal map rendering)
-- [x] 2j — Preset-scaled texture resolution (Mobile 1024, PC 2048, Cinematic 4096 — 4× texel density for fine skin/surface detail)
+- [x] 2j — Preset-scaled texture resolution (Mobile 1024, PC 2048, Cinematic 4096, Ultra 8192)
 - [x] 2k — Selective PBR correction (metallic-mask-guided: organic zones get roughness floor 0.60 + metallic → 0; metal zones preserved as chrome)
 - [x] 2l — Albedo clarity enhancement (shadow lift for dark-subject detail visibility + 1.5× saturation boost)
 
@@ -214,9 +223,10 @@ The viewport sits between the Process and Export pages. The pipeline auto-naviga
 - [x] 5d — Sculpt brushes (inflate, deflate, smooth, flatten) with seam-safe deformation
 - [x] 5e — Polygon lasso selection with FBO face-ID rendering and pixel-based face collection
 - [x] 5f — Layer system: save, name, toggle visibility, delete, color swatches, 3D overlay tracking
-- [ ] 5g — Mesh operations (smooth, decimate, fill holes, subdivide, remove floaters)
-- [ ] 5h — Texture projection / direct paint on mesh
-- [ ] 5i — Settings dialog (camera sensitivity, keybindings)
+- [x] 5g — Ultra (400K / 8K) quality preset for maximum-fidelity hero assets
+- [x] 5h — Shader-based texture projection with screen-space polygon mask and export baking
+- [ ] 5i — Mesh operations (smooth, decimate, fill holes, subdivide, remove floaters)
+- [ ] 5j — Settings dialog (camera sensitivity, keybindings)
 
 ### Phase 3: LiDAR Live Capture
 - [ ] 3a — iOS companion app (ARKit + LiDAR)
@@ -294,3 +304,6 @@ poetry run python scripts/dev.py
 - Android companion app for LiDAR capture
 - Real-time collaborative scanning (multiple phones contributing to one reconstruction)
 - Performance optimization: Apple Object Capture detail level control, COLMAP sequential/vocab-tree matching for large datasets, image preprocessing (auto-resize inputs)
+- Previous Jobs section — reopen past reconstruction jobs in the viewport for continued editing
+- Automated background removal in the Import stage (preprocessing pass before reconstruction)
+- Mesh merge tool for combining multi-session capture datasets

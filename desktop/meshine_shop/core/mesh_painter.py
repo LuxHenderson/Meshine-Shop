@@ -26,7 +26,7 @@ from pathlib import Path
 
 import numpy as np
 import trimesh
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter
 
 log = logging.getLogger(__name__)
 
@@ -118,6 +118,35 @@ class MeshPainter:
 
         self._albedo_path: Path = albedo_path
         self._tex_w, self._tex_h = self._albedo_img.size
+
+        # Keep a pristine copy of the original baked texture so the erase tool
+        # can restore original pixels rather than just painting over them.
+        self._albedo_orig: Image.Image = self._albedo_img.copy()
+
+        # ------------------------------------------------------------------ #
+        # Layer texture compositing                                            #
+        # _albedo_base = original baked texture + brush/fill/erase strokes.   #
+        # _albedo_img  = composite display = _albedo_base + visible layer      #
+        #                textures on top. Rebuilt by _rebuild_composite()      #
+        #                whenever a layer texture changes or is toggled.       #
+        # Keeping them separate lets eye-toggle show/hide a layer's texture    #
+        # without losing brush work painted before or after the projection.    #
+        # ------------------------------------------------------------------ #
+        self._albedo_base: Image.Image = self._albedo_img.copy()
+
+        # Per-layer projected textures: layer_id → full-size RGBA Image.
+        # Populated by project_texture(); cleared by remove_layer_texture().
+        self._layer_textures: dict[int, Image.Image] = {}
+
+        # Per-layer visibility for the projected texture (mirrors the eye toggle).
+        # When False the layer's texture is excluded from _rebuild_composite().
+        self._layer_visible: dict[int, bool] = {}
+
+        # Per-layer planar projection parameters for shader-based display.
+        # Populated by setup_layer_projection(); read by ViewportWidget to
+        # set GLSL uniforms. Does NOT modify _albedo_img — the shader renders
+        # the projection entirely on the GPU without touching the PIL buffer.
+        self._layer_projections: dict[int, dict] = {}
 
         # ------------------------------------------------------------------ #
         # Dirty-rect tracking — accumulate modified region per paint call      #
@@ -380,8 +409,9 @@ class MeshPainter:
         py = int(uv[1] * self._tex_h)
 
         # Draw the brush ellipse onto a temporary RGBA layer so we can
-        # alpha-composite it over the existing texture
-        stroke_layer = Image.new("RGBA", self._albedo_img.size, (0, 0, 0, 0))
+        # alpha-composite it over the base texture buffer (not the composite
+        # display — brush strokes live in _albedo_base, not _albedo_img).
+        stroke_layer = Image.new("RGBA", self._albedo_base.size, (0, 0, 0, 0))
         draw = ImageDraw.Draw(stroke_layer)
 
         alpha = int(opacity * 255)
@@ -391,14 +421,80 @@ class MeshPainter:
         x1, y1 = px + radius_px, py + radius_px
         draw.ellipse([x0, y0, x1, y1], fill=fill_color)
 
-        # Alpha-composite the stroke over the existing buffer
-        self._albedo_img = Image.alpha_composite(self._albedo_img, stroke_layer)
+        # Write stroke into _albedo_base (layer textures excluded from base)
+        self._albedo_base = Image.alpha_composite(self._albedo_base, stroke_layer)
 
-        # Expand dirty rect to cover this stroke
-        self._expand_dirty(
-            max(0, x0), max(0, y0),
-            min(self._tex_w, x1 + 1), min(self._tex_h, y1 + 1)
+        if self._layer_textures:
+            # Has projected layer textures: rebuild full composite so layers
+            # remain correctly composited on top of the updated base.
+            self._rebuild_composite()
+        else:
+            # Fast path — no layer textures, mirror stroke directly into display
+            # buffer and use fine-grained dirty-rect tracking for GPU efficiency.
+            self._albedo_img = Image.alpha_composite(self._albedo_img, stroke_layer)
+            self._expand_dirty(
+                max(0, x0), max(0, y0),
+                min(self._tex_w, x1 + 1), min(self._tex_h, y1 + 1)
+            )
+
+    def erase_brush(
+        self,
+        uv: np.ndarray,
+        radius_px: int,
+        opacity: float,
+    ) -> None:
+        """
+        Restore original baked texture pixels within a circular brush area.
+
+        Rather than painting a new color, this samples from _albedo_orig (the
+        pristine texture loaded at startup) and alpha-composites it back over
+        the current working buffer. At opacity=1.0 the original texture is
+        fully restored; lower opacity blends gradually.
+
+        Parameters
+        ----------
+        uv : (2,) float array in [0,1]²
+            Texture-space hit point.
+        radius_px : int
+            Brush radius in pixels.
+        opacity : float in 0.0–1.0
+            Erase strength — 1.0 fully restores original pixels.
+        """
+        px = int(uv[0] * self._tex_w)
+        py = int(uv[1] * self._tex_h)
+
+        x0 = max(0, px - radius_px)
+        y0 = max(0, py - radius_px)
+        x1 = min(self._tex_w, px + radius_px + 1)
+        y1 = min(self._tex_h, py + radius_px + 1)
+
+        if x1 <= x0 or y1 <= y0:
+            return
+
+        # Build a circular mask for the brush area
+        mask = Image.new("L", (x1 - x0, y1 - y0), 0)
+        draw = ImageDraw.Draw(mask)
+        # Circle is drawn relative to the crop region
+        cx, cy = px - x0, py - y0
+        draw.ellipse(
+            [cx - radius_px, cy - radius_px, cx + radius_px, cy + radius_px],
+            fill=int(opacity * 255),
         )
+
+        # Restore original pixels into _albedo_base (the brush-stroke buffer).
+        # Layer textures composited on top are NOT affected by erase — hiding a
+        # layer first lets the user see the erased base pixels underneath.
+        orig_patch = self._albedo_orig.crop((x0, y0, x1, y1))
+        curr_patch = self._albedo_base.crop((x0, y0, x1, y1))
+        curr_patch.paste(orig_patch, mask=mask)
+        self._albedo_base.paste(curr_patch, (x0, y0))
+
+        if self._layer_textures:
+            self._rebuild_composite()
+        else:
+            # Fast path: mirror directly to display buffer
+            self._albedo_img.paste(curr_patch, (x0, y0))
+            self._expand_dirty(x0, y0, x1, y1)
 
     # ------------------------------------------------------------------ #
     # Region flood fill                                                    #
@@ -435,9 +531,10 @@ class MeshPainter:
                     visited.add(nb)
                     queue.append(nb)
 
-        # Rasterize each face's UV triangle into the albedo buffer
+        # Rasterize each face's UV triangle into the base buffer.
+        # Layer textures remain composited on top regardless.
         fill_color_rgba = (color[0], color[1], color[2], 255)
-        draw = ImageDraw.Draw(self._albedo_img)
+        draw = ImageDraw.Draw(self._albedo_base)
 
         dirty_x0, dirty_y0 = self._tex_w, self._tex_h
         dirty_x1, dirty_y1 = 0, 0
@@ -458,13 +555,213 @@ class MeshPainter:
 
             draw.polygon(pts, fill=fill_color_rgba)
 
-        # Clamp dirty rect to texture bounds and expand the tracker
+        # Clamp dirty rect to texture bounds
         dirty_x0 = max(0, dirty_x0)
         dirty_y0 = max(0, dirty_y0)
         dirty_x1 = min(self._tex_w, dirty_x1)
         dirty_y1 = min(self._tex_h, dirty_y1)
+
         if dirty_x1 > dirty_x0 and dirty_y1 > dirty_y0:
-            self._expand_dirty(dirty_x0, dirty_y0, dirty_x1, dirty_y1)
+            if self._layer_textures:
+                # Rebuild composite so layers stay on top of the filled base
+                self._rebuild_composite()
+            else:
+                # Fast path: mirror fill directly to display buffer
+                patch = self._albedo_base.crop((dirty_x0, dirty_y0, dirty_x1, dirty_y1))
+                self._albedo_img.paste(patch, (dirty_x0, dirty_y0))
+                self._expand_dirty(dirty_x0, dirty_y0, dirty_x1, dirty_y1)
+
+    # ------------------------------------------------------------------ #
+    # Texture projection                                                   #
+    # ------------------------------------------------------------------ #
+
+    def setup_layer_projection(
+        self,
+        layer_id: int,
+        face_set: set,
+        texture_img: "Image.Image",
+        rotate_deg: float = 0.0,
+        scale: float = 1.0,
+        offset_x: float = 0.0,
+        offset_y: float = 0.0,
+        opacity: float = 1.0,
+    ) -> dict | None:
+        """
+        Compute and store planar projection parameters for a layer.
+
+        Unlike the old UV-atlas baking approach, this method does NOT modify
+        _albedo_img or _albedo_base. All display happens in the OpenGL
+        projection shader pass in ViewportWidget.paintGL(). The UV atlas is
+        only used at export time (future bake-on-save path).
+
+        Algorithm:
+            1. Average face normal → orthonormal frame (R=right, U=up, N=normal)
+            2. Project selected vertices onto (R, U) plane → normalization bounds
+            3. Pre-compute cos/sin for rotation uniform
+            4. Store all shader uniforms in _layer_projections[layer_id]
+            5. Store source PIL image in _layer_textures[layer_id] for undo tracking
+
+        Returns the params dict so ViewportWidget can immediately build GPU resources.
+        Returns None if face_set is empty or UVs not loaded.
+
+        Parameters
+        ----------
+        layer_id    : The layer this projection belongs to.
+        face_set    : Mesh face indices that define the selection.
+        texture_img : Source texture to project (any PIL mode — converted to RGBA).
+        rotate_deg  : Counter-clockwise rotation in degrees.
+        scale       : Uniform texture scale (1.0 = fill selection).
+        offset_x    : Horizontal shift (-1.0 to 1.0) in normalized planar space.
+        offset_y    : Vertical shift (-1.0 to 1.0) in normalized planar space.
+        opacity     : Overall blend opacity (0.0–1.0).
+        """
+        if self._uvs is None or not face_set:
+            return None
+
+        verts = np.asarray(self._mesh.vertices, dtype=np.float64)
+        faces = np.asarray(self._mesh.faces,    dtype=np.int32)
+
+        # ---------------------------------------------------------------- #
+        # Step 1: Average face normal → build orthonormal projection frame. #
+        # ---------------------------------------------------------------- #
+        normals_acc = np.zeros(3, dtype=np.float64)
+        for fi in face_set:
+            f  = faces[fi]
+            e1 = verts[f[1]] - verts[f[0]]
+            e2 = verts[f[2]] - verts[f[0]]
+            n  = np.cross(e1, e2)
+            nn = np.linalg.norm(n)
+            if nn > 1e-10:
+                normals_acc += n / nn
+
+        avg_n = normals_acc / (np.linalg.norm(normals_acc) + 1e-10)
+
+        # Build stable right / up vectors perpendicular to N
+        up_hint = np.array([0.0, 1.0, 0.0])
+        if abs(float(np.dot(avg_n, up_hint))) > 0.98:
+            up_hint = np.array([1.0, 0.0, 0.0])
+        R_vec = np.cross(avg_n, up_hint);  R_vec /= np.linalg.norm(R_vec)
+        U_vec = np.cross(R_vec, avg_n);    U_vec /= np.linalg.norm(U_vec)
+        # Negate U so "up" in world maps to "up" (low row index) in image
+        U_vec = -U_vec
+
+        # ---------------------------------------------------------------- #
+        # Step 2: Project selected vertices onto (R, U) plane.             #
+        # Normalization bounds ensure the texture fills the selection at   #
+        # scale=1.0 — same convention the fragment shader uses.            #
+        # ---------------------------------------------------------------- #
+        sel_verts: set[int] = set()
+        for fi in face_set:
+            sel_verts.update(int(v) for v in faces[fi])
+
+        r_coords = [float(np.dot(verts[vi], R_vec)) for vi in sel_verts]
+        u_coords = [float(np.dot(verts[vi], U_vec)) for vi in sel_verts]
+
+        r_min = min(r_coords);  r_max = max(r_coords)
+        u_min = min(u_coords);  u_max = max(u_coords)
+        r_range = max(r_max - r_min, 1e-9)
+        u_range = max(u_max - u_min, 1e-9)
+
+        # ---------------------------------------------------------------- #
+        # Step 3: Pre-compute rotation trig and pack all shader uniforms.  #
+        # ---------------------------------------------------------------- #
+        cos_a = float(math.cos(math.radians(rotate_deg)))
+        sin_a = float(math.sin(math.radians(rotate_deg)))
+
+        params: dict = {
+            "right":     R_vec.astype(np.float32),   # vec3 — horizontal axis
+            "up":        U_vec.astype(np.float32),   # vec3 — vertical axis (negated)
+            "r_min":     float(r_min),               # normalization: left edge
+            "r_range":   float(r_range),             # normalization: width
+            "u_min":     float(u_min),               # normalization: top edge
+            "u_range":   float(u_range),             # normalization: height
+            "scale":     max(float(scale), 1e-9),    # uniform scale
+            "cos":       cos_a,                      # rotation cos (pre-computed)
+            "sin":       sin_a,                      # rotation sin
+            "offset_x":  float(offset_x),            # horizontal shift
+            "offset_y":  float(offset_y),            # vertical shift
+            "opacity":   float(opacity),             # blend opacity
+            "face_set":  face_set,                   # kept so viewport rebuilds VAO on mesh reload
+            "rotate_deg": rotate_deg,                # kept for re-projection on slider change
+            "texture_img": texture_img.convert("RGBA"),  # source RGBA for GPU upload
+        }
+
+        # ---------------------------------------------------------------- #
+        # Step 4: Store params and source texture.                         #
+        # _layer_textures[layer_id] = source PIL image (for undo tracking  #
+        # and future export-bake). _layer_projections[layer_id] = uniforms #
+        # consumed by ViewportWidget to set shader state each frame.       #
+        # ---------------------------------------------------------------- #
+        self._layer_projections[layer_id] = params
+        self._layer_visible[layer_id]     = True
+        # Store source image in _layer_textures for snapshot undo tracking.
+        # This is NOT a baked atlas image — it is just the raw source texture.
+        self._layer_textures[layer_id] = texture_img.convert("RGBA")
+
+        log.debug(
+            "MeshPainter: setup_layer_projection layer=%d faces=%d",
+            layer_id, len(face_set),
+        )
+        return params
+
+    def _rebuild_composite(self) -> None:
+        """
+        Rebuild _albedo_img from _albedo_base.
+
+        With shader-based projection, layer textures are rendered on the GPU and
+        do NOT modify _albedo_img. This method is kept for brush/fill/erase ops
+        that still write into _albedo_base and need the dirty rect refreshed.
+
+        _layer_textures now stores raw source PIL images (not atlas-baked images),
+        so compositing them would produce garbage — we only copy the base.
+        """
+        # Start from the brush-stroke base (no layer textures composited in)
+        self._albedo_img = self._albedo_base.copy()
+        # Mark full texture dirty so viewport reuploads on next frame
+        self._dirty = (0, 0, self._tex_w, self._tex_h)
+
+    def set_layer_texture_visible(self, layer_id: int, visible: bool) -> None:
+        """
+        Show or hide a layer's projected texture in the composite display.
+
+        Called by ViewportWidget when the layers panel eye button is toggled.
+        Rebuilds the composite immediately so the viewport reflects the change
+        on the next frame without requiring another Apply.
+
+        Parameters
+        ----------
+        layer_id : int
+            The layer whose texture visibility is being toggled.
+        visible : bool
+            True = include in composite; False = exclude from composite.
+        """
+        self._layer_visible[layer_id] = visible
+        # Update shader projection params visibility so the viewport render
+        # pass skips invisible layers without needing a GPU resource teardown.
+        if layer_id in self._layer_projections:
+            self._layer_projections[layer_id]["visible"] = visible
+        # No composite rebuild needed — shader handles projection display.
+        log.debug("MeshPainter: layer %d visibility → %s", layer_id, visible)
+
+    def remove_layer_texture(self, layer_id: int) -> None:
+        """
+        Remove a layer's projection — both source texture and shader params.
+
+        Called by ViewportWidget.delete_layer() when the user deletes a layer.
+        Clears both the source texture (used for undo tracking) and the shader
+        projection parameters. The viewport render pass will no longer include
+        this layer on the next frame.
+
+        Parameters
+        ----------
+        layer_id : int
+            The layer being deleted.
+        """
+        self._layer_textures.pop(layer_id, None)
+        self._layer_projections.pop(layer_id, None)
+        self._layer_visible.pop(layer_id, None)
+        # No composite rebuild needed — shader handles display.
+        log.debug("MeshPainter: removed projection for layer %d", layer_id)
 
     def sculpt(
         self,
@@ -786,11 +1083,17 @@ class MeshPainter:
         else:
             verts = faces = norms = uvs = None
 
-        # Always copy the PIL image — it is mutable and paint strokes modify it
-        # in place, so a reference copy would be invalidated immediately.
-        albedo = self._albedo_img.copy()
+        # Snapshot the BASE buffer (brush strokes only, no layer textures).
+        # Undo restores this base, then rebuilds the composite from the
+        # simultaneously-snapshotted layer_textures state.
+        albedo = self._albedo_base.copy()
 
-        return verts, faces, norms, uvs, albedo
+        # Copy per-layer texture and visibility state so undoing a texture
+        # projection also removes it from the composite (not just the base).
+        layer_textures = {lid: img.copy() for lid, img in self._layer_textures.items()}
+        layer_visible  = dict(self._layer_visible)
+
+        return verts, faces, norms, uvs, albedo, layer_textures, layer_visible
 
     def restore_snapshot(
         self,
@@ -799,6 +1102,8 @@ class MeshPainter:
         normals: "np.ndarray | None",
         uvs: "np.ndarray | None",
         albedo: "Image.Image",
+        layer_textures: "dict | None" = None,
+        layer_visible:  "dict | None" = None,
     ) -> None:
         """
         Overwrite the current editor state with a previously captured snapshot.
@@ -840,13 +1145,34 @@ class MeshPainter:
             # Rebuild all topology caches for the restored mesh
             self._rebuild_topology()
 
-        # Restore texture — replace the PIL buffer with the snapshot copy
-        self._albedo_img = albedo.copy()
-        self._tex_w, self._tex_h = self._albedo_img.size
+        # Restore the BASE buffer (brush strokes, no layer textures)
+        self._albedo_base = albedo.copy()
+        self._tex_w, self._tex_h = self._albedo_base.size
 
-        # Mark texture as fully dirty so the full texture is reuploaded to the
-        # GPU (the caller reads get_dirty_rect() or calls get_texture_rgba()).
-        self._dirty = (0, 0, self._tex_w, self._tex_h)
+        # Restore per-layer texture state if the snapshot includes it.
+        # If not provided (old snapshot), keep existing layer state so the
+        # composite still reflects any layers the user has active.
+        if layer_textures is not None:
+            self._layer_textures = {
+                lid: img.copy() for lid, img in layer_textures.items()
+            }
+        if layer_visible is not None:
+            self._layer_visible = dict(layer_visible)
+
+        # Sync _layer_projections: remove any projections for layers that
+        # are absent from the restored snapshot. This ensures that undoing
+        # a projection call correctly removes it from the shader render pass.
+        if layer_textures is not None:
+            stale = [lid for lid in list(self._layer_projections.keys())
+                     if lid not in layer_textures]
+            for lid in stale:
+                self._layer_projections.pop(lid, None)
+                log.debug("MeshPainter: restore_snapshot cleared projection for layer %d", lid)
+
+        # Rebuild the composite from the restored base.
+        # With shader-based projection, _rebuild_composite() just copies _albedo_base
+        # and marks the texture dirty for GPU reupload.
+        self._rebuild_composite()
 
     def _rebuild_topology(self) -> None:
         """
@@ -1109,3 +1435,173 @@ class MeshPainter:
         """
         self._albedo_img.save(str(self._albedo_path), format="PNG")
         log.info("MeshPainter: albedo saved to %s", self._albedo_path)
+
+    def bake_projections_to_atlas(self) -> "Image.Image":
+        """
+        Bake all visible shader-projection layers onto the UV atlas.
+
+        Implements the same planar-projection math as PROJ_FRAG_SHADER (in
+        viewport.py) but runs entirely on the CPU using numpy so the result
+        can be embedded in an exported mesh file without any OpenGL dependency.
+
+        Algorithm (per projection layer, per selected face):
+            1. Rasterize the face's UV-atlas triangle to find all covered texels.
+            2. Compute barycentric weights → interpolate 3D world position.
+            3. Project 3D position onto the orthonormal (R, U) plane.
+            4. Normalise → apply material transform (scale, rotate, offset).
+            5. Bilinear-sample the source texture.
+            6. Alpha-composite onto the result buffer.
+
+        Returns
+        -------
+        Image.Image
+            RGBA copy of the albedo with all visible projection layers baked in.
+            The original _albedo_img is NOT modified — callers receive an
+            independent image suitable for saving or passing to the exporter.
+        """
+        # Supersample at 2× resolution then downsample at the end.
+        # Each UV triangle covers 4× more pixels during rasterization, giving
+        # smoother edges and better colour gradients before the final LANCZOS
+        # downsample brings it back to the atlas resolution.
+        SUPER = 2
+        W0, H0 = self._albedo_img.size                    # target (atlas) size
+        W,  H  = W0 * SUPER, H0 * SUPER                  # working size
+
+        # Start from a 2× upscaled copy so we never mutate the live buffer.
+        result_arr = np.array(
+            self._albedo_img.resize((W, H), Image.LANCZOS), dtype=np.float32
+        )  # (H, W, 4)
+
+        if not self._layer_projections or self._uvs is None:
+            baked = Image.fromarray(result_arr.clip(0, 255).astype(np.uint8), "RGBA")
+            return baked.resize((W0, H0), Image.LANCZOS) if SUPER > 1 else baked
+
+        verts = np.asarray(self._mesh.vertices, dtype=np.float64)
+        faces = np.asarray(self._mesh.faces,    dtype=np.int32)
+        uvs   = np.asarray(self._uvs,           dtype=np.float32)
+
+        for layer_id, params in self._layer_projections.items():
+            # Respect eye-toggle visibility — hidden layers are skipped.
+            if not self._layer_visible.get(layer_id, True):
+                continue
+
+            face_set  = params["face_set"]
+            R_vec     = params["right"].astype(np.float64)
+            U_vec     = params["up"].astype(np.float64)
+            r_min     = float(params["r_min"])
+            r_range   = float(params["r_range"])
+            u_min     = float(params["u_min"])
+            u_range   = float(params["u_range"])
+            scale     = float(params["scale"])
+            cos_a     = float(params["cos"])
+            sin_a     = float(params["sin"])
+            offset_x  = float(params["offset_x"])
+            offset_y  = float(params["offset_y"])
+            opacity   = float(params["opacity"])
+            tex_img   = params["texture_img"]           # PIL RGBA from setup_layer_projection
+            tex_arr   = np.array(tex_img, dtype=np.float32)  # (th, tw, 4)
+            th, tw    = tex_arr.shape[:2]
+
+            for fi in face_set:
+                f          = faces[fi]
+                v0, v1, v2 = int(f[0]), int(f[1]), int(f[2])
+
+                # UV-atlas pixel positions of the three triangle vertices.
+                # Multiply by the supersampled dimensions so the rasterization
+                # covers SUPER× more pixels per triangle than the atlas native size.
+                uv0 = uvs[v0];  uv1 = uvs[v1];  uv2 = uvs[v2]
+                px0 = float(uv0[0]) * (W - 1)
+                py0 = float(uv0[1]) * (H - 1)
+                px1 = float(uv1[0]) * (W - 1)
+                py1 = float(uv1[1]) * (H - 1)
+                px2 = float(uv2[0]) * (W - 1)
+                py2 = float(uv2[1]) * (H - 1)
+
+                # Bounding box of this UV triangle in texel space.
+                x_min = max(0,     int(np.floor(min(px0, px1, px2))))
+                x_max = min(W - 1, int(np.ceil( max(px0, px1, px2))))
+                y_min = max(0,     int(np.floor(min(py0, py1, py2))))
+                y_max = min(H - 1, int(np.ceil( max(py0, py1, py2))))
+                if x_min >= x_max or y_min >= y_max:
+                    continue
+
+                # Candidate pixel grid inside the bounding box.
+                xs = np.arange(x_min, x_max + 1, dtype=np.float32)
+                ys = np.arange(y_min, y_max + 1, dtype=np.float32)
+                gx, gy = np.meshgrid(xs, ys)
+                gx = gx.ravel();  gy = gy.ravel()
+
+                # Barycentric coordinates in UV-atlas space.
+                denom = (py1 - py2) * (px0 - px2) + (px2 - px1) * (py0 - py2)
+                if abs(denom) < 1e-10:
+                    continue
+                w0 = ((py1 - py2) * (gx - px2) + (px2 - px1) * (gy - py2)) / denom
+                w1 = ((py2 - py0) * (gx - px2) + (px0 - px2) * (gy - py2)) / denom
+                w2 = 1.0 - w0 - w1
+
+                inside = (w0 >= 0) & (w1 >= 0) & (w2 >= 0)
+                if not np.any(inside):
+                    continue
+
+                gx_in = gx[inside];  gy_in = gy[inside]
+                w0_in = w0[inside][:, None]
+                w1_in = w1[inside][:, None]
+                w2_in = w2[inside][:, None]
+
+                # Interpolate 3D world position for each interior texel.
+                p0 = verts[v0];  p1 = verts[v1];  p2 = verts[v2]
+                pos = (w0_in * p0 + w1_in * p1 + w2_in * p2)  # (N, 3)
+
+                # Planar UV projection — mirrors the GLSL shader exactly.
+                r_coord = pos @ R_vec
+                u_coord = pos @ U_vec
+                pu = (r_coord - r_min) / r_range
+                pv = (u_coord - u_min) / u_range
+
+                # Material transform: centre, scale, rotate, re-wrap.
+                pu_c = pu - 0.5 - offset_x
+                pv_c = pv - 0.5 - offset_y
+                pu_c /= scale
+                pv_c /= scale
+                pu_r = pu_c * cos_a - pv_c * sin_a
+                pv_r = pu_c * sin_a + pv_c * cos_a
+
+                tex_u = np.mod(pu_r + 0.5, 1.0)
+                tex_v = np.mod(pv_r + 0.5, 1.0)
+
+                # Bilinear sample the source texture.
+                fx   = tex_u * (tw - 1)
+                fy   = tex_v * (th - 1)
+                x0i  = np.floor(fx).astype(np.int32).clip(0, tw - 2)
+                y0i  = np.floor(fy).astype(np.int32).clip(0, th - 2)
+                x1i  = x0i + 1;  y1i = y0i + 1
+                wx   = (fx - x0i)[:, None]
+                wy   = (fy - y0i)[:, None]
+                c00  = tex_arr[y0i, x0i]
+                c01  = tex_arr[y0i, x1i]
+                c10  = tex_arr[y1i, x0i]
+                c11  = tex_arr[y1i, x1i]
+                samp = (c00 * (1 - wx) * (1 - wy) + c01 * wx * (1 - wy)
+                        + c10 * (1 - wx) * wy      + c11 * wx * wy)
+
+                # Scale alpha by opacity.
+                samp[:, 3] *= opacity
+
+                # Alpha-composite sampled colour over existing result.
+                ix    = gx_in.astype(np.int32).clip(0, W - 1)
+                iy    = gy_in.astype(np.int32).clip(0, H - 1)
+                src_a = samp[:, 3:4] / 255.0
+                dst   = result_arr[iy, ix]
+                result_arr[iy, ix] = samp * src_a + dst * (1.0 - src_a)
+
+            log.debug(
+                "MeshPainter: baked projection layer %d (%d faces)",
+                layer_id, len(face_set),
+            )
+
+        # Downsample from the supersampled working size back to the atlas
+        # resolution using LANCZOS (high-quality anti-aliasing filter).
+        baked = Image.fromarray(result_arr.clip(0, 255).astype(np.uint8), "RGBA")
+        if SUPER > 1:
+            baked = baked.resize((W0, H0), Image.LANCZOS)
+        return baked
