@@ -269,6 +269,10 @@ class ViewportLayersPanel(QWidget):
     layer_deleted = Signal(int)
     # Emitted when the user clicks a layer row to make it the active layer.
     layer_selected = Signal(int)
+    # Emitted when the user wants to permanently delete the selected layer's
+    # faces from the mesh geometry. The viewport handles the topology change
+    # and undo snapshot; the panel removes the row after the signal is emitted.
+    delete_faces_requested = Signal(int)        # layer_id
     # Emitted when the user clicks "Apply to Layer" with a loaded texture.
     # Args: (layer_id, texture_path, rotate_deg, scale, offset_x, offset_y)
     project_texture_requested = Signal(int, str, float, float, float, float)
@@ -312,7 +316,24 @@ class ViewportLayersPanel(QWidget):
         self._save_btn.clicked.connect(self._on_save_clicked)
         layout.addWidget(self._save_btn)
 
-        # Second divider below the save button
+        # --- Delete Faces button ---
+        # Permanently removes the selected layer's faces from the mesh geometry.
+        # Enabled only when a layer is selected. This is the viewport-based
+        # alternative to preprocessing background removal — select unwanted
+        # geometry (base, stool, background surfaces), then delete it directly
+        # from the mesh. The operation is undoable via Ctrl+Z.
+        self._delete_faces_btn = QPushButton("Delete Faces")
+        self._delete_faces_btn.setObjectName("save_layer_btn")
+        self._delete_faces_btn.setEnabled(False)
+        self._delete_faces_btn.setToolTip(
+            "Permanently remove the selected layer's faces from the mesh.\n"
+            "Use this to delete background geometry (bases, tables, floors).\n"
+            "Undoable with Ctrl+Z."
+        )
+        self._delete_faces_btn.clicked.connect(self._on_delete_faces_clicked)
+        layout.addWidget(self._delete_faces_btn)
+
+        # Second divider below the action buttons
         divider2 = QFrame()
         divider2.setObjectName("tools_divider")
         divider2.setFrameShape(QFrame.Shape.HLine)
@@ -530,6 +551,7 @@ class ViewportLayersPanel(QWidget):
         self._pending_face_count = 0
         self._pending_label.hide()
         self._save_btn.setEnabled(False)
+        self._delete_faces_btn.setEnabled(False)
         self._placeholder.show()
         self._selected_id = None
 
@@ -568,7 +590,8 @@ class ViewportLayersPanel(QWidget):
             self._selected_id = layer_id
             self.layer_selected.emit(layer_id)
 
-        # Re-evaluate texture section enable state whenever selection changes.
+        # Re-evaluate button enable states whenever selection changes.
+        self._delete_faces_btn.setEnabled(self._selected_id is not None)
         self._update_texture_section()
 
     def _make_slider_row(
@@ -736,10 +759,38 @@ class ViewportLayersPanel(QWidget):
         if row is not None:
             self._list_layout.removeWidget(row)
             row.deleteLater()
+        # Clear selection state if the deleted layer was selected
+        if self._selected_id == layer_id:
+            self._selected_id = None
+            self._delete_faces_btn.setEnabled(False)
+            self._update_texture_section()
         # Show placeholder again if all layers were deleted
         if not self._layer_rows:
             self._placeholder.show()
         self.layer_deleted.emit(layer_id)
+
+    def _on_delete_faces_clicked(self) -> None:
+        """
+        Emit delete_faces_requested for the currently selected layer.
+
+        The viewport handles the actual geometry change and undo snapshot.
+        This method also removes the row from the panel since the layer
+        will no longer exist after the faces are deleted from the mesh.
+        """
+        if self._selected_id is None:
+            return
+        layer_id = self._selected_id
+        # Notify the viewport first — it needs the layer to still be in
+        # self._layers when delete_layer_faces runs. If _on_delete fired first,
+        # the layer_deleted signal would call viewport.delete_layer(), removing
+        # the layer before delete_layer_faces could find it.
+        # delete_layer_faces handles its own internal viewport.delete_layer()
+        # cleanup; _on_delete here only removes the panel UI row and re-emits
+        # layer_deleted, which calls viewport.delete_layer() again harmlessly
+        # (layer is already gone — the method just returns early).
+        self.delete_faces_requested.emit(layer_id)
+        # Now clean up the panel UI row
+        self._on_delete(layer_id)
 
     def _schedule_preview(self) -> None:
         """

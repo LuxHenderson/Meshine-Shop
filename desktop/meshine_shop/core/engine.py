@@ -111,7 +111,8 @@ def ingest_images(image_paths: list[str], workspace, on_progress) -> None:
                 # Convert to RGB in case the image has an alpha channel
                 # or is in a color mode JPEG doesn't support (e.g., RGBA, P).
                 rgb_img = img.convert("RGB")
-                rgb_img.save(dest, "JPEG", quality=95)
+
+            rgb_img.save(dest, "JPEG", quality=95)
             valid_count += 1
         except Exception as e:
             skipped.append(f"{path.name} (conversion failed: {e})")

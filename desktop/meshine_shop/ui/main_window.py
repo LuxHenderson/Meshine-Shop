@@ -299,6 +299,8 @@ class ViewportView(QWidget):
         self.layers.layer_visibility_changed.connect(self.viewport.set_layer_visibility)
         self.layers.layer_color_changed.connect(self.viewport.set_layer_color)
         self.layers.layer_deleted.connect(self.viewport.delete_layer)
+        # Delete Faces — permanently removes selected layer's faces from the mesh
+        self.layers.delete_faces_requested.connect(self.viewport.delete_layer_faces)
         # Clicking a layer row selects it in the panel and highlights it on the model
         self.layers.layer_selected.connect(self.viewport.set_active_layer)
 
