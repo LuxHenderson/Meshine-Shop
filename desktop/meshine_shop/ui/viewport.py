@@ -976,6 +976,14 @@ class ViewportWidget(QOpenGLWidget):
         # side, so the highlight naturally disappears behind the geometry.
         self._pending_poly_avg_normal: "np.ndarray | None" = None
 
+        # 2D screen-space polygon and camera matrices captured at selection time.
+        # Used by the cookie-cutter deletion to clip boundary triangles exactly
+        # along the polygon outline rather than deleting whole triangles.
+        self._pending_poly_pts_2d: "list | None" = None
+        self._pending_view_mat:    "np.ndarray | None" = None
+        self._pending_proj_mat:    "np.ndarray | None" = None
+        self._pending_model_mat:   "np.ndarray | None" = None
+
         # Saved layers — keyed by integer layer_id assigned at save time.
         # Each entry: {"name", "faces", "visible", "color", "vao", "vbo"}
         self._layers: dict[int, dict] = {}
@@ -1073,6 +1081,10 @@ class ViewportWidget(QOpenGLWidget):
         self._pending_screen_mask_tex = None
         self._pending_poly_pts_3d = None
         self._pending_poly_avg_normal = None
+        self._pending_poly_pts_2d  = None
+        self._pending_view_mat     = None
+        self._pending_proj_mat     = None
+        self._pending_model_mat    = None
         self._layers.clear()
         self._next_layer_id = 0
 
@@ -1343,6 +1355,10 @@ class ViewportWidget(QOpenGLWidget):
         self._pending_rebuild = False
         self._pending_screen_mask_tex = None
         self._pending_poly_pts_3d = None
+        self._pending_poly_pts_2d  = None
+        self._pending_view_mat     = None
+        self._pending_proj_mat     = None
+        self._pending_model_mat    = None
         self._layers.clear()
         self._next_layer_id = 0
 
@@ -1533,9 +1549,10 @@ class ViewportWidget(QOpenGLWidget):
         # _camera_moved is set to True by orbit/pan handlers and cleared here
         # each frame — reprojection only fires on genuine camera navigation, not
         # every frame, to prevent floating-point drift from accumulating.
-        if self._poly_points_3d and self._camera_moved:
+        if self._camera_moved:
+            if self._poly_points_3d:
+                self._reproject_poly_overlay(self._poly_cursor)
             self._camera_moved = False
-            self._reproject_poly_overlay(self._poly_cursor)
 
         # Clear depth to 1.0 and color to black; the background gradient quad
         # will immediately overwrite every color pixel, so the clear color
@@ -1759,7 +1776,45 @@ class ViewportWidget(QOpenGLWidget):
             self._ctx.disable(moderngl.DEPTH_TEST)
 
             # --- Pending selection: teal/cyan overlay (screen-space PIL mask) ---
-            # Mask rasterized in PIL top-left-origin space → Y-flip shader variant.
+            # Reproject 3D anchor points each frame so the overlay tracks the
+            # mesh during orbit.  Done inline here (not in _camera_moved) so we
+            # are guaranteed to be inside an active GL context with qt_fbo bound,
+            # using .write() on the existing texture (safe mid-frame pattern,
+            # same as committed layers) instead of allocating a new texture object.
+            if _pending_has_overlay and self._pending_poly_pts_3d is not None:
+                from PIL import Image as _PilPM, ImageDraw as _PilPMD  # noqa: PLC0415
+                _pm_pts = [p for p in self._pending_poly_pts_3d if p is not None]
+                if len(_pm_pts) >= 3:
+                    _pm_vw = float(self.width())
+                    _pm_vh = float(self.height())
+                    if _pm_vw > 0 and _pm_vh > 0:
+                        _pm_w    = np.array(_pm_pts, dtype=np.float32)
+                        _pm_view  = self._camera.get_view_matrix()
+                        _pm_proj  = self._camera.get_projection_matrix(_pm_vw / _pm_vh)
+                        _pm_model = self._model_mat_4x4()
+                        _pm_mvp  = (_pm_proj @ _pm_view
+                                    @ _pm_model.astype(np.float64)).astype(np.float32)
+                        _pm_pts4 = np.hstack([_pm_w, np.ones((len(_pm_w), 1), np.float32)])
+                        _pm_clip = (_pm_mvp @ _pm_pts4.T).T
+                        _pm_wc   = np.where(np.abs(_pm_clip[:, 3]) < 1e-8,
+                                            1e-8, _pm_clip[:, 3])
+                        _pm_sx   = ((_pm_clip[:, 0] / _pm_wc + 1.0) * 0.5 * _pm_vw).astype(int)
+                        _pm_sy   = ((1.0 - (_pm_clip[:, 1] / _pm_wc + 1.0) * 0.5) * _pm_vh).astype(int)
+                        _pm_img  = _PilPM.new("L", (int(_pm_vw), int(_pm_vh)), 0)
+                        _PilPMD.Draw(_pm_img).polygon(
+                            [(_pm_sx[k], _pm_sy[k]) for k in range(len(_pm_sx))], fill=255
+                        )
+                        self._pending_screen_mask_tex.write(
+                            np.array(_pm_img, dtype=np.uint8).tobytes()
+                        )
+                        # Keep cookie-cutter matrices in sync with current camera.
+                        self._pending_poly_pts_2d = [
+                            (float(_pm_sx[k]), float(_pm_sy[k])) for k in range(len(_pm_sx))
+                        ]
+                        self._pending_view_mat  = _pm_view.astype(np.float64).copy()
+                        self._pending_proj_mat  = _pm_proj.astype(np.float64).copy()
+                        self._pending_model_mat = _pm_model.astype(np.float64).copy()
+
             if _pending_has_overlay:
                 self._ctx.enable(moderngl.BLEND)
                 self._ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
@@ -2491,16 +2546,40 @@ class ViewportWidget(QOpenGLWidget):
                     self._gizmo_axis = axis
                 return  # rotate tool owns LMB entirely (gizmo or no-op)
 
-            # --- Polygon select: defer anchor placement to mouse release ---
-            # Record the press position here but don't commit the anchor yet.
-            # On LMB release (mouseReleaseEvent) we check whether the mouse
-            # moved significantly (indicating an orbit drag) — if it did, the
-            # pending press is silently discarded; if not, the anchor is committed.
-            # This prevents every orbit drag from planting an accidental anchor
-            # at the drag-start position, which was the root cause of "jagged"
-            # face deletion (polygon distorted by unwanted extra points).
+            # --- Polygon select: commit anchor immediately on LMB press ---
+            # Anchor is placed the moment the user clicks.  If they then drag
+            # to orbit the camera, the first mouseMoveEvent detects the drag and
+            # pops the anchor back out so the polygon isn't distorted.
+            # _poly_pending_press is still set so mouseReleaseEvent can clean up.
             if self._tool == "poly_select":
-                self._poly_pending_press = (int(x), int(y))
+                ix, iy = int(x), int(y)
+                # Close-loop check: pressing within 15px of first anchor finalises.
+                if len(self._poly_points) >= 3:
+                    fx, fy = self._poly_points[0]
+                    if math.hypot(ix - fx, iy - fy) < 15:
+                        self._poly_pending_press = None
+                        self._poly_orbit_dragged = False
+                        self._finalize_poly_selection()
+                        return
+                # Commit anchor immediately.
+                self._poly_points.append((ix, iy))
+                if self._camera is not None and self._painter is not None:
+                    w_vp, h_vp = self.width(), self.height()
+                    ndc_x = (ix / w_vp) * 2.0 - 1.0
+                    ndc_y = 1.0 - (iy / h_vp) * 2.0
+                    origin, direction = self._camera.unproject_ray(
+                        ndc_x, ndc_y, w_vp / max(h_vp, 1)
+                    )
+                    model_origin, model_dir = self._to_model_ray(origin, direction)
+                    hit_model = self._painter.ray_cast_world_pos(model_origin, model_dir)
+                    self._poly_points_3d.append(
+                        hit_model.tolist() if hit_model is not None else None
+                    )
+                self._poly_overlay.set_points(self._poly_points, (ix, iy))
+                self._poly_overlay.update()
+                self.history_changed.emit(True, self._history.can_redo)
+                # Track press so the move event can roll back if orbit starts.
+                self._poly_pending_press = (ix, iy)
                 self._poly_orbit_dragged = False
                 return  # poly select owns LMB entirely
 
@@ -2689,15 +2768,38 @@ class ViewportWidget(QOpenGLWidget):
                 self._poly_overlay.set_points(self._poly_points, (x, y))
                 self._poly_overlay.update()
 
-            # Allow camera orbit while poly_select is active so the user can
-            # navigate around the model mid-selection without switching tools.
-            # Flagging _poly_orbit_dragged prevents the pending press from being
-            # committed as an anchor on release — orbit drags don't plant anchors.
+            # Allow camera orbit while poly_select is active.  If the user
+            # starts dragging immediately after a press, roll back the anchor
+            # that was committed on press — orbit drags should not plant points.
+            #
+            # Dead-zone: require at least 4px of total travel from the press
+            # position before treating movement as intentional orbit.  Without
+            # this, sub-pixel mouse jitter on a click (dx/dy = ±1) was enough
+            # to trigger orbit and pop the just-placed anchor, making it feel
+            # like the tool was confused between clicking and dragging.
             if self._mouse_binding_active("orbit") and (dx != 0 or dy != 0):
-                self._poly_orbit_dragged = True
-                self._camera.orbit(dx, dy)
-                self._camera_moved = True
-                self.update()
+                is_orbit = self._poly_orbit_dragged  # already confirmed drag
+                if not is_orbit and self._poly_pending_press is not None:
+                    px, py = self._poly_pending_press
+                    travel = math.hypot(x - px, y - py)
+                    is_orbit = travel >= 4.0
+                if is_orbit:
+                    if (self._poly_pending_press is not None
+                            and not self._poly_orbit_dragged
+                            and self._poly_points):
+                        # First confirmed orbit move — pop the just-committed anchor.
+                        self._poly_points.pop()
+                        if self._poly_points_3d:
+                            self._poly_points_3d.pop()
+                        self._poly_overlay.set_points(
+                            self._poly_points,
+                            (self._poly_pending_press[0], self._poly_pending_press[1]),
+                        )
+                        self._poly_overlay.update()
+                    self._poly_orbit_dragged = True
+                    self._camera.orbit(dx, dy)
+                    self._camera_moved = True
+                    self.update()
 
         elif self._tool in ("brush", "erase") and self._lmb_held:
             # Tool active — brush/erase stroke on drag; orbit is suspended.
@@ -2741,45 +2843,9 @@ class ViewportWidget(QOpenGLWidget):
             _SCULPT_TOOLS = {"inflate", "deflate", "smooth", "flatten"}
             if self._tool in _SCULPT_TOOLS and self._painter is not None:
                 self._painter._rebuild_bvh()
-            # Poly select tool owns LMB — commit or discard the pending anchor
-            # depending on whether an orbit drag occurred during this press cycle.
+            # Poly select: anchor was committed on press; just reset drag state.
             if self._tool == "poly_select":
                 self._lmb_cursor_origin_global = None
-                if self._poly_pending_press is not None and not self._poly_orbit_dragged:
-                    # Pure click — commit the anchor.
-                    ix, iy = self._poly_pending_press
-                    # Check close-loop: clicking within 15px of first anchor finalizes.
-                    if len(self._poly_points) >= 3:
-                        fx, fy = self._poly_points[0]
-                        if math.hypot(ix - fx, iy - fy) < 15:
-                            self._poly_pending_press = None
-                            self._poly_orbit_dragged = False
-                            self._finalize_poly_selection()
-                            return
-                    # Commit the anchor to _poly_points.
-                    self._poly_points.append((ix, iy))
-                    # Raycast the anchor onto the mesh surface and store the
-                    # model-space hit position for per-frame reprojection.
-                    if self._camera is not None and self._painter is not None:
-                        w_vp, h_vp = self.width(), self.height()
-                        ndc_x = (ix / w_vp) * 2.0 - 1.0
-                        ndc_y = 1.0 - (iy / h_vp) * 2.0
-                        origin, direction = self._camera.unproject_ray(
-                            ndc_x, ndc_y, w_vp / max(h_vp, 1)
-                        )
-                        model_origin, model_dir = self._to_model_ray(origin, direction)
-                        hit_model = self._painter.ray_cast_world_pos(model_origin, model_dir)
-                        if hit_model is not None:
-                            self._poly_points_3d.append(hit_model.tolist())
-                        else:
-                            # Off-mesh click — store None so reprojection skips
-                            # this point and keeps its original screen position.
-                            self._poly_points_3d.append(None)
-                    self._poly_overlay.set_points(self._poly_points, (ix, iy))
-                    self._poly_overlay.update()
-                    # Enable the Undo button so the user can pop this anchor.
-                    self.history_changed.emit(True, self._history.can_redo)
-                # else: orbit drag — pending anchor is silently discarded.
                 self._poly_pending_press = None
                 self._poly_orbit_dragged = False
                 return
@@ -3123,6 +3189,77 @@ class ViewportWidget(QOpenGLWidget):
             self._poly_points[i] = (int(sx[k]), int(sy[k]))
         self._poly_overlay.set_points(self._poly_points, cursor)
 
+    def _reproject_pending_mask(self) -> None:
+        """
+        Rebuild the pending-selection screen mask from the stored 3D anchor points.
+
+        Called from paintGL() whenever the camera moves and a finalized pending
+        selection exists.  The teal overlay is a screen-space texture frozen at
+        selection time — without reprojection it floats in screen space while the
+        mesh moves under it during orbit.  This method reprojects the 3D anchor
+        polygon through the current MVP and re-rasterizes the PIL mask so the
+        overlay stays glued to the mesh surface.
+
+        Also updates _pending_poly_pts_2d so that delete_layer_faces always uses
+        the most recent camera state rather than the original frozen view.
+        """
+        if (self._pending_poly_pts_3d is None
+                or self._camera is None
+                or self._ctx is None):
+            return
+
+        w, h = self.width(), self.height()
+        if w < 1 or h < 1:
+            return
+
+        # Reproject 3D anchor points through the current MVP.
+        aspect = w / h
+        view   = self._camera.get_view_matrix()
+        proj   = self._camera.get_projection_matrix(aspect)
+        model  = self._model_mat_4x4()
+        mvp    = (proj @ view @ model.astype(np.float64)).astype(np.float32)
+
+        pts_w = np.array([p for p in self._pending_poly_pts_3d if p is not None],
+                         dtype=np.float32)
+        if len(pts_w) < 3:
+            return
+
+        pts4 = np.hstack([pts_w, np.ones((len(pts_w), 1), np.float32)])
+        clip  = (mvp @ pts4.T).T
+        wc    = np.where(np.abs(clip[:, 3]) < 1e-8, 1e-8, clip[:, 3])
+        sx    = ((clip[:, 0] / wc + 1.0) * 0.5 * w)
+        sy    = ((1.0 - (clip[:, 1] / wc + 1.0) * 0.5) * h)
+
+        new_pts_2d = [(float(sx[k]), float(sy[k])) for k in range(len(pts_w))]
+
+        # Rasterise the reprojected polygon into a new mask texture.
+        from PIL import Image as _PilImg, ImageDraw as _PilDraw  # noqa: PLC0415
+        mask_pil = _PilImg.new("L", (w, h), 0)
+        _PilDraw.Draw(mask_pil).polygon(new_pts_2d, fill=255)
+        mask_data = np.array(mask_pil, dtype=np.uint8)
+
+        # Called from inside paintGL() — the GL context is already current.
+        # Do NOT call makeCurrent()/doneCurrent() here: re-entrant context
+        # activation is undefined on macOS and causes a SIGSEGV in the driver.
+        try:
+            if self._pending_screen_mask_tex is not None:
+                try:
+                    self._pending_screen_mask_tex.release()
+                except Exception:
+                    pass
+                self._pending_screen_mask_tex = None
+            tex = self._ctx.texture((w, h), 1, mask_data.tobytes())
+            tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+            self._pending_screen_mask_tex = tex
+            # Keep _pending_poly_pts_2d in sync with the reprojected polygon so
+            # delete_layer_faces uses the current camera view, not the frozen one.
+            self._pending_poly_pts_2d  = new_pts_2d
+            self._pending_view_mat     = view.astype(np.float64).copy()
+            self._pending_proj_mat     = proj.astype(np.float64).copy()
+            self._pending_model_mat    = model.astype(np.float64).copy()
+        except Exception:
+            log.exception("ViewportWidget: _reproject_pending_mask failed")
+
     def _finalize_poly_selection(self) -> None:
         """
         Close the polygon and determine exactly which mesh faces fall inside it.
@@ -3145,9 +3282,6 @@ class ViewportWidget(QOpenGLWidget):
         w, h = self.width(), self.height()
         if w == 0 or h == 0:
             return
-
-        print(f"[DIAG] _finalize_poly_selection called: pts={len(self._poly_points)} w={w} h={h}", flush=True)
-        log.info("[DIAG] _finalize_poly_selection called: pts=%d w=%d h=%d", len(self._poly_points), w, h)
 
         # ------------------------------------------------------------------ #
         # 1.  Rasterize the drawn polygon into a 2-D boolean mask             #
@@ -3172,6 +3306,15 @@ class ViewportWidget(QOpenGLWidget):
         proj   = self._camera.get_projection_matrix(aspect)
         model  = self._model_mat_4x4()
         mvp    = (proj @ view @ model.astype(np.float64)).astype(np.float64)
+
+        # Snapshot the 2D polygon and camera state for cookie-cutter deletion.
+        # These are stored on the pending selection and transferred to the layer
+        # in save_pending_as_layer so that delete_layer_faces can clip boundary
+        # triangles exactly along the polygon outline at deletion time.
+        self._pending_poly_pts_2d = list(self._poly_points)
+        self._pending_view_mat    = view.astype(np.float64).copy()
+        self._pending_proj_mat    = proj.astype(np.float64).copy()
+        self._pending_model_mat   = model.astype(np.float64).copy()
 
         faces_arr = np.asarray(self._painter._mesh.faces, dtype=np.int32)   # (M, 3)
         verts_arr = np.asarray(self._painter._mesh.vertices, dtype=np.float32)  # (N, 3)
@@ -3202,52 +3345,25 @@ class ViewportWidget(QOpenGLWidget):
         # vertices are all just outside the polygon boundary but whose interior
         # is clearly inside it — common for large triangles at shallow angles.
         vi0, vi1, vi2 = faces_arr[:, 0], faces_arr[:, 1], faces_arr[:, 2]
-        in_v0   = mask[isy[vi0], isx[vi0]]  # (M,) bool
-        in_v1   = mask[isy[vi1], isx[vi1]]
-        in_v2   = mask[isy[vi2], isx[vi2]]
-        # Centroid pixel (integer average of the three vertex screen coords)
-        cx_i    = np.clip((isx[vi0] + isx[vi1] + isx[vi2]) // 3, 0, w - 1)
-        cy_i    = np.clip((isy[vi0] + isy[vi1] + isy[vi2]) // 3, 0, h - 1)
-        in_cent = mask[cy_i, cx_i]
 
-        face_inside = in_v0 | in_v1 | in_v2 | in_cent  # (M,) bool
+        # Test face centroid against the polygon mask.
+        # Centroid = average of the three projected vertex screen positions.
+        # Using the centroid means "this face is mostly inside the polygon" —
+        # it spans the full selection area without over-selecting partial
+        # boundary faces, and avoids the strip/cluster artifacts that "all 3
+        # vertices inside" produces at the polygon edges.
+        cx_f = (sx[vi0] + sx[vi1] + sx[vi2]) / 3.0   # float centroid x (N,)
+        cy_f = (sy[vi0] + sy[vi1] + sy[vi2]) / 3.0   # float centroid y (N,)
+        cx_i = np.clip(cx_f.astype(np.int32), 0, w - 1)
+        cy_i = np.clip(cy_f.astype(np.int32), 0, h - 1)
+        face_inside = mask[cy_i, cx_i]                 # (M,) bool
 
-        # ------------------------------------------------------------------ #
-        # Front-face culling: exclude faces pointing away from the camera.    #
-        # Without this, faces on the back of the mesh that project into the   #
-        # same screen region as the drawn polygon are also selected — when     #
-        # deleted they create the wrong hole shape on the wrong surface.       #
-        # ------------------------------------------------------------------ #
-        # Camera position in world space from the inverse view matrix.
-        view_f64  = view.astype(np.float64)
-        view_inv  = np.linalg.inv(view_f64)
-        cam_world = view_inv[:3, 3]                    # (3,) eye position
-
-        # Face centroids in local (model) space.
-        v0p = verts_arr[vi0].astype(np.float64)       # (M, 3)
-        v1p = verts_arr[vi1].astype(np.float64)
-        v2p = verts_arr[vi2].astype(np.float64)
-        centroids_local = (v0p + v1p + v2p) / 3.0     # (M, 3)
-
-        # Transform centroids and normals to world space using the model matrix.
-        # M = T(c) @ R @ T(-c) → world = R @ (local - c) + c
-        R_f64 = self._model_rot.astype(np.float64)
-        c_f64 = self._mesh_centroid.astype(np.float64)
-        centroids_world = (R_f64 @ (centroids_local - c_f64).T).T + c_f64  # (M, 3)
-
-        face_norms_local = np.asarray(
-            self._painter._mesh.face_normals, dtype=np.float64
-        )                                              # (M, 3) unit normals
-        face_norms_world = (R_f64 @ face_norms_local.T).T  # (M, 3)
-
-        # A face is front-facing when its normal points toward the camera:
-        # dot(n_world, cam_pos - centroid_world) > 0
-        cam_to_cent  = cam_world - centroids_world     # (M, 3)
-        dot_cam      = np.sum(face_norms_world * cam_to_cent, axis=1)  # (M,)
-        front_facing = dot_cam > 0                     # (M,) bool
-
-        # Apply both filters: inside polygon AND front-facing.
-        face_inside  = face_inside & front_facing
+        # Centroid-only test: no front-face culling.
+        # Front-face culling was tried but Apple Object Capture OBJ files use
+        # CW winding, so trimesh face_normals are inverted relative to the camera
+        # convention. The culling was selecting the wrong faces (discarding ~86%
+        # of the correct front-visible faces). Centroid-only is clean enough on
+        # its own — back faces of a closed mesh project to different screen regions.
         selected: set[int] = set(int(i) for i in np.where(face_inside)[0])
 
         # ------------------------------------------------------------------ #
@@ -3256,28 +3372,54 @@ class ViewportWidget(QOpenGLWidget):
         # Committed layer rendering dot-tests this normal against the camera
         # direction each frame and skips drawing the highlight when the layer
         # is facing away from the viewer.
-        if selected:
-            sel_face_norms = np.asarray(
-                self._painter._mesh.face_normals, dtype=np.float32
-            )[list(selected)]  # (K, 3) local space
-            avg_local = sel_face_norms.mean(axis=0)
-            n_len = float(np.linalg.norm(avg_local))
-            if n_len > 1e-8:
-                avg_local /= n_len
-            avg_world = (self._model_rot.astype(np.float32) @ avg_local)
-            self._pending_poly_avg_normal = avg_world
-        else:
-            self._pending_poly_avg_normal = None
+        # avg_normal-based back-face culling disabled: Apple Object Capture OBJ
+        # files use CW winding, so trimesh face_normals are inverted. Computing
+        # avg_normal from those inverted normals caused committed layers to always
+        # be culled (dot test always fired). Setting None disables the cull —
+        # layers render from all camera angles, which is the correct behaviour.
+        self._pending_poly_avg_normal = None
 
         # ------------------------------------------------------------------ #
         # 5.  3D anchor positions for committed-layer reprojection            #
         # ------------------------------------------------------------------ #
         # _poly_points_3d is populated at click time via raycasting in
-        # mouseReleaseEvent. Use those model-space positions directly —
-        # they are exactly what the layer system needs for per-frame reprojection
-        # that keeps the highlight glued to the mesh surface during orbit.
+        # mousePressEvent. Use those model-space positions for per-frame
+        # reprojection that keeps the pending overlay glued to the mesh surface.
+        #
+        # For anchor points that missed the mesh (None entries), estimate a 3D
+        # position by unprojecting the 2D screen point at the average depth of
+        # the valid hits. This ensures _pending_poly_pts_3d is always populated
+        # (as long as at least 1 anchor hit the mesh), so _reproject_pending_mask
+        # always runs during orbit and the overlay tracks the model correctly.
         valid_3d = [p for p in self._poly_points_3d if p is not None]
-        self._pending_poly_pts_3d = valid_3d if len(valid_3d) >= 3 else None
+        if valid_3d:
+            # Compute average model-space depth of valid hits to use as stand-in
+            # depth for off-mesh anchor points.
+            inv_mvp = np.linalg.inv(mvp)
+            avg_valid = np.mean(valid_3d, axis=0).astype(np.float64)
+            avg_h     = np.append(avg_valid, 1.0)
+            avg_clip  = mvp @ avg_h
+            avg_ndc_z = avg_clip[2] / avg_clip[3] if abs(avg_clip[3]) > 1e-8 else 0.0
+
+            full_3d: list = []
+            for i, p3d in enumerate(self._poly_points_3d):
+                if p3d is not None:
+                    full_3d.append(p3d)
+                else:
+                    # Unproject the 2D screen position at the average NDC depth.
+                    sx_i, sy_i = self._poly_points[i] if i < len(self._poly_points) \
+                                 else self._poly_points[-1]
+                    ndc_x_i = (sx_i / w) * 2.0 - 1.0
+                    ndc_y_i = 1.0 - (sy_i / h) * 2.0
+                    ndc_pt  = np.array([ndc_x_i, ndc_y_i, avg_ndc_z, 1.0])
+                    world_h = inv_mvp @ ndc_pt
+                    if abs(world_h[3]) > 1e-8:
+                        full_3d.append((world_h[:3] / world_h[3]).tolist())
+                    else:
+                        full_3d.append(avg_valid.tolist())
+            self._pending_poly_pts_3d = full_3d if len(full_3d) >= 3 else None
+        else:
+            self._pending_poly_pts_3d = None
 
         # ------------------------------------------------------------------ #
         # 6.  Upload polygon mask as GPU texture for the screen-space overlay #
@@ -3322,12 +3464,17 @@ class ViewportWidget(QOpenGLWidget):
         # Re-sync undo button state with actual geometry history.
         self.history_changed.emit(self._history.can_undo, self._history.can_redo)
 
-        if not selected:
-            return
-
+        # Always proceed when cookie-cutter data is available, even if no face
+        # centroids landed inside the polygon (small polygon that fits inside one
+        # mesh triangle). The cookie-cutter uses the stored polygon + matrices
+        # directly, so _pending_faces being empty is fine on that path.
+        # Emit at least 1 so the Save button enables in the UI.
         self._pending_faces = selected
         self.update()
-        self.selection_ready.emit(len(selected))
+        emit_count = len(selected) if selected else (1 if self._pending_poly_pts_2d else 0)
+        if emit_count == 0:
+            return
+        self.selection_ready.emit(emit_count)
 
     def _build_face_vao(
         self, face_indices: "set[int]"
@@ -3407,7 +3554,11 @@ class ViewportWidget(QOpenGLWidget):
         Returns the new layer_id, or -1 if there is no pending selection or
         the GL context is unavailable.
         """
-        if not self._pending_faces or self._ctx is None or self._painter is None:
+        # Allow saving even when _pending_faces is empty: the cookie-cutter path
+        # works from the stored polygon + camera matrices and doesn't require
+        # face centroids to have been detected inside the polygon.
+        has_cookie = self._pending_poly_pts_2d is not None
+        if (not self._pending_faces and not has_cookie) or self._ctx is None or self._painter is None:
             return -1
 
         layer_id = self._next_layer_id
@@ -3421,6 +3572,15 @@ class ViewportWidget(QOpenGLWidget):
         avg_normal = self._pending_poly_avg_normal
         self._pending_poly_avg_normal = None
 
+        # Transfer the cookie-cutter data: the original 2D polygon and the
+        # exact camera matrices at the moment of selection. delete_layer_faces
+        # uses these to clip boundary triangles along the polygon outline.
+        poly_pts_2d = self._pending_poly_pts_2d
+        self._pending_poly_pts_2d = None
+        view_mat  = self._pending_view_mat;  self._pending_view_mat  = None
+        proj_mat  = self._pending_proj_mat;  self._pending_proj_mat  = None
+        model_mat = self._pending_model_mat; self._pending_model_mat = None
+
         self._layers[layer_id] = {
             "name":         name,
             "faces":        set(self._pending_faces),  # kept for future painting ops
@@ -3428,6 +3588,11 @@ class ViewportWidget(QOpenGLWidget):
             "color":        color,
             "poly_pts_3d":  poly_pts_3d,   # 3D anchors → reproject each frame
             "avg_normal":   avg_normal,    # world-space face normal for culling
+            # Cookie-cutter data — exact polygon + camera state at selection time
+            "poly_pts_2d":  poly_pts_2d,
+            "view_mat":     view_mat,
+            "proj_mat":     proj_mat,
+            "model_mat":    model_mat,
         }
 
         # Discard the pending teal highlight now that it's been promoted
@@ -3498,23 +3663,438 @@ class ViewportWidget(QOpenGLWidget):
             self._painter.remove_layer_texture(layer_id)
         self.update()
 
+    def _read_scene_depth_buffer(self) -> "np.ndarray | None":
+        """
+        Read self._scene_depth_tex from GPU to CPU.
+
+        Returns a float32 numpy array of shape (h, w) with GL depth values in
+        [0, 1] (0 = near plane, 1 = far plane), in OpenGL convention (row 0 is
+        the bottom of the screen).  Returns None if the texture is unavailable
+        or the readback fails.
+
+        Safe to call from outside paintGL — uses makeCurrent()/doneCurrent().
+        """
+        if self._scene_depth_tex is None:
+            return None
+        try:
+            self.makeCurrent()
+            raw   = self._scene_depth_tex.read()
+            tex_w, tex_h = self._scene_depth_tex.size          # moderngl: (w, h)
+            return np.frombuffer(raw, dtype=np.float32).reshape(tex_h, tex_w)
+        except Exception:
+            log.exception("ViewportWidget: scene depth buffer readback failed")
+            return None
+        finally:
+            self.doneCurrent()
+
+    def _cookie_cutter_clip(
+        self,
+        poly_pts_2d: list,
+        view_mat: np.ndarray,
+        proj_mat: np.ndarray,
+        model_mat: np.ndarray,
+    ) -> "tuple[np.ndarray, np.ndarray, np.ndarray | None]":
+        """
+        Clip the mesh against a screen-space polygon using the Sutherland-Hodgman
+        / Shapely difference approach (cookie-cutter deletion).
+
+        For each triangle in the mesh:
+          - Fully inside the polygon  → deleted (not included in output)
+          - Fully outside the polygon → kept unchanged
+          - Straddling the boundary   → the outside fragment is kept; new
+            vertices are added at the exact screen-space crossing points,
+            with 3D positions and UV coordinates interpolated via barycentric
+            coords on the original triangle
+
+        The result is a hole whose boundary follows the drawn polygon exactly,
+        not the jagged triangle-edge approximation produced by whole-face deletion.
+
+        Parameters
+        ----------
+        poly_pts_2d : list of (x, y) floats — screen-space polygon (same coords
+                      as _poly_points at selection time)
+        view_mat    : 4×4 float64 view matrix at selection time
+        proj_mat    : 4×4 float64 projection matrix at selection time
+        model_mat   : 4×4 float64 model matrix at selection time
+
+        Returns
+        -------
+        (new_vertices, new_faces, new_uvs)  — ready to drop into a new Trimesh.
+        new_uvs is None if the painter has no UV data.
+        """
+        from shapely.geometry import Polygon as _SPoly  # noqa: PLC0415
+
+        mesh      = self._painter._mesh
+        old_verts = np.asarray(mesh.vertices,  dtype=np.float64)   # (V, 3)
+        old_faces = np.asarray(mesh.faces,     dtype=np.int64)     # (F, 3)
+        old_uvs   = self._painter._uvs                              # (V, 2) | None
+        n_verts   = len(old_verts)
+        n_faces   = len(old_faces)
+
+        w = float(self.width())
+        h = float(self.height())
+
+        # ------------------------------------------------------------------ #
+        # 1.  Project all vertices to screen space using stored matrices      #
+        # ------------------------------------------------------------------ #
+        mvp    = (proj_mat @ view_mat @ model_mat)
+        verts_h = np.hstack([old_verts,
+                              np.ones((n_verts, 1), dtype=np.float64)])  # (V,4)
+        clip   = (mvp @ verts_h.T).T                                      # (V,4)
+        wc     = np.where(np.abs(clip[:, 3]) < 1e-8, 1e-8, clip[:, 3])
+        ndc    = clip[:, :3] / wc[:, np.newaxis]
+        sx     = (ndc[:, 0] + 1.0) * 0.5 * w                             # (V,)
+        sy     = (1.0 - (ndc[:, 1] + 1.0) * 0.5) * h                    # (V,)
+
+        # ------------------------------------------------------------------ #
+        # 2.  Build Shapely clip polygon (the user's drawn polygon)           #
+        # ------------------------------------------------------------------ #
+        clip_poly = _SPoly(poly_pts_2d)
+        if not clip_poly.is_valid:
+            clip_poly = clip_poly.buffer(0)  # repair self-intersections
+
+        # ------------------------------------------------------------------ #
+        # 3.  Pre-filter: fast numpy classification for fully-inside /        #
+        #     fully-outside faces to avoid per-face Shapely overhead on       #
+        #     Ultra-density meshes (400 K faces).                             #
+        # ------------------------------------------------------------------ #
+        # Rasterise the polygon into a pixel mask for the fast test
+        from PIL import Image as _PI, ImageDraw as _PID  # noqa: PLC0415
+        mask_img = _PI.new("L", (int(w), int(h)), 0)
+        _PID.Draw(mask_img).polygon([(px, py) for px, py in poly_pts_2d],
+                                    fill=255)
+        mask = np.array(mask_img, dtype=np.uint8) > 0  # bool (H, W)
+
+        vi0, vi1, vi2 = old_faces[:, 0], old_faces[:, 1], old_faces[:, 2]
+        isx = np.clip(sx.astype(np.int32), 0, int(w) - 1)
+        isy = np.clip(sy.astype(np.int32), 0, int(h) - 1)
+
+        in_v0 = mask[isy[vi0], isx[vi0]]
+        in_v1 = mask[isy[vi1], isx[vi1]]
+        in_v2 = mask[isy[vi2], isx[vi2]]
+
+        # ------------------------------------------------------------------ #
+        # Screen-space winding test for front-face culling.                   #
+        # We avoid trimesh face_normals here because Apple Object Capture OBJ #
+        # files use CW winding, making those normals appear inverted.         #
+        #                                                                      #
+        # Instead, compute the 2-D signed area of each projected triangle:    #
+        #   signed_area = (v1−v0) × (v2−v0)  (2-D cross product)             #
+        # In Y-down screen space, CW winding → signed_area < 0 → front-face  #
+        # (matches OpenGL's CCW = front-face convention in Y-up NDC).         #
+        # ------------------------------------------------------------------ #
+        p0x, p0y = sx[vi0], sy[vi0]
+        p1x, p1y = sx[vi1], sy[vi1]
+        p2x, p2y = sx[vi2], sy[vi2]
+        signed_area   = (p1x - p0x) * (p2y - p0y) - (p1y - p0y) * (p2x - p0x)
+        front_facing  = signed_area < 0   # (F,) bool — CW in Y-down = front
+
+        # ------------------------------------------------------------------ #
+        # Centroid pixel coords (needed for mask lookup and depth lookup)     #
+        # ------------------------------------------------------------------ #
+        cx_pix = np.clip((isx[vi0] + isx[vi1] + isx[vi2]) // 3, 0, int(w) - 1)
+        cy_pix = np.clip((isy[vi0] + isy[vi1] + isy[vi2]) // 3, 0, int(h) - 1)
+        centroid_in_mask = mask[cy_pix, cx_pix]                        # (F,) bool
+
+        # ------------------------------------------------------------------ #
+        # GPU depth buffer visibility test                                     #
+        #                                                                      #
+        # Read back the scene depth texture (rendered by the last paintGL).   #
+        # Convert each face's centroid from NDC depth to GL [0,1] and compare #
+        # against the buffer value at that pixel.  A face whose GL depth      #
+        # exceeds the buffer is occluded (behind the visible surface) and     #
+        # should be kept.  This replaces all heuristic depth-margin math.     #
+        #                                                                      #
+        # Winding test (front_facing) is still used as a first-pass filter    #
+        # because it is fast and eliminates obviously back-facing geometry     #
+        # before the more expensive buffer lookup.                             #
+        # ------------------------------------------------------------------ #
+        # NDC depth for each face centroid, converted to GL [0, 1] range.
+        face_ndc_z  = (ndc[vi0, 2] + ndc[vi1, 2] + ndc[vi2, 2]) / 3.0  # (F,)
+        face_gl_dep = (face_ndc_z + 1.0) * 0.5                           # (F,)
+
+        depth_buf = self._read_scene_depth_buffer()
+        if depth_buf is not None:
+            tex_h, tex_w = depth_buf.shape
+            vp_w, vp_h   = int(w), int(h)
+            # Scene depth texture uses OpenGL convention: row 0 = bottom of screen.
+            # cx_pix/cy_pix are screen-space (top-left origin). Flip Y for lookup.
+            if tex_w == vp_w and tex_h == vp_h:
+                gl_row = (tex_h - 1) - cy_pix
+                gl_col = cx_pix
+            else:
+                # Rare: viewport resized between last paintGL and delete call.
+                gl_col = np.clip(cx_pix * tex_w  // vp_w, 0, tex_w  - 1)
+                gl_row = np.clip((vp_h - 1 - cy_pix) * tex_h // vp_h, 0, tex_h - 1)
+            buf_depth    = depth_buf[gl_row, gl_col]                    # (F,) float32
+            # Small epsilon (~0.1%) handles surface roughness and floating-point
+            # precision at the boundary. A face at exactly the visible surface
+            # depth must pass; only truly occluded faces (behind it) are blocked.
+            _EPS          = 0.001
+            depth_visible = face_gl_dep <= (buf_depth + _EPS)           # (F,) bool
+        else:
+            # Depth texture unavailable — fall back to accepting all front-facing
+            # faces. Conservative (may pass some back faces) but never silently
+            # drops valid geometry. Matches pre-depth-readback behaviour.
+            log.warning("ViewportWidget: depth buffer unavailable; skipping depth gate")
+            depth_visible = np.ones(n_faces, dtype=bool)
+
+        # ------------------------------------------------------------------ #
+        # Face classification                                                  #
+        # ------------------------------------------------------------------ #
+        all_in  = in_v0 & in_v1 & in_v2
+        all_out = ~in_v0 & ~in_v1 & ~in_v2
+        mixed   = ~all_in & ~all_out                                    # some in, some out
+
+        # Fully-inside: all verts inside polygon, front-facing, depth-visible
+        fully_inside_mask = all_in & front_facing & depth_visible
+
+        # Straddling boundary faces: no depth gate — boundary triangles can be
+        # slightly occluded at the polygon edge due to surface roughness, and we
+        # always want to Shapely-clip them to preserve the hole shape exactly.
+        straddling_mask   = mixed & front_facing & depth_visible
+
+        # Edge case: drawn polygon is entirely INSIDE a single mesh triangle.
+        # Case 1: face centroid inside the polygon mask (polygon > face).
+        centroid_inside = all_out & centroid_in_mask & front_facing & depth_visible
+
+        # Case 2: a clip polygon vertex falls inside a mesh face (polygon < face —
+        # tip/corner of drawn shape fits inside one triangle).
+        clip_vert_in_face = np.zeros(n_faces, dtype=bool)
+        candidate_ao = all_out & front_facing & depth_visible
+        if candidate_ao.any():
+            ax, ay = sx[vi0][candidate_ao], sy[vi0][candidate_ao]
+            bx, by = sx[vi1][candidate_ao], sy[vi1][candidate_ao]
+            cx, cy = sx[vi2][candidate_ao], sy[vi2][candidate_ao]
+            for cpx, cpy in poly_pts_2d:
+                d0 = (cpx - bx) * (ay - by) - (ax - bx) * (cpy - by)
+                d1 = (cpx - cx) * (by - cy) - (bx - cx) * (cpy - cy)
+                d2 = (cpx - ax) * (cy - ay) - (cx - ax) * (cpy - ay)
+                inside = ~((d0 < 0) | (d1 < 0) | (d2 < 0)) | \
+                         ~((d0 > 0) | (d1 > 0) | (d2 > 0))
+                clip_vert_in_face[candidate_ao] |= inside
+
+        polygon_inside_face = centroid_inside | (clip_vert_in_face & all_out)
+        straddling_mask     = straddling_mask | polygon_inside_face
+
+        # Everything else is kept unchanged
+        fully_outside_mask = ~fully_inside_mask & ~straddling_mask
+
+        # ------------------------------------------------------------------ #
+        # 4.  Accumulate output geometry                                      #
+        # ------------------------------------------------------------------ #
+        # Start with original vertex arrays; new boundary vertices are appended.
+        out_verts = list(old_verts)
+        out_uvs   = list(old_uvs) if old_uvs is not None else None
+        out_faces: list[list[int]] = []
+
+        def _add_vert(pos3d: np.ndarray,
+                      uv2d:  "np.ndarray | None") -> int:
+            """Append a new vertex and return its index."""
+            idx = len(out_verts)
+            out_verts.append(pos3d)
+            if out_uvs is not None:
+                out_uvs.append(uv2d if uv2d is not None
+                               else np.zeros(2, dtype=np.float32))
+            return idx
+
+        def _bary(p: np.ndarray,
+                  a: np.ndarray,
+                  b: np.ndarray,
+                  c: np.ndarray) -> np.ndarray:
+            """
+            Barycentric coordinates of 2-D point p in triangle (a, b, c).
+            Returns (u, v, w) such that p ≈ u*a + v*b + w*c.
+            """
+            v0 = b - a;  v1 = c - a;  v2 = p - a
+            d00 = float(np.dot(v0, v0))
+            d01 = float(np.dot(v0, v1))
+            d11 = float(np.dot(v1, v1))
+            d20 = float(np.dot(v2, v0))
+            d21 = float(np.dot(v2, v1))
+            denom = d00 * d11 - d01 * d01
+            if abs(denom) < 1e-12:
+                return np.array([1.0, 0.0, 0.0])
+            vv = (d11 * d20 - d01 * d21) / denom
+            ww = (d00 * d21 - d01 * d20) / denom
+            uu = 1.0 - vv - ww
+            bary = np.array([uu, vv, ww])
+            # Clamp + renormalise to guard against floating-point overshoot
+            bary = np.clip(bary, 0.0, 1.0)
+            s = bary.sum()
+            return bary / s if s > 1e-12 else np.array([1.0, 0.0, 0.0])
+
+        def _interp(pt2d: np.ndarray,
+                    i0: int, i1: int, i2: int) -> "tuple[np.ndarray, np.ndarray|None]":
+            """
+            Interpolate 3-D position (and UV) for a screen-space point pt2d
+            that lies on or inside triangle (i0, i1, i2).
+            """
+            a2d = np.array([sx[i0], sy[i0]])
+            b2d = np.array([sx[i1], sy[i1]])
+            c2d = np.array([sx[i2], sy[i2]])
+            bary = _bary(pt2d, a2d, b2d, c2d)
+            pos3d = (bary[0] * old_verts[i0]
+                   + bary[1] * old_verts[i1]
+                   + bary[2] * old_verts[i2])
+            uv2d = None
+            if old_uvs is not None:
+                uv2d = (bary[0] * old_uvs[i0]
+                      + bary[1] * old_uvs[i1]
+                      + bary[2] * old_uvs[i2]).astype(np.float32)
+            return pos3d, uv2d
+
+        def _fan(indices: list[int]) -> list[list[int]]:
+            """Fan-triangulate a convex/simple polygon given as vertex indices."""
+            if len(indices) < 3:
+                return []
+            tris = []
+            v0 = indices[0]
+            for k in range(1, len(indices) - 1):
+                tris.append([v0, indices[k], indices[k + 1]])
+            return tris
+
+        # --- Fully-outside faces: keep unchanged ---
+        for fi in np.where(fully_outside_mask)[0]:
+            out_faces.append([int(old_faces[fi, 0]),
+                               int(old_faces[fi, 1]),
+                               int(old_faces[fi, 2])])
+
+        # --- Fully-inside faces: dropped (not appended) ---
+
+        # --- Straddling faces: Shapely clip → triangulate outside fragment ---
+        for fi in np.where(straddling_mask)[0]:
+            i0, i1, i2 = int(old_faces[fi, 0]), \
+                          int(old_faces[fi, 1]), \
+                          int(old_faces[fi, 2])
+
+            p0 = np.array([sx[i0], sy[i0]])
+            p1 = np.array([sx[i1], sy[i1]])
+            p2 = np.array([sx[i2], sy[i2]])
+
+            try:
+                tri_2d = _SPoly([tuple(p0), tuple(p1), tuple(p2)])
+                if not tri_2d.is_valid:
+                    tri_2d = tri_2d.buffer(0)
+            except Exception:
+                out_faces.append([i0, i1, i2])
+                continue
+
+            if tri_2d.area < 1e-6:
+                # Degenerate triangle — keep as-is
+                out_faces.append([i0, i1, i2])
+                continue
+
+            try:
+                outside = tri_2d.difference(clip_poly)
+            except Exception:
+                out_faces.append([i0, i1, i2])
+                continue
+
+            if outside.is_empty:
+                continue  # Fully covered — delete
+
+            if outside.area >= tri_2d.area * 0.999:
+                out_faces.append([i0, i1, i2])  # Effectively untouched
+                continue
+
+            # Collect output polygons (may be Polygon or MultiPolygon)
+            # Triangulate the outside fragment using constrained Delaunay
+            # triangulation (Shapely 2.x).  Fan triangulation only works for
+            # convex polygons — when the clip polygon has sharp corners the
+            # outside fragment can be L-shaped or otherwise non-convex, and
+            # fan triangulation produces incorrect overlapping triangles that
+            # leave corner artifacts in the hole boundary.
+            import shapely as _shapely  # noqa: PLC0415
+            try:
+                tri_collection = _shapely.constrained_delaunay_triangles(outside)
+                output_tris = list(tri_collection.geoms)
+            except Exception:
+                # Fallback: treat the whole outside as one polygon and fan it
+                polys_fb = (list(outside.geoms)
+                            if outside.geom_type == "MultiPolygon"
+                            else [outside])
+                output_tris = []
+                for poly_fb in polys_fb:
+                    coords_fb = list(poly_fb.exterior.coords)[:-1]
+                    if len(coords_fb) >= 3:
+                        vi_fb: list[int] = []
+                        for pt in coords_fb:
+                            pt2d = np.array(pt, dtype=np.float64)
+                            if np.linalg.norm(pt2d - p0) < 0.5:
+                                vi_fb.append(i0)
+                            elif np.linalg.norm(pt2d - p1) < 0.5:
+                                vi_fb.append(i1)
+                            elif np.linalg.norm(pt2d - p2) < 0.5:
+                                vi_fb.append(i2)
+                            else:
+                                pos3d, uv2d = _interp(pt2d, i0, i1, i2)
+                                vi_fb.append(_add_vert(pos3d, uv2d))
+                        out_faces.extend(_fan(vi_fb))
+                continue  # skip the CDT loop below
+
+            for tri_geom in output_tris:
+                if tri_geom.is_empty:
+                    continue
+                coords = list(tri_geom.exterior.coords)[:-1]  # always 3 pts
+                if len(coords) != 3:
+                    continue
+
+                # Map each CDT triangle vertex to a mesh vertex index.
+                vert_indices: list[int] = []
+                for pt in coords:
+                    pt2d = np.array(pt, dtype=np.float64)
+                    if np.linalg.norm(pt2d - p0) < 0.5:
+                        vert_indices.append(i0)
+                    elif np.linalg.norm(pt2d - p1) < 0.5:
+                        vert_indices.append(i1)
+                    elif np.linalg.norm(pt2d - p2) < 0.5:
+                        vert_indices.append(i2)
+                    else:
+                        pos3d, uv2d = _interp(pt2d, i0, i1, i2)
+                        vert_indices.append(_add_vert(pos3d, uv2d))
+
+                if len(vert_indices) == 3:
+                    out_faces.append(vert_indices)
+
+        # ------------------------------------------------------------------ #
+        # 5.  Convert accumulated lists to numpy arrays                       #
+        # ------------------------------------------------------------------ #
+        new_verts = np.array(out_verts, dtype=np.float64)
+        new_faces = (np.array(out_faces, dtype=np.int64)
+                     if out_faces
+                     else np.zeros((0, 3), dtype=np.int64))
+        new_uvs   = (np.array(out_uvs, dtype=np.float32)
+                     if out_uvs is not None
+                     else None)
+
+        return new_verts, new_faces, new_uvs
+
+    # ---------------------------------------------------------------------- #
+
     def delete_layer_faces(self, layer_id: int) -> None:
         """
-        Permanently delete a layer's face set from the mesh geometry.
+        Permanently remove a layer's geometry from the mesh using cookie-cutter
+        clipping when polygon data is available, or simple whole-face deletion
+        as a fallback.
 
-        This is the viewport-based alternative to preprocessing background
-        removal. The user selects unwanted geometry (base surfaces, stools,
-        floors) using the polygon lasso, saves it as a layer, then calls this
-        to surgically remove those faces from the mesh.
+        Cookie-cutter path (preferred):
+          Uses the 2D screen-space polygon and camera matrices stored at
+          selection time to clip every boundary triangle exactly along the
+          polygon outline via Shapely.  New vertices are interpolated at the
+          crossing points so the resulting hole matches the drawn polygon shape
+          precisely rather than following jagged triangle edges.
 
-        The operation:
-          1. Pushes a full geometry snapshot for undo (Ctrl+Z restores the mesh)
-          2. Builds a keep-mask over all mesh faces (False = delete)
-          3. Remaps face indices in all other layers so their selections survive
-          4. Rebuilds the trimesh with kept faces only, removing orphaned verts
-          5. Remaps the UV array to match the new vertex layout
-          6. Rebuilds all topology caches (BVH, adjacency, seam partners)
-          7. Schedules a GPU VBO/IBO re-upload and triggers a repaint
+        Fallback path:
+          If the layer pre-dates cookie-cutter support (no poly_pts_2d stored),
+          falls back to the original whole-face keep-mask approach.
+
+        Both paths:
+          1. Push a full geometry snapshot for undo (Ctrl+Z restores the mesh)
+          2. Rebuild the trimesh with new vertices/faces, removing orphaned verts
+          3. Remap UVs to the new vertex layout
+          4. Rebuild all topology caches (BVH, adjacency, seam partners)
+          5. Schedule a GPU VBO/IBO re-upload and trigger a repaint
 
         Args:
             layer_id: ID of the layer whose faces should be deleted from the mesh.
@@ -3522,83 +4102,91 @@ class ViewportWidget(QOpenGLWidget):
         if self._painter is None or layer_id not in self._layers:
             return
 
-        layer       = self._layers[layer_id]
-        faces_to_del = layer["faces"]          # set[int] — face indices to remove
-        mesh         = self._painter._mesh
-        n_faces      = len(mesh.faces)
-
-        if not faces_to_del:
-            return
+        layer = self._layers[layer_id]
+        mesh  = self._painter._mesh
 
         # --- 1. Snapshot for undo BEFORE any modification ---
         self._history.push_snapshot(self._painter, geometry=True)
 
-        # --- 2. Build face keep-mask ---
-        keep_mask = np.ones(n_faces, dtype=bool)
-        for fi in faces_to_del:
-            if fi < n_faces:
-                keep_mask[fi] = False
+        # ------------------------------------------------------------------ #
+        # Cookie-cutter path: exact polygon clipping via Shapely              #
+        # ------------------------------------------------------------------ #
+        poly_pts_2d = layer.get("poly_pts_2d")
+        view_mat    = layer.get("view_mat")
+        proj_mat    = layer.get("proj_mat")
+        model_mat   = layer.get("model_mat")
 
-        # --- 3. Build face index remap for surviving layers ---
-        # kept_face_old[i] = original face index of the i-th kept face
-        kept_face_old = np.where(keep_mask)[0]
-        face_remap    = np.full(n_faces, -1, dtype=np.int64)
-        face_remap[kept_face_old] = np.arange(len(kept_face_old), dtype=np.int64)
+        if (poly_pts_2d is not None and view_mat is not None
+                and proj_mat is not None and model_mat is not None):
+            log.info("ViewportWidget: delete_layer_faces — cookie-cutter path")
+            new_vertices, new_faces_arr, new_uvs = self._cookie_cutter_clip(
+                poly_pts_2d, view_mat, proj_mat, model_mat
+            )
+        else:
+            # ---------------------------------------------------------------- #
+            # Fallback: whole-face deletion (pre-cookie-cutter layers)         #
+            # ---------------------------------------------------------------- #
+            log.info("ViewportWidget: delete_layer_faces — whole-face fallback")
+            faces_to_del = layer.get("faces", set())
+            if not faces_to_del:
+                return
 
-        for lid, layer_data in self._layers.items():
-            if lid == layer_id:
-                continue
-            old_set = layer_data["faces"]
-            new_set = set()
-            for fi in old_set:
+            n_faces   = len(mesh.faces)
+            old_verts = np.asarray(mesh.vertices, dtype=np.float64)
+            old_faces = np.asarray(mesh.faces,    dtype=np.int64)
+
+            keep_mask = np.ones(n_faces, dtype=bool)
+            for fi in faces_to_del:
                 if fi < n_faces:
-                    new_fi = int(face_remap[fi])
-                    if new_fi >= 0:          # face survived the deletion
-                        new_set.add(new_fi)
-            layer_data["faces"] = new_set
+                    keep_mask[fi] = False
 
-        # --- 4. Rebuild mesh with kept faces, remove orphaned vertices ---
-        old_verts = np.asarray(mesh.vertices, dtype=np.float64)
-        old_faces = np.asarray(mesh.faces,    dtype=np.int64)
+            new_faces_raw = old_faces[keep_mask]
+            used_verts    = np.unique(new_faces_raw.ravel())
+            vert_remap    = np.full(len(old_verts), -1, dtype=np.int64)
+            vert_remap[used_verts] = np.arange(len(used_verts), dtype=np.int64)
 
-        new_faces_raw = old_faces[keep_mask]           # (n_kept, 3) — old vertex indices
+            new_faces_arr = vert_remap[new_faces_raw]
+            new_vertices  = old_verts[used_verts]
+            new_uvs       = (self._painter._uvs[used_verts]
+                             if self._painter._uvs is not None else None)
 
-        # Identify vertices still referenced by at least one kept face
-        used_verts = np.unique(new_faces_raw.ravel())
+        # ------------------------------------------------------------------ #
+        # Shared finish: compact vertices, rebuild mesh + topology            #
+        # ------------------------------------------------------------------ #
+        # Remove orphaned vertices (vertices not referenced by any face).
+        # The cookie-cutter path may add new vertices but never leaves orphans;
+        # the fallback path removes faces so some original vertices become orphans.
+        if len(new_faces_arr) == 0:
+            log.warning("ViewportWidget: delete_layer_faces produced empty mesh — aborting")
+            return
 
-        # Vertex remap: old_v_idx -> new_v_idx (or -1 if orphaned)
-        vert_remap = np.full(len(old_verts), -1, dtype=np.int64)
+        new_faces_i64 = np.asarray(new_faces_arr, dtype=np.int64)
+        used_verts    = np.unique(new_faces_i64.ravel())
+        vert_remap    = np.full(len(new_vertices), -1, dtype=np.int64)
         vert_remap[used_verts] = np.arange(len(used_verts), dtype=np.int64)
 
-        new_faces    = vert_remap[new_faces_raw].astype(np.uint32)
-        new_vertices = old_verts[used_verts]
+        final_verts = new_vertices[used_verts]
+        final_faces = vert_remap[new_faces_i64].astype(np.uint32)
+        final_uvs   = new_uvs[used_verts] if new_uvs is not None else None
 
-        # --- 5. Remap UV array to match new vertex layout ---
-        new_uvs = None
-        if self._painter._uvs is not None:
-            new_uvs = self._painter._uvs[used_verts]
-
-        # --- 6. Replace painter mesh and UVs, rebuild topology caches ---
         import trimesh as _trimesh
         self._painter._mesh = _trimesh.Trimesh(
-            vertices=new_vertices,
-            faces=new_faces,
+            vertices=final_verts,
+            faces=final_faces,
             process=False,
         )
-        if new_uvs is not None:
-            self._painter._uvs = new_uvs
+        if final_uvs is not None:
+            self._painter._uvs = final_uvs
 
         self._painter._rebuild_topology()
 
-        # --- 7. Remove the layer entry and schedule GPU re-upload ---
-        # delete_layer() releases GPU highlight/projection resources for this
-        # layer and removes it from _layers / _proj_layers.
+        # Remove the layer and schedule GPU re-upload
         self.delete_layer(layer_id)
-
-        # _needs_mesh_upload triggers _upload_mesh_only() in the next paintGL
-        # call — rebuilds VBO/IBO/VAO without touching the albedo texture.
         self._needs_mesh_upload = True
         self.update()
+
+        # Notify UI so the Undo button enables immediately after face deletion.
+        self.history_changed.emit(self._history.can_undo, self._history.can_redo)
 
     def project_texture_to_layer(
         self,

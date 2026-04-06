@@ -167,13 +167,13 @@ The viewport sits between the Process and Export pages. The pipeline auto-naviga
 - Undo/redo via a full command stack (`UndoStack` + `ICommand` ABC) — Ctrl+Z / Ctrl+Shift+Z
 
 **Polygon Selection + Layers**
-- Lasso tool: click to place polygon anchor points, Enter or double-click to finalize
-- Face-ID FBO rendering: mesh rendered offscreen with per-triangle 24-bit RGB-encoded face indices (depth-tested so occluded back-faces are automatically excluded)
-- Pixel-based selection: faces whose depth-tested pixels land inside the drawn polygon are selected — robust at all camera angles and triangle sizes
-- **Pending overlay**: screen-space mask texture composited as a teal highlight; visible before saving
-- **Committed overlay**: per-frame 3D anchor reprojection — polygon anchor points are baked to world-space surface positions via barycentric interpolation at save time, then reprojected through the current camera each frame. The highlight stays glued to the model surface from any orbit angle
-- **Back-face culling**: average face normal (world-space) computed at save time; each frame, `dot(avg_normal, camera_pos − centroid) > 0` hides the overlay when the camera is viewing from the back
-- **Layers panel** (left sidebar): each saved polygon selection appears as a named layer row with an eye toggle, color swatch, inline rename (double-click), and delete button
+- Lasso tool: click to place polygon anchor points (committed instantly on press), Enter or double-click to finalize
+- CPU/numpy face selection: every mesh vertex projected to screen space via MVP; faces selected when centroid lands inside the drawn polygon mask — no FBO, no DPR mismatch
+- **Pending overlay**: teal screen-space mask; reprojects from 3D anchor points each frame so the overlay tracks the mesh surface during orbit before saving
+- **Committed overlay**: per-frame 3D anchor reprojection — anchor points stored as world-space surface positions, reprojected through the current camera MVP each frame. The highlight stays glued to the model surface from any orbit angle
+- **Layers panel** (left sidebar): each saved polygon selection appears as a named layer row with an eye toggle, color swatch, inline rename (double-click), and delete button. All layers default to crimson; per-layer color is user-adjustable via the swatch
+- **Delete Faces — cookie-cutter clipping**: removes geometry with exact polygon-shaped holes rather than whole-face deletion. Uses Shapely `difference()` on screen-space projected triangles; boundary triangles are split exactly along the polygon outline and re-triangulated via constrained Delaunay triangulation. New boundary vertices are created at exact crossing points with 3D positions and UVs interpolated via barycentric coordinates. Supports Undo (Ctrl+Z)
+- **GPU depth buffer back-face guard**: face visibility determined by reading back the scene depth texture rendered by the last `paintGL` frame. Each candidate face's NDC centroid depth is compared against the buffer value at that pixel — faces deeper than the rendered surface are occluded and kept, eliminating blowout on the back of the mesh regardless of camera angle or surface curvature
 
 **Shader-Based Texture Projection**
 - Textures are projected onto the mesh via a dedicated GLSL second render pass — planar UV projection entirely in world-space, not UV-atlas space

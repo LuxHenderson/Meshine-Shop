@@ -43,16 +43,9 @@ log = logging.getLogger(__name__)
 
 # Palette of RGBA highlight colors (0-1 range) cycled through as layers are created.
 # Chosen to be visually distinct against the dark charcoal background.
-_LAYER_COLORS: list[tuple[float, float, float, float]] = [
-    (0.86, 0.27, 0.27, 0.40),  # crimson
-    (0.27, 0.67, 0.86, 0.40),  # sky blue
-    (0.27, 0.86, 0.47, 0.40),  # green
-    (0.86, 0.67, 0.27, 0.40),  # amber
-    (0.67, 0.27, 0.86, 0.40),  # violet
-    (0.86, 0.47, 0.27, 0.40),  # orange
-    (0.27, 0.86, 0.86, 0.40),  # teal
-    (0.86, 0.27, 0.67, 0.40),  # pink
-]
+# Default save color for all new layers. Users can change per-layer color via
+# the swatch in the layer row; this just sets the initial value on save.
+_DEFAULT_LAYER_COLOR: tuple[float, float, float, float] = (0.86, 0.27, 0.27, 0.40)  # crimson
 
 
 class _LayerRow(QWidget):
@@ -742,7 +735,7 @@ class ViewportLayersPanel(QWidget):
         # but resets to 1 when all layers have been deleted.
         next_num = max(self._layer_nums.values()) + 1 if self._layer_nums else 1
         name  = f"Layer {next_num}"
-        color = _LAYER_COLORS[(next_num - 1) % len(_LAYER_COLORS)]
+        color = _DEFAULT_LAYER_COLOR
 
         # Disable Save button immediately — user must draw a new polygon
         # before saving another layer.

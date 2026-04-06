@@ -290,6 +290,46 @@ The quality difference is the same as the difference between a 70K-sample textur
 
 ---
 
+### Challenge: Delete Faces removed triangles instead of exact polygon shapes
+
+**Problem:** The first Delete Faces implementation removed entire mesh triangles that fell inside the user's polygon selection. The result looked like a coarse approximation — the hole in the mesh was made of whole triangle edges, not the drawn polygon outline. Where the selection boundary crossed a triangle, the whole triangle was either kept or removed, producing a jagged, staircase-shaped hole that didn't match the drawn shape at all.
+
+**Solution:** Replaced whole-triangle deletion with Shapely-based cookie-cutter clipping. Each front-facing triangle that straddles the polygon boundary is intersected with the polygon in screen space using `shapely.difference()`. The region inside the polygon is removed; the region outside is retained and re-triangulated. New boundary vertices are unprojected from screen space back to 3D world coordinates using barycentric interpolation — each new screen-space vertex is expressed as a weighted sum of its parent triangle's three world-space vertices, producing the correct 3D position on the mesh surface. Triangles fully inside the polygon are deleted entirely. Triangles fully outside are untouched. The hole in the mesh now matches the drawn polygon outline exactly at sub-triangle precision.
+
+**Fan triangulation failure at polygon corners:** The first re-triangulation approach — fan triangulation from a centroid — produced correct output for convex Shapely fragments but failed on non-convex (L-shaped, concave) fragments that appear at polygon corners where the boundary cuts through multiple edges. Fan triangulation from a centroid always produces a convex hull, so concave fragments either had overlapping triangles or missing fill. Replaced with `shapely.constrained_delaunay_triangles()`, which correctly triangulates any polygon shape including concave and multi-vertex fragments.
+
+**Snap tolerance:** Shapely returns boundary vertices whose coordinates differ from the original mesh vertex coordinates by floating-point rounding amounts that are not zero. A snap tolerance of `1e-4` screen pixels (effectively zero) treated these as new interpolated vertices, creating micro-gaps at triangle corners where original vertices were displaced by rounding. Raised to `0.5` screen pixels, which correctly identifies original corners as coincident with Shapely output without snapping geometrically distinct new vertices.
+
+**Lesson:** Whole-triangle deletion is a geometry approximation, not a geometry operation. If the goal is a hole that matches a drawn shape, the mesh must be cut along the exact polygon boundary — which requires fragment intersection, new vertex generation, and re-triangulation of the remaining geometry. Shapely provides all three as library operations; the hard part is correctly converting between screen-space polygon coordinates and 3D world-space vertex positions via barycentric interpolation.
+
+---
+
+### Challenge: Delete Faces blew out the back side of the model
+
+**Problem:** After implementing cookie-cutter clipping, faces on the visible front surface were deleted correctly. But the same deletion also removed faces on the back of the model — faces that were geometrically behind the front surface and invisible to the camera, but whose screen-space projections happened to land inside the drawn polygon. On a roughly cylindrical model (a figurine, a prop), drawing a selection on the chest would also delete the back of the chest, producing a through-hole. This "back-face blowout" made Delete Faces unusable for any model with thickness.
+
+**Multiple heuristic approaches that failed:** Front-face winding test (2D signed area of screen-space triangle) correctly identified most back faces, but curved surfaces have faces that are oblique to the camera — their winding is ambiguous and the winding test flipped inconsistently. Depth margin approaches (reject faces whose NDC depth exceeded the visible mesh depth by 5%, 10%, 25%) failed because the "visible depth" varied continuously across the surface — any fixed margin either let back faces through or clipped front faces on curved parts of the model.
+
+**Root cause insight:** The GPU had already solved this problem. The scene depth buffer — the OpenGL depth texture used for the base mesh render pass — contains the exact depth of the front-most visible fragment at every pixel. A face is visible from the camera if and only if its depth is less than or equal to the depth buffer value at that pixel. No heuristic is needed; the answer is already in GPU memory.
+
+**Solution:** GPU depth buffer readback. After the scene renders, `_scene_depth_tex.read()` pulls the depth texture back to CPU as a float32 numpy array. For each candidate face, compute its centroid NDC depth (`face_ndc_z`), convert to OpenGL depth space (`face_gl_dep = (face_ndc_z + 1.0) * 0.5`), and look up the rendered depth at the face's screen-space centroid pixel — with a Y-flip because OpenGL row 0 is the bottom of the screen. If `face_gl_dep <= buf_depth + eps`, the face is visible; otherwise it's behind a front-facing surface and should be skipped. The epsilon (`0.001`) accommodates floating-point rounding between the two depth computations. Back-face blowout is eliminated entirely — the depth buffer already contains exactly the information needed, at pixel resolution, for every face simultaneously.
+
+**Lesson:** When the GPU has already computed the answer, read it back rather than re-deriving it on the CPU with heuristics. The depth buffer is the canonical truth about which surface is visible at each pixel. Any depth-margin heuristic is an approximation of a quantity the GPU already knows exactly. The one-time cost of a texture readback is negligible compared to the correctness guarantee it provides.
+
+---
+
+### Challenge: Pending overlay drifted away from the model during orbit
+
+**Problem:** After the committed layer overlay correctly tracked the model surface (using 3D anchor reprojection), the *pending* (pre-save) overlay still drifted when orbiting. The teal selection outline stayed fixed on screen as the camera moved — drawn at screen-space coordinates recorded at click time — while the model rotated underneath it. The user could see their selection drift off the model surface before saving.
+
+**First approach — dedicated reprojection method:** Added a `_reproject_pending_mask()` method that called `self.makeCurrent()`, rasterized the pending polygon's 3D anchors into a fresh texture, and wrote the result to the pending mask texture. This caused an immediate SIGSEGV crash on macOS. Root cause: `makeCurrent()` called from inside `paintGL()` is re-entrant GL context activation — the context is already current, and calling `makeCurrent()` again triggers undefined behavior in the platform GL layer on macOS.
+
+**Solution:** Moved the reprojection entirely inline into `paintGL()`, before the pending mask texture is bound for rendering. Inside paintGL the GL context is guaranteed to be current — no `makeCurrent()`/`doneCurrent()` calls needed. Each frame, if a pending selection exists and has 3D anchor points, the 3D points are projected through the live MVP matrix to current screen coordinates, PIL-rasterized into a numpy array, and written directly to the existing mask texture via `.write()`. The `.write()` call updates the texture data in-place without reallocating GPU memory — the same safe pattern used by committed layer reprojection. The overlay now tracks the model surface correctly during orbit before saving, matching the committed layer behavior.
+
+**Lesson:** Any GPU texture write that happens inside the render loop must occur within the paintGL call stack where the context is already current. Creating a separate method that calls `makeCurrent()` to perform mid-frame updates is re-entrant context activation and is undefined behavior on macOS Metal. Use `.write()` on the existing texture object instead of allocation-and-replace — it's cheaper, avoids the context re-entry, and produces the same visual result.
+
+---
+
 *More challenges will be documented as development progresses.*
 
 ## Results and Impact
