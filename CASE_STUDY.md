@@ -330,6 +330,20 @@ The quality difference is the same as the difference between a 70K-sample textur
 
 ---
 
+### Challenge: Polygon anchor points drifted when navigating with WASD
+
+**Problem:** Polygon selection anchor points (in-progress lasso anchors) correctly tracked the model surface during mouse orbit — `_reproject_poly_overlay` was called via `_camera_moved` whenever the orbit handler ran. But navigating with WASD fly keys caused the anchors to immediately float off the model surface, despite WASD visually moving the camera. Orbit and WASD appeared identical to the user, but only orbit kept anchors glued to the mesh.
+
+**Root cause:** The `_camera_moved` flag that triggers reprojection was only set in the mouse orbit, pan, and scroll handlers. The WASD movement timer (`_move_tick`, firing at ~60fps) updated `self._camera.position` and `self._camera.focal_point` and called `self.update()` — but never set `_camera_moved = True`. The reprojection check in `paintGL` saw `_camera_moved = False` on every WASD frame and skipped the MVP update entirely. The anchors were left at their original screen-space positions while the mesh moved under them.
+
+**Solution:** One line added to `_move_tick` — `self._camera_moved = True` immediately after the camera position update. This ensures that every camera movement path, not just mouse-driven ones, signals the reprojection system.
+
+**Secondary fix — rubber-band line:** With reprojection now firing on WASD, a second issue surfaced: a rubber-band preview line shot off into the distance during camera movement. The rubber-band draws from the last anchor to `_poly_cursor` (the last recorded mouse position). During WASD the mouse doesn't move, so `_poly_cursor` was stale — the anchors reprojected to their correct new positions while the rubber-band still pointed at the cursor's old screen location. Fixed by using the last reprojected anchor as the rubber-band endpoint during `_reproject_poly_overlay` rather than the stale `_poly_cursor`. The line reappears correctly the moment the user moves the mouse again.
+
+**Lesson:** Camera movement can happen through multiple input paths — mouse drag, scroll, keyboard. Any system that responds to "camera moved" must hook into every path that actually moves the camera, not just the most visible ones. A missing hook produces no crash or error; it silently produces incorrect behavior only when that specific input path is used.
+
+---
+
 *More challenges will be documented as development progresses.*
 
 ## Results and Impact

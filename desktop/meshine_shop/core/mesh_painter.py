@@ -662,6 +662,13 @@ class MeshPainter:
         r_range = max(r_max - r_min, 1e-9)
         u_range = max(u_max - u_min, 1e-9)
 
+        # Centroid of selected vertices — used with avg_n to define the projection
+        # half-space plane. Fragments behind this plane are discarded in the shader
+        # so the texture never wraps to the back side of the mesh.
+        sel_verts_arr = np.array([verts[vi] for vi in sel_verts], dtype=np.float64)
+        centroid      = sel_verts_arr.mean(axis=0)
+        plane_d       = float(np.dot(centroid, avg_n))
+
         # ---------------------------------------------------------------- #
         # Step 3: Pre-compute rotation trig and pack all shader uniforms.  #
         # ---------------------------------------------------------------- #
@@ -671,6 +678,9 @@ class MeshPainter:
         params: dict = {
             "right":     R_vec.astype(np.float32),   # vec3 — horizontal axis
             "up":        U_vec.astype(np.float32),   # vec3 — vertical axis (negated)
+            "normal":    avg_n.astype(np.float32),   # vec3 — projection plane normal (may need flip)
+            "plane_d":   plane_d,                    # dot(centroid, normal) — half-space constant
+            "centroid":  centroid.astype(np.float32),# world-space centroid — for normal orientation in viewport
             "r_min":     float(r_min),               # normalization: left edge
             "r_range":   float(r_range),             # normalization: width
             "u_min":     float(u_min),               # normalization: top edge

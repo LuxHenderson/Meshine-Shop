@@ -523,9 +523,8 @@ in vec3 in_position;
 
 uniform mat4 MVP;
 
-// World-space position passed to fragment shader for planar UV computation.
-// Model matrix = identity (mesh lives in world space already) so in_position
-// is the world position without any further transform needed.
+// World-space position passed to fragment shader for planar UV computation
+// and winding-independent normal estimation via dFdx/dFdy.
 out vec3 v_world_pos;
 
 void main() {
@@ -602,7 +601,18 @@ void main() {
     // filtering automatically — no aliasing grain, no "Doom look".
     vec4 tex_color = texture(proj_tex, vec2(tex_u, tex_v));
 
-    // Step 5: Clip to the exact drawn polygon via the screen-space mask.
+    // Step 5: Headlight shading — same as base mesh shader.
+    // Face culling is handled at IBO build time on the CPU (only front-facing
+    // faces are included in the projection VAO), so no per-fragment discard
+    // is needed here. dFdx/dFdy gives a winding-independent geometric normal
+    // for correct diffuse shading regardless of mesh winding convention.
+    vec3 geo_n = normalize(cross(dFdx(v_world_pos), dFdy(v_world_pos)));
+    vec3 N = geo_n;
+    float diffuse  = max(dot(N, vec3(0.0, 0.0, 1.0)), 0.0) * 0.65;
+    float ambient  = 0.35;
+    tex_color.rgb *= (diffuse + ambient);
+
+    // Step 7: Clip to the exact drawn polygon via the screen-space mask.
     // Y is flipped because gl_FragCoord is bottom-left but PIL mask is top-left.
     vec2 screen_uv = vec2(gl_FragCoord.x / viewport_w, 1.0 - gl_FragCoord.y / viewport_h);
     float mask = texture(layer_mask, screen_uv).r;
@@ -799,6 +809,10 @@ class ViewportWidget(QOpenGLWidget):
         self._proj_prog: "moderngl.Program | None" = None
         # Per-layer GPU resources: {layer_id: {gpu_tex, ibo, vao, params, visible}}
         self._proj_layers: dict[int, dict] = {}
+        # Pending projection setups deferred to paintGL for safe GPU resource creation.
+        # Keyed by layer_id; each value is the dict returned by project_texture_to_layer
+        # before GPU objects exist.  paintGL picks these up and builds VAO/tex/IBO.
+        self._pending_proj_setups: dict[int, dict] = {}
 
         self._vao: moderngl.VertexArray | None = None
         self._vbo: moderngl.Buffer | None = None
@@ -1545,6 +1559,64 @@ class ViewportWidget(QOpenGLWidget):
             except Exception:
                 log.exception("ViewportWidget: sculpt VBO re-upload failed")
 
+        # Deferred projection GPU setup: build VAO/IBO/texture for any pending
+        # projection layers.  Done here (inside Qt's managed GL frame) so the
+        # context is guaranteed current — avoids the makeCurrent/doneCurrent
+        # lifecycle issue that caused projections to silently render nothing.
+        if self._pending_proj_setups and self._proj_prog is not None and self._vbo is not None:
+            for _lid, _setup in list(self._pending_proj_setups.items()):
+                try:
+                    _tex_img  = _setup["texture_img"]
+                    _face_set = _setup["face_set"]
+                    _params   = _setup["params"]
+
+                    # Upload texture to GPU.
+                    _tw, _th  = _tex_img.size
+                    _gpu_tex  = self._ctx.texture((_tw, _th), 4, data=_tex_img.tobytes())
+                    _gpu_tex.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
+                    _gpu_tex.build_mipmaps()
+
+                    # Build IBO from all selected faces (no front-face filtering needed —
+                    # the polygon mask clips the projection to the drawn shape each frame).
+                    _face_arr    = np.asarray(self._painter._mesh.faces, dtype=np.int32)
+                    _sel_idx     = np.array(sorted(_face_set), dtype=np.int32)
+                    _ibo_data    = _face_arr[_sel_idx].flatten().astype(np.uint32)
+                    _proj_ibo    = self._ctx.buffer(_ibo_data.tobytes())
+
+                    # VAO: position-only binding from the interleaved VBO.
+                    # Layout: [pos(3f) | normal(3f) | uv(2f)] = 32 bytes per vertex.
+                    # "3f 20x" = read 3 floats (pos), skip 20 bytes (normal+uv).
+                    _proj_vao = self._ctx.vertex_array(
+                        self._proj_prog,
+                        [(self._vbo, "3f 20x", "in_position")],
+                        _proj_ibo,
+                    )
+
+                    # Release stale GPU resources if re-projecting the same layer.
+                    _old = self._proj_layers.get(_lid)
+                    if _old is not None:
+                        for _k in ("gpu_tex", "ibo", "vao"):
+                            _r = _old.get(_k)
+                            if _r is not None:
+                                try:
+                                    _r.release()
+                                except Exception:
+                                    pass
+
+                    self._proj_layers[_lid] = {
+                        "gpu_tex": _gpu_tex,
+                        "ibo":     _proj_ibo,
+                        "vao":     _proj_vao,
+                        "params":  _params,
+                        "visible": _setup.get("visible", True),
+                    }
+                    log.info("paintGL: proj GPU setup complete layer=%d faces=%d tex=%dx%d",
+                             _lid, len(_sel_idx), _tw, _th)
+                except Exception:
+                    log.exception("paintGL: proj GPU setup FAILED layer=%d", _lid)
+                finally:
+                    self._pending_proj_setups.pop(_lid, None)
+
         # Reproject in-progress polygon anchors when the camera actually moved.
         # _camera_moved is set to True by orbit/pan handlers and cleared here
         # each frame — reprojection only fires on genuine camera navigation, not
@@ -1614,9 +1686,7 @@ class ViewportWidget(QOpenGLWidget):
             from PIL import Image as _PilProj, ImageDraw as _PilDProj  # noqa: PLC0415
             self._ctx.enable(moderngl.BLEND)
             self._ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
-            # Switch to LEQUAL so the projection pass (which re-draws the same
-            # faces as the base mesh pass) passes the depth test. The default
-            # GL_LESS discards fragments at equal depth, making the layer invisible.
+            # LEQUAL so the projection pass (same faces as base mesh) passes depth.
             self._ctx.depth_func = "<="
             w_vp = float(self.width())
             h_vp = float(self.height())
@@ -1630,57 +1700,71 @@ class ViewportWidget(QOpenGLWidget):
                 if not pdata.get("visible", True):
                     continue
 
-                # --- Rasterize the polygon mask for this layer ---
-                # Reproject poly_pts_3d through the live MVP so the mask always
-                # matches the current camera angle, then PIL-fill into _layer_mask_tex.
-                # Back-face cull: if the polygon surface faces away from the camera,
-                # skip rendering this layer entirely.
-                layer       = self._layers.get(lid, {})
-                poly_pts_3d = layer.get("poly_pts_3d")
-                if poly_pts_3d and len(poly_pts_3d) >= 3:
-                    pts_w = np.array(poly_pts_3d, dtype=np.float32)
-                    avg_normal = layer.get("avg_normal")
-                    if avg_normal is not None:
-                        centroid_w  = np.mean(pts_w, axis=0)
-                        cam_to_surf = centroid_w - self._camera.position.astype(np.float32)
-                        if float(np.dot(avg_normal, cam_to_surf)) > 0.0:
-                            continue  # back-facing — skip
-                    pts4  = np.hstack([pts_w, np.ones((len(pts_w), 1), np.float32)])
-                    lproj = (mvp @ pts4.T).T
-                    lwc   = np.where(np.abs(lproj[:, 3]) < 1e-8, 1e-8, lproj[:, 3])
-                    l_sx  = ((lproj[:, 0] / lwc + 1.0) * 0.5 * w_vp).astype(int)
-                    l_sy  = ((1.0 - (lproj[:, 1] / lwc + 1.0) * 0.5) * h_vp).astype(int)
-                    lmask = _PilProj.new("L", (int(w_vp), int(h_vp)), 0)
-                    _PilDProj.Draw(lmask).polygon(
-                        [(int(l_sx[k]), int(l_sy[k])) for k in range(len(l_sx))],
-                        fill=255,
-                    )
-                    self._layer_mask_tex.write(np.array(lmask, dtype=np.uint8).tobytes())
-                else:
-                    # No polygon data — fill mask with white (no clipping)
-                    self._layer_mask_tex.write(
-                        bytes([255] * (int(w_vp) * int(h_vp)))
-                    )
+                try:
+                    # --- Rasterize the polygon mask for this layer ---
+                    # Reproject poly_pts_3d through the live MVP so the mask always
+                    # matches the current camera angle, then PIL-fill into _layer_mask_tex.
+                    # NOTE: No per-frame back-face normal check here — Apple OC meshes have
+                    # CW-wound faces whose raw cross-product normals point inward, so a dot-
+                    # product test would incorrectly cull front-facing projections.  Back-face
+                    # geometry is already excluded by the signed-area IBO filter applied when
+                    # the projection was set up; we just trust that and always render.
+                    layer       = self._layers.get(lid, {})
+                    poly_pts_3d = layer.get("poly_pts_3d")
+                    mask_w = self._layer_mask_tex.width
+                    mask_h = self._layer_mask_tex.height
+                    if poly_pts_3d and len(poly_pts_3d) >= 3:
+                        from PIL import ImageFilter as _IF
+                        pts_w = np.array(poly_pts_3d, dtype=np.float32)
+                        pts4  = np.hstack([pts_w, np.ones((len(pts_w), 1), np.float32)])
+                        lproj = (mvp @ pts4.T).T
+                        lwc   = np.where(np.abs(lproj[:, 3]) < 1e-8, 1e-8, lproj[:, 3])
+                        l_sx  = ((lproj[:, 0] / lwc + 1.0) * 0.5 * mask_w).astype(int)
+                        l_sy  = ((1.0 - (lproj[:, 1] / lwc + 1.0) * 0.5) * mask_h).astype(int)
+                        # Supersample 4× for clean polygon edge anti-aliasing.
+                        # PIL Draw.polygon() has no native AA — rasterizing at 4× screen
+                        # resolution then Lanczos-downsampling gives sub-pixel smooth edges
+                        # with no staircase artifacts. Minimal blur (radius=1) feathers the
+                        # last sub-pixel fringe without introducing softness.
+                        _SS = 4
+                        lmask_hi = _PilProj.new("L", (mask_w * _SS, mask_h * _SS), 0)
+                        _PilDProj.Draw(lmask_hi).polygon(
+                            [(int(l_sx[k]) * _SS, int(l_sy[k]) * _SS)
+                             for k in range(len(l_sx))],
+                            fill=255,
+                        )
+                        lmask = lmask_hi.resize(
+                            (mask_w, mask_h), _PilProj.Resampling.LANCZOS
+                        )
+                        lmask = lmask.filter(_IF.GaussianBlur(radius=1))
+                        self._layer_mask_tex.write(np.array(lmask, dtype=np.uint8).tobytes())
+                    else:
+                        # No polygon data — fill mask with white (no clipping)
+                        self._layer_mask_tex.write(
+                            bytes([255] * (mask_w * mask_h))
+                        )
 
-                pr  = pdata["params"]
-                p   = self._proj_prog
-                p["proj_right"].write(pr["right"].tobytes())
-                p["proj_up"].write(pr["up"].tobytes())
-                p["proj_r_min"].value    = pr["r_min"]
-                p["proj_r_range"].value  = pr["r_range"]
-                p["proj_u_min"].value    = pr["u_min"]
-                p["proj_u_range"].value  = pr["u_range"]
-                p["proj_scale"].value    = pr["scale"]
-                p["proj_cos"].value      = pr["cos"]
-                p["proj_sin"].value      = pr["sin"]
-                p["proj_offset_x"].value = pr["offset_x"]
-                p["proj_offset_y"].value = pr["offset_y"]
-                p["proj_opacity"].value  = pr["opacity"]
-                pdata["gpu_tex"].use(1)
-                self._layer_mask_tex.use(2)
-                pdata["vao"].render()
+                    pr  = pdata["params"]
+                    p   = self._proj_prog
+                    p["proj_right"].write(pr["right"].tobytes())
+                    p["proj_up"].write(pr["up"].tobytes())
+                    p["proj_r_min"].value    = pr["r_min"]
+                    p["proj_r_range"].value  = pr["r_range"]
+                    p["proj_u_min"].value    = pr["u_min"]
+                    p["proj_u_range"].value  = pr["u_range"]
+                    p["proj_scale"].value    = pr["scale"]
+                    p["proj_cos"].value      = pr["cos"]
+                    p["proj_sin"].value      = pr["sin"]
+                    p["proj_offset_x"].value = pr["offset_x"]
+                    p["proj_offset_y"].value = pr["offset_y"]
+                    p["proj_opacity"].value  = pr["opacity"]
+                    pdata["gpu_tex"].use(1)
+                    self._layer_mask_tex.use(2)
+                    pdata["vao"].render()
+                except Exception:
+                    log.exception("paintGL: projection render EXCEPTION lid=%d", lid)
 
-            # Restore default depth function and clean up state
+            # Restore depth func and blend state
             self._ctx.depth_func = "<"
             self._ctx.disable(moderngl.BLEND)
 
@@ -1855,19 +1939,11 @@ class ViewportWidget(QOpenGLWidget):
                     if not poly_pts_3d or len(poly_pts_3d) < 3:
                         continue
 
-                    # Back-face cull: skip this layer if the camera is on the
-                    # opposite side of the model from where the selection was made.
-                    # dot(avg_normal, camera_pos - centroid) < 0 means the layer
-                    # surface is facing away — don't render it this frame.
-                    pts_w = np.array(poly_pts_3d, dtype=np.float32)       # (K, 3)
-                    avg_normal = layer.get("avg_normal")
-                    if avg_normal is not None:
-                        centroid_w = np.mean(pts_w, axis=0)
-                        cam_to_surf = centroid_w - self._camera.position.astype(np.float32)
-                        if float(np.dot(avg_normal, cam_to_surf)) > 0.0:
-                            continue  # back-facing — skip this layer
-
                     # Project 3D anchors → current screen positions
+                    # NOTE: No back-face cull here — Apple OC meshes use CW winding so
+                    # the raw avg_normal points inward; a dot-product test would hide the
+                    # highlight whenever the camera faces the selection front.
+                    pts_w = np.array(poly_pts_3d, dtype=np.float32)       # (K, 3)
                     pts4  = np.hstack([pts_w, np.ones((len(pts_w), 1), np.float32)])
                     lproj = (mvp @ pts4.T).T                               # (K, 4)
                     lwc   = np.where(np.abs(lproj[:, 3]) < 1e-8, 1e-8, lproj[:, 3])
@@ -3012,6 +3088,7 @@ class ViewportWidget(QOpenGLWidget):
             move = delta * (speed * min(mag, 1.0) / mag)
             self._camera.position    += move
             self._camera.focal_point += move
+            self._camera_moved = True
             self.update()
         elif abs(self._vel_fwd) > 1e-4 or abs(self._vel_right) > 1e-4 or abs(self._vel_up) > 1e-4:
             self.update()
@@ -3165,29 +3242,60 @@ class ViewportWidget(QOpenGLWidget):
         mvp    = (proj @ view @ model.astype(np.float64)).astype(np.float32)
 
         # Separate valid (mesh-hit) from None (off-mesh) entries.
-        # Off-mesh anchors are skipped — their original screen position is kept
-        # exactly as placed. Reprojecting them through the centroid fallback was
-        # the bug that distorted the polygon mask and broke face deletion shape.
         valid_indices = [i for i, p in enumerate(self._poly_points_3d) if p is not None]
+        none_indices  = [i for i, p in enumerate(self._poly_points_3d) if p is None]
+
         if not valid_indices:
             # No mesh-hit anchors at all — nothing to reproject.
             return
 
+        # Project the valid (mesh-hit) anchor positions.
         valid_3d = [self._poly_points_3d[i] for i in valid_indices]
-        pts_w = np.array(valid_3d, dtype=np.float32)               # (K, 3)
+        pts_w = np.array(valid_3d, dtype=np.float32)
         pts4  = np.hstack([pts_w, np.ones((len(pts_w), 1), np.float32)])
-        clip  = (mvp @ pts4.T).T                                   # (K, 4)
+        clip  = (mvp @ pts4.T).T
 
-        # Perspective divide — guard against zero w.
         wc = np.where(np.abs(clip[:, 3]) < 1e-8, 1e-8, clip[:, 3])
         sx = ((clip[:, 0] / wc + 1.0) * 0.5 * w).astype(int)
         sy = ((1.0 - (clip[:, 1] / wc + 1.0) * 0.5) * h).astype(int)
 
-        # Update only the mesh-hit anchors in _poly_points; off-mesh anchors
-        # stay at whatever screen position the user originally placed them.
         for k, i in enumerate(valid_indices):
             self._poly_points[i] = (int(sx[k]), int(sy[k]))
-        self._poly_overlay.set_points(self._poly_points, cursor)
+
+        # Estimate 3D positions for off-mesh (None) anchors so they also
+        # reproject correctly when the camera moves, instead of staying frozen
+        # at their original screen position while on-mesh anchors shift.
+        # Use the average NDC z of valid hits as a stand-in depth — identical
+        # to the approach in _finalize_poly_selection. Store the estimate back
+        # into _poly_points_3d so subsequent reprojections are consistent.
+        if none_indices:
+            # Average NDC z from valid mesh hits.
+            avg_ndc_z = float(np.mean(clip[:, 2] / wc))
+            inv_mvp   = np.linalg.inv(mvp.astype(np.float64))
+            for i in none_indices:
+                px_i, py_i = self._poly_points[i]
+                ndc_x_i = (px_i / w) * 2.0 - 1.0
+                ndc_y_i = 1.0 - (py_i / h) * 2.0
+                ndc_pt  = np.array([ndc_x_i, ndc_y_i, avg_ndc_z, 1.0])
+                world_h = inv_mvp @ ndc_pt
+                if abs(world_h[3]) > 1e-8:
+                    est_3d = (world_h[:3] / world_h[3]).tolist()
+                    self._poly_points_3d[i] = est_3d
+                    # Project estimated position back to screen.
+                    est_h = np.array([*est_3d, 1.0], dtype=np.float64)
+                    ec    = mvp.astype(np.float64) @ est_h
+                    ew    = ec[3] if abs(ec[3]) > 1e-8 else 1e-8
+                    self._poly_points[i] = (
+                        int((ec[0] / ew + 1.0) * 0.5 * w),
+                        int((1.0 - (ec[1] / ew + 1.0) * 0.5) * h),
+                    )
+
+        # Use the last reprojected anchor as the rubber-band cursor endpoint.
+        # _poly_cursor is stale during WASD (mouse doesn't move), so pointing the
+        # rubber-band at the cursor would shoot a line off into the distance.
+        # The rubber-band reappears at the correct position on the next mouse move.
+        draw_cursor = self._poly_points[-1] if self._poly_points else cursor
+        self._poly_overlay.set_points(self._poly_points, draw_cursor)
 
     def _reproject_pending_mask(self) -> None:
         """
@@ -4226,31 +4334,76 @@ class ViewportWidget(QOpenGLWidget):
         offset_y     : Vertical shift (-1.0 to 1.0).
         """
         import math as _math
+        import traceback as _tb
+        log.info("project_texture_to_layer: called layer=%d path=%s", layer_id, texture_path)
+        try:
+            self._project_texture_to_layer_impl(layer_id, texture_path, rotate, scale, offset_x, offset_y)
+        except Exception:
+            log.error("project_texture_to_layer: UNHANDLED EXCEPTION\n%s", _tb.format_exc())
+        return
+
+    def _project_texture_to_layer_impl(
+        self,
+        layer_id: int,
+        texture_path: str,
+        rotate: float,
+        scale: float,
+        offset_x: float,
+        offset_y: float,
+    ) -> None:
+        """Inner implementation — called from project_texture_to_layer which wraps in try/except."""
         if self._painter is None or layer_id not in self._layers:
             log.warning(
-                "project_texture_to_layer: layer %d not found or no painter", layer_id
+                "project_texture_to_layer: layer %d not found or no painter (layers=%s)",
+                layer_id, list(self._layers.keys())
             )
             return
-        if self._ctx is None or self._proj_prog is None or self._vbo is None:
-            log.warning("project_texture_to_layer: GL context not ready")
-            return
 
-        # Load source texture from disk
+        # Load source texture from disk — CPU only, no GL context needed yet.
         try:
             from PIL import Image as _Image
-            texture_img = _Image.open(texture_path)
+            texture_img = _Image.open(texture_path).convert("RGBA")
         except Exception as e:
             log.warning("project_texture_to_layer: could not load %s: %s", texture_path, e)
             return
 
         # Snapshot BEFORE applying projection so it is undoable.
-        # geometry=False — only the projection layer state changes, not vertices.
         self._history.push_snapshot(self._painter, geometry=False)
         self.history_changed.emit(self._history.can_undo, self._history.can_redo)
 
-        face_set = self._layers[layer_id]["faces"]
+        face_set = set(self._layers[layer_id]["faces"])
 
-        # Compute projection frame and store in painter._layer_projections.
+        # For cookie-cutter layers the face set may be empty — recompute from polygon.
+        if not face_set:
+            layer     = self._layers[layer_id]
+            pts_2d    = layer.get("poly_pts_2d")
+            view_mat  = layer.get("view_mat")
+            proj_mat  = layer.get("proj_mat")
+            model_mat = layer.get("model_mat")
+            if pts_2d and view_mat is not None and proj_mat is not None and model_mat is not None:
+                from PIL import Image as _PilFace, ImageDraw as _PilFaceD
+                w_fb, h_fb = self.width(), self.height()
+                if w_fb > 0 and h_fb > 0:
+                    _mask_pil = _PilFace.new("L", (w_fb, h_fb), 0)
+                    _PilFaceD.Draw(_mask_pil).polygon(pts_2d, fill=255)
+                    _mask_np  = np.array(_mask_pil, dtype=np.uint8)
+                    _mvp_r    = (proj_mat @ view_mat @ model_mat.astype(np.float64)).astype(np.float32)
+                    _verts    = np.asarray(self._painter._mesh.vertices, dtype=np.float32)
+                    _faces_np = np.asarray(self._painter._mesh.faces,    dtype=np.int32)
+                    _verts_h  = np.hstack([_verts, np.ones((_verts.shape[0], 1), np.float32)])
+                    _clip     = (_mvp_r @ _verts_h.T).T
+                    _wc       = np.where(np.abs(_clip[:, 3]) < 1e-8, 1e-8, _clip[:, 3])
+                    _sx       = ((_clip[:, 0] / _wc + 1.0) * 0.5 * w_fb).astype(int)
+                    _sy       = ((1.0 - (_clip[:, 1] / _wc + 1.0) * 0.5) * h_fb).astype(int)
+                    _cx       = np.clip((_sx[_faces_np[:, 0]] + _sx[_faces_np[:, 1]] + _sx[_faces_np[:, 2]]) // 3, 0, w_fb - 1)
+                    _cy       = np.clip((_sy[_faces_np[:, 0]] + _sy[_faces_np[:, 1]] + _sy[_faces_np[:, 2]]) // 3, 0, h_fb - 1)
+                    _inside   = _mask_np[_cy, _cx] > 0
+                    face_set  = set(int(i) for i in np.where(_inside)[0])
+            if not face_set:
+                log.warning("project_texture_to_layer: layer %d has no faces and polygon recompute failed", layer_id)
+                return
+
+        # Compute projection frame (CPU — no GL needed).
         params = self._painter.setup_layer_projection(
             layer_id,
             face_set,
@@ -4265,56 +4418,18 @@ class ViewportWidget(QOpenGLWidget):
             return
 
         # ------------------------------------------------------------------
-        # Build GPU resources for this projection layer.
-        # Make GL context current (required for moderngl buffer/texture ops).
+        # Defer all GPU resource creation to paintGL so it runs inside Qt's
+        # managed GL frame (context guaranteed current, no makeCurrent needed).
+        # Store everything the paintGL setup pass will need.
         # ------------------------------------------------------------------
-        self.makeCurrent()
-
-        # Upload source texture to GPU with trilinear mipmap filtering.
-        # LINEAR_MIPMAP_LINEAR (trilinear) is the highest quality filter mode —
-        # eliminates the aliasing grain that plagues nearest-neighbor and even
-        # plain bilinear sampling at minification scales.
-        tex_rgba = texture_img.convert("RGBA")
-        tw, th   = tex_rgba.size
-        gpu_tex  = self._ctx.texture((tw, th), 4, data=tex_rgba.tobytes())
-        gpu_tex.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
-        gpu_tex.build_mipmaps()
-
-        # Build face-subset index buffer: only the selected faces are rendered
-        # in the projection pass so pixels outside the selection are untouched.
-        face_arr        = np.asarray(self._painter._mesh.faces, dtype=np.int32)
-        sel_face_idx    = np.array(sorted(face_set), dtype=np.int32)
-        sel_ibo_data    = face_arr[sel_face_idx].flatten().astype(np.uint32)
-        proj_ibo        = self._ctx.buffer(sel_ibo_data.tobytes())
-
-        # Build VAO: bind only in_position (first 3 floats of interleaved VBO).
-        # The interleaved VBO layout is [pos(3f), normal(3f), uv(2f)] = 32 bytes.
-        # "3f 20x" = 3 floats then skip 20 bytes (normal 12b + uv 8b).
-        proj_vao = self._ctx.vertex_array(
-            self._proj_prog,
-            [(self._vbo, "3f 20x", "in_position")],
-            proj_ibo,
-        )
-
-        # Release old GPU resources for this layer if re-projecting
-        old = self._proj_layers.get(layer_id)
-        if old is not None:
-            for key in ("gpu_tex", "ibo", "vao"):
-                res = old.get(key)
-                if res is not None:
-                    try:
-                        res.release()
-                    except Exception:
-                        pass
-
-        self._proj_layers[layer_id] = {
-            "gpu_tex": gpu_tex,
-            "ibo":     proj_ibo,
-            "vao":     proj_vao,
-            "params":  params,
-            "visible": True,
+        self._pending_proj_setups[layer_id] = {
+            "texture_img": texture_img,   # RGBA PIL image
+            "face_set":    face_set,
+            "params":      params,
+            "visible":     True,
         }
-        self.doneCurrent()
+        log.info("project_texture_to_layer: queued pending setup for layer %d (%d faces)",
+                 layer_id, len(face_set))
 
         # Repaint — projection pass runs next frame
         self.update()
