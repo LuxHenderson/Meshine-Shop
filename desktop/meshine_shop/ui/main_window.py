@@ -21,7 +21,7 @@ from pathlib import Path
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QStackedWidget,
-    QPushButton, QComboBox, QFileDialog,
+    QPushButton, QComboBox, QFileDialog, QInputDialog,
 )
 from PySide6.QtCore import Qt, Signal
 from meshine_shop.ui.drop_zone import DropZone, collect_images_from_paths
@@ -306,6 +306,33 @@ class ViewportView(QWidget):
 
         # Texture projection — apply a texture image onto the selected layer's UV faces
         self.layers.project_texture_requested.connect(self._on_project_texture)
+
+        # Mesh Operations — destructive edits forwarded from the tools panel
+        self.tools.mesh_smooth_requested.connect(self.viewport.apply_mesh_smooth)
+        self.tools.mesh_fill_holes_requested.connect(self.viewport.apply_mesh_fill_holes)
+        self.tools.mesh_remove_floaters_requested.connect(self.viewport.apply_mesh_remove_floaters)
+        self.tools.mesh_decimate_requested.connect(self._on_decimate_requested)
+
+    def _on_decimate_requested(self) -> None:
+        """
+        Show a dialog asking for a target face count, then decimate the mesh.
+
+        Presents the current face count so the user can make an informed choice.
+        Cancelled or invalid inputs are silently ignored.
+        """
+        current = self.viewport.get_face_count()
+        if current == 0:
+            return
+        target, ok = QInputDialog.getInt(
+            self,
+            "Decimate Mesh",
+            f"Current faces: {current:,}\nTarget face count:",
+            value=max(4, current // 2),
+            min=4,
+            max=current,
+        )
+        if ok:
+            self.viewport.apply_mesh_decimate(target)
 
     def _on_project_texture(
         self,

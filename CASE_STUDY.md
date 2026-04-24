@@ -344,6 +344,32 @@ The quality difference is the same as the difference between a 70K-sample textur
 
 ---
 
+### Challenge: Projected texture edges were jagged — whole-face granularity
+
+**Problem:** After moving texture projection to a GLSL second render pass, the projected texture appeared correctly on the mesh interior but had ragged, staircase-shaped edges wherever the drawn polygon boundary crossed a mesh triangle. The projection filled entire faces — including portions that extended beyond the polygon outline. Edge quality was determined entirely by triangle size; on close-up regions with large screen-space triangles, the edges looked coarsely aliased regardless of source texture quality.
+
+**Root cause:** Face selection was centroid-based — a face was included in the projection if its centroid fell inside the drawn polygon. Faces that straddled the boundary were either fully included or fully excluded based on where their centroid happened to land. The GLSL screen-space polygon mask could only clip within the set of selected faces; it had no control over faces that weren't in the IBO at all.
+
+**Solution:** Replaced centroid lookup with Shapely triangle–polygon intersection. Every mesh vertex is projected to screen space via the camera MVP. For each candidate face (pre-filtered by bounding-box overlap against the polygon's `bounds`), a `shapely.geometry.Polygon` is constructed from the three screen-space vertex positions and tested against the drawn lasso polygon via `.intersects()`. Any face with any overlap — even one pixel — is included in the IBO. The GLSL analytical mask then clips the GPU-rendered projection output to the exact polygon boundary at sub-pixel accuracy. The bounding-box pre-filter skips the Shapely call for the vast majority of faces, keeping the per-finalization cost manageable even on 200K-triangle meshes.
+
+**Why both steps are necessary:** Shapely intersection controls which faces are in the IBO (geometry participation). The GLSL mask controls the visible shape within those faces (pixel-level clipping). Shapely alone produces correct edge geometry but no AA. The GLSL mask alone cannot restore a face that wasn't in the IBO. Together they produce edges that match the drawn polygon outline exactly at GPU-native sub-pixel quality.
+
+**Lesson:** Face selection and shape masking are two separate concerns that require separate mechanisms operating at different granularities. A face-granularity inclusion step determines what geometry participates in a pass; a pixel-granularity clip determines the visible boundary within that geometry. Conflating them into either step alone produces incorrect output at face boundaries.
+
+---
+
+### Challenge: Reset Rotation button did nothing
+
+**Problem:** The Reset Rotation button in the tools panel had no visible effect when clicked. The model stayed in whatever orientation it had been placed by the user's gizmo drag — clicking Reset didn't restore the original pose.
+
+**Root cause:** PCA auto-leveling runs at mesh-load time and bakes the rotation correction directly into the vertex positions. After this step, `self._model_rot` is reset to the identity matrix — the vertices already reflect the corrected orientation. When the user later drags the rotation gizmo, `_model_rot` accumulates the gizmo rotation as a 3×3 matrix applied each frame as a uniform. Clicking Reset set `_model_rot = np.eye(3)` — but if the gizmo had been used, this also discarded the user's intentional rotation with no visual feedback. Worse, if the gizmo hadn't been used, `_model_rot` was already identity and the button appeared to do nothing at all.
+
+**Solution:** Two parts. First, bake any accumulated gizmo rotation into the vertex positions before resetting — `self._painter._mesh.vertices = (R @ verts.T).T` — so the geometry reflects the post-gizmo pose and the reset doesn't destroy user work. Second, always call `self._camera.frame_mesh(bbox_min, bbox_max)` after resetting, so the camera re-frames to show the full model from a clean default angle regardless of how far the user has orbited. The combination gives the button a consistent, visible outcome: the gizmo rotation is baked in, the matrix is cleared to identity, and the camera snaps to a fresh overhead view.
+
+**Lesson:** When a transformation is applied as a per-frame shader uniform rather than baked into geometry, "reset" must bake the accumulated state into geometry first — otherwise the reset throws away user work. Always provide visible camera feedback on a reset operation so the user can confirm it worked, especially when the before and after states might look identical (identity → identity).
+
+---
+
 *More challenges will be documented as development progresses.*
 
 ## Results and Impact
@@ -493,7 +519,9 @@ The viewport replaces the direct pipeline→export flow with an interactive insp
 
 **Polygon selection and layers:** The lasso tool uses FBO-based face-ID selection (the same technique as Blender and Maya). A temporary framebuffer renders the mesh with each triangle's index encoded as a 24-bit RGB color. A PIL polygon raster of the drawn lasso is intersected with the FBO pixels to collect selected face indices. Saved layers persist as 3D anchor points reprojected each frame through the current camera — the highlight tracks the model surface correctly from any orbit angle. Back-face culling via face normal dot product hides layers when viewing from the opposite side.
 
-**Shader-based texture projection:** Textures are projected onto the mesh surface via a GLSL second render pass. The projection frame (Right, Up, Normal vectors) is passed as shader uniforms; planar UV coordinates are computed in the fragment shader from world-space vertex positions. Source textures are uploaded as trilinear mipmap GPU textures for maximum sampling quality. A per-frame screen-space polygon mask — rasterized from the layer's 3D anchor points through the live MVP — clips the projection to the exact drawn polygon shape at sub-pixel accuracy. At export time, `bake_projections_to_atlas()` implements the same shader math in numpy with 2× supersampling + LANCZOS downsample, baking GPU projection state into the UV atlas PNG so the exported GLB/OBJ/FBX carries the user's painted result.
+**Shader-based texture projection:** Textures are projected onto the mesh surface via a GLSL second render pass. The projection frame (Right, Up, Normal vectors) is passed as shader uniforms; planar UV coordinates are computed in the fragment shader from world-space vertex positions. Source textures are uploaded as trilinear mipmap GPU textures for maximum sampling quality. A GLSL analytical polygon mask (`uniform vec2 poly_verts[64]`, winding-number point-in-polygon, 1.5px SDF AA smoothstep) clips the projection to the exact drawn polygon shape at GPU-native sub-pixel accuracy — no CPU rasterization per frame. Face inclusion uses Shapely triangle–polygon intersection so boundary faces participate in the IBO even when their centroid is outside the polygon; the GLSL mask then clips the visible shape within those faces. A `proj_forward` uniform stores the camera's world-space forward direction at projection time; the shader discards fragments where the derivative surface normal disagrees with the original projection direction, hiding the projection when the camera orbits behind the mesh. At export time, `bake_projections_to_atlas()` implements the same shader math in numpy with 2× supersampling + LANCZOS downsample, baking GPU projection state into the UV atlas PNG so the exported GLB/OBJ/FBX carries the user's painted result.
+
+**Mesh operations:** Four non-destructive mesh editing tools wired into the viewport tools panel. Smooth (5-iteration Taubin smooth) reduces reconstruction noise without shrinkage and is seam-safe. Fill Holes closes open boundary loops left by Delete Faces or scan coverage gaps. Remove Floaters splits the mesh into connected components and discards fragments below 100 faces, eliminating background debris. Decimate applies QEM polygon reduction to a user-specified target face count via a dialog showing the current count and defaulting to 50% reduction; UV coordinates are transferred to the new topology via KD-tree nearest-vertex lookup. All four operations push a geometry snapshot to the undo stack before modifying the mesh.
 
 ## What I'd Improve
 

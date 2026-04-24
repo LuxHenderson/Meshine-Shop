@@ -344,14 +344,13 @@ void main() {
 }
 """
 
-# Face-ID shaders for pixel-accurate polygon selection.
+# Face-ID shaders (retained for Delete Faces GPU depth back-face guard).
 #
-# Instead of testing face centroids (which gives jagged triangle-boundary
-# selections), we render the mesh into an offscreen FBO where every fragment
-# is colored with the unique ID of its face, then read which IDs appear
-# under the pixels of the user's drawn polygon.  Only faces that have at
-# least one visible pixel inside the polygon are selected — this matches
-# how Blender and Maya implement lasso/boundary select.
+# Face selection for polygon layers uses Shapely triangle-polygon intersection
+# in screen space (_finalize_poly_selection). Any face whose projected triangle
+# overlaps the drawn polygon is included, giving pixel-accurate boundary coverage.
+# The GLSL analytical polygon mask clips the outside portions of boundary triangles
+# precisely — no centroid-gap artifacts, no jagged projection edges.
 #
 # Encoding: face_index+1 packed into 24-bit RGB (background stays (0,0,0,0)).
 # 'flat' interpolation on v_face_id guarantees every fragment in a primitive
@@ -557,35 +556,72 @@ uniform float proj_opacity;   // overall blend opacity (0.0 – 1.0)
 // Projection source texture (bound to texture unit 1)
 uniform sampler2D proj_tex;
 
-// Screen-space polygon mask (bound to texture unit 2).
-// Rasterized each frame from the layer's poly_pts_3d so the projected
-// texture is clipped to the exact shape the user drew — not just the
-// rough union of selected face triangles.
-uniform sampler2D layer_mask;
+// Camera forward direction (world space) at the moment the projection was created.
+// Used to discard fragments on the back side of the mesh when the camera orbits —
+// geo_n (from screen-space derivatives) flips sign when a face is viewed from
+// behind, so dot(geo_n, -proj_forward) < 0 reliably identifies back-face fragments
+// without needing per-vertex normals or winding-convention awareness.
+uniform vec3 proj_forward;
 
-// Viewport dimensions — used to convert gl_FragCoord to [0,1] UV for mask lookup.
-// gl_FragCoord uses OpenGL bottom-left origin; PIL mask uses top-left, so Y is flipped.
-uniform float viewport_w;
-uniform float viewport_h;
+// Analytical polygon mask — polygon vertices in GL screen space (pixels,
+// y=0 at bottom-left, matching gl_FragCoord.xy). Replaces the PIL-rasterized
+// bitmap mask: the GPU tests each fragment analytically, giving sub-pixel
+// accurate, perfectly anti-aliased edges with zero CPU-to-GPU texture upload.
+//
+// MAX_POLY = 64 vertices — more than any practical lasso selection.
+#define MAX_POLY 64
+uniform vec2  poly_verts[MAX_POLY];   // reprojected polygon corners (screen pixels)
+uniform int   poly_vert_count;        // number of active vertices (0 = no mask)
+
+// Winding-number point-in-polygon test.
+// Returns true if p is strictly inside the polygon. Handles concave and
+// self-intersecting polygons correctly via the non-zero winding rule.
+bool poly_contains(vec2 p) {
+    int winding = 0;
+    for (int i = 0; i < poly_vert_count; i++) {
+        int j = (i + 1 < poly_vert_count) ? i + 1 : 0;
+        vec2 a = poly_verts[i];
+        vec2 b = poly_verts[j];
+        // Cross product (b-a) × (p-a) — positive = p is left of directed edge a→b
+        float cross = (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
+        if (a.y <= p.y) {
+            if (b.y > p.y && cross > 0.0) winding++;   // upward crossing, p left of edge
+        } else {
+            if (b.y <= p.y && cross < 0.0) winding--;  // downward crossing, p right of edge
+        }
+    }
+    return winding != 0;
+}
+
+// Minimum distance from point p to the nearest polygon edge (in pixels).
+// Used with smoothstep to produce a 1-pixel anti-aliased fade at the boundary.
+float poly_edge_dist(vec2 p) {
+    float minD = 1.0e6;
+    for (int i = 0; i < poly_vert_count; i++) {
+        int j = (i + 1 < poly_vert_count) ? i + 1 : 0;
+        vec2 a  = poly_verts[i];
+        vec2 b  = poly_verts[j];
+        vec2 ab = b - a;
+        vec2 ap = p - a;
+        float t = clamp(dot(ap, ab) / max(dot(ab, ab), 1.0e-8), 0.0, 1.0);
+        minD = min(minD, length(ap - t * ab));
+    }
+    return minD;
+}
 
 in  vec3 v_world_pos;
 out vec4 f_color;
 
 void main() {
     // Step 1: Project world-space fragment position onto the (R, U) plane.
-    // dot(p, R) is the scalar projection along the right axis;
-    // dot(p, U) is the scalar projection along the up axis.
     float r = dot(v_world_pos, proj_right);
     float u = dot(v_world_pos, proj_up);
 
     // Step 2: Normalize to [0, 1] within the selection bounding box.
-    // At scale=1.0 the texture fills the entire selection with no waste.
     float pu = (r - proj_r_min) / proj_r_range;
     float pv = (u - proj_u_min) / proj_u_range;
 
-    // Step 3: Apply material transform.
-    // Center the UV around (0.5, 0.5), apply scale, rotate, re-center.
-    // Matches the CPU math in mesh_painter.py setup_layer_projection().
+    // Step 3: Apply material transform (scale, rotate, translate).
     float pu_c = pu - 0.5 - proj_offset_x;
     float pv_c = pv - 0.5 - proj_offset_y;
     pu_c /= proj_scale;
@@ -597,30 +633,33 @@ void main() {
     float tex_u = fract(pu_r + 0.5);
     float tex_v = fract(pv_r + 0.5);
 
-    // Step 4: Sample source texture. GPU handles bilinear + trilinear mipmap
-    // filtering automatically — no aliasing grain, no "Doom look".
+    // Step 4: Sample source texture with GPU bilinear + trilinear mipmap filtering.
     vec4 tex_color = texture(proj_tex, vec2(tex_u, tex_v));
 
-    // Step 5: Headlight shading — same as base mesh shader.
-    // Face culling is handled at IBO build time on the CPU (only front-facing
-    // faces are included in the projection VAO), so no per-fragment discard
-    // is needed here. dFdx/dFdy gives a winding-independent geometric normal
-    // for correct diffuse shading regardless of mesh winding convention.
+    // Step 5: Back-face discard + headlight shading.
+    // geo_n is the screen-space derivative normal — it always points "toward the
+    // current camera" for a front-facing fragment and FLIPS when the face is seen
+    // from behind (reversed screen winding). Comparing it against -proj_forward
+    // (direction toward original projection camera) discards fragments that are
+    // now on the back of the mesh relative to the original projection angle.
     vec3 geo_n = normalize(cross(dFdx(v_world_pos), dFdy(v_world_pos)));
-    vec3 N = geo_n;
-    float diffuse  = max(dot(N, vec3(0.0, 0.0, 1.0)), 0.0) * 0.65;
-    float ambient  = 0.35;
-    tex_color.rgb *= (diffuse + ambient);
+    if (dot(geo_n, -proj_forward) <= 0.0) discard;
+    float diffuse = max(dot(geo_n, vec3(0.0, 0.0, 1.0)), 0.0) * 0.65;
+    tex_color.rgb *= (diffuse + 0.35);
 
-    // Step 7: Clip to the exact drawn polygon via the screen-space mask.
-    // Y is flipped because gl_FragCoord is bottom-left but PIL mask is top-left.
-    vec2 screen_uv = vec2(gl_FragCoord.x / viewport_w, 1.0 - gl_FragCoord.y / viewport_h);
-    float mask = texture(layer_mask, screen_uv).r;
+    // Step 6: Analytical polygon mask — clip projection to drawn polygon shape.
+    // gl_FragCoord.xy is in screen pixels (0,0 = bottom-left), exactly matching
+    // the poly_verts coordinate space uploaded from Python each frame.
+    float poly_alpha = 1.0;
+    if (poly_vert_count >= 3) {
+        if (!poly_contains(gl_FragCoord.xy)) discard;
+        // Sub-pixel anti-aliasing: smoothstep from 0 at the boundary to 1.0
+        // at 1.5 pixels inside. Gives a clean 1-pixel AA fringe with no blur.
+        float edgeDist = poly_edge_dist(gl_FragCoord.xy);
+        poly_alpha = smoothstep(0.0, 1.5, edgeDist);
+    }
 
-    tex_color.a *= mask * proj_opacity;
-
-    // Discard fully transparent fragments so depth buffer is not dirtied
-    // and the albedo texture shows through around the projection edges.
+    tex_color.a *= poly_alpha * proj_opacity;
     if (tex_color.a < 0.004) discard;
 
     f_color = tex_color;
@@ -1288,14 +1327,83 @@ class ViewportWidget(QOpenGLWidget):
 
     def reset_model_rotation(self) -> None:
         """
-        Snap the mesh back to its original orientation (identity rotation).
+        Snap the mesh back to its original orientation and re-frame the camera.
 
-        Called by the Reset button in the tools panel. Clears _model_rot to
-        the identity matrix so the MVP shader receives no model transform.
+        If a gizmo rotation has been applied (_model_rot ≠ identity), bake it
+        into the mesh vertices before resetting so mesh operations always act on
+        the correct geometry. Then reset _model_rot to identity and re-frame the
+        camera to the default view — giving visible confirmation even when no
+        gizmo rotation was in effect.
         """
-        self._model_rot = np.eye(3, dtype=np.float32)
+        if self._painter is not None:
+            # Bake any accumulated gizmo rotation into geometry so mesh
+            # operations (decimate, smooth, etc.) work on the correct vertices.
+            if not np.allclose(self._model_rot, np.eye(3, dtype=np.float32)):
+                verts = np.asarray(self._painter._mesh.vertices, dtype=np.float64)
+                R     = self._model_rot.astype(np.float64)
+                self._painter._mesh.vertices = (R @ verts.T).T
+                self._needs_upload = True
+
+        self._model_rot  = np.eye(3, dtype=np.float32)
         self._gizmo_axis = None
+
+        # Re-frame the camera so the user gets clear visual confirmation
+        # and the viewport returns to a clean default starting view.
+        if self._painter is not None and self._camera is not None:
+            bbox_min, bbox_max = self._painter.get_bbox()
+            self._camera.frame_mesh(bbox_min, bbox_max)
+
         self.update()
+
+    # ------------------------------------------------------------------ #
+    # Mesh Operations — destructive edits, all undoable                  #
+    # ------------------------------------------------------------------ #
+
+    def apply_mesh_smooth(self, iterations: int = 5) -> None:
+        """Taubin smooth the mesh in-place. Preserves UV seams."""
+        if self._painter is None:
+            return
+        self._history.push_snapshot(self._painter, geometry=True)
+        self.history_changed.emit(self._history.can_undo, self._history.can_redo)
+        self._painter.mesh_smooth(iterations=iterations)
+        self._needs_upload = True
+        self.update()
+
+    def apply_mesh_fill_holes(self) -> None:
+        """Close open boundary loops. New patch vertices get UV (0,0)."""
+        if self._painter is None:
+            return
+        self._history.push_snapshot(self._painter, geometry=True)
+        self.history_changed.emit(self._history.can_undo, self._history.can_redo)
+        self._painter.mesh_fill_holes()
+        self._needs_upload = True
+        self.update()
+
+    def apply_mesh_remove_floaters(self, min_faces: int = 100) -> None:
+        """Discard disconnected components with fewer than min_faces triangles."""
+        if self._painter is None:
+            return
+        self._history.push_snapshot(self._painter, geometry=True)
+        self.history_changed.emit(self._history.can_undo, self._history.can_redo)
+        self._painter.mesh_remove_floaters(min_faces=min_faces)
+        self._needs_upload = True
+        self.update()
+
+    def apply_mesh_decimate(self, target_faces: int) -> None:
+        """Reduce polygon count to target_faces via quadric error decimation."""
+        if self._painter is None:
+            return
+        self._history.push_snapshot(self._painter, geometry=True)
+        self.history_changed.emit(self._history.can_undo, self._history.can_redo)
+        self._painter.mesh_decimate(target_faces=target_faces)
+        self._needs_upload = True
+        self.update()
+
+    def get_face_count(self) -> int:
+        """Return current mesh face count, or 0 if no mesh is loaded."""
+        if self._painter is None:
+            return 0
+        return len(self._painter._mesh.faces)
 
     def normalize_scale(self) -> None:
         """
@@ -1608,6 +1716,7 @@ class ViewportWidget(QOpenGLWidget):
                         "ibo":     _proj_ibo,
                         "vao":     _proj_vao,
                         "params":  _params,
+                        "cam_fwd": _setup.get("cam_fwd", np.array([0.0, 0.0, -1.0], dtype=np.float32)),
                         "visible": _setup.get("visible", True),
                     }
                     log.info("paintGL: proj GPU setup complete layer=%d faces=%d tex=%dx%d",
@@ -1681,9 +1790,7 @@ class ViewportWidget(QOpenGLWidget):
         # Each active projection layer is rendered over the albedo using planar
         # UV projection computed in world space. This gives a perfect shape
         # (exactly the face selection) with full GPU bilinear/mipmap quality.
-        if (self._proj_layers and self._proj_prog is not None
-                and self._layer_mask_tex is not None):
-            from PIL import Image as _PilProj, ImageDraw as _PilDProj  # noqa: PLC0415
+        if self._proj_layers and self._proj_prog is not None:
             self._ctx.enable(moderngl.BLEND)
             self._ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
             # LEQUAL so the projection pass (same faces as base mesh) passes depth.
@@ -1691,61 +1798,44 @@ class ViewportWidget(QOpenGLWidget):
             w_vp = float(self.width())
             h_vp = float(self.height())
             self._proj_prog["MVP"].write(mvp.T.tobytes())
-            self._proj_prog["proj_tex"].value   = 1   # source texture on unit 1
-            self._proj_prog["layer_mask"].value = 2   # polygon mask on unit 2
-            self._proj_prog["viewport_w"].value = w_vp
-            self._proj_prog["viewport_h"].value = h_vp
+            self._proj_prog["proj_tex"].value = 1   # source texture on unit 1
 
             for lid, pdata in self._proj_layers.items():
                 if not pdata.get("visible", True):
                     continue
 
                 try:
-                    # --- Rasterize the polygon mask for this layer ---
-                    # Reproject poly_pts_3d through the live MVP so the mask always
-                    # matches the current camera angle, then PIL-fill into _layer_mask_tex.
-                    # NOTE: No per-frame back-face normal check here — Apple OC meshes have
-                    # CW-wound faces whose raw cross-product normals point inward, so a dot-
-                    # product test would incorrectly cull front-facing projections.  Back-face
-                    # geometry is already excluded by the signed-area IBO filter applied when
-                    # the projection was set up; we just trust that and always render.
+                    # --- Upload polygon verts as GLSL uniforms (analytical mask) ---
+                    # Each frame, the layer's 3D anchor points are reprojected through
+                    # the live MVP to GL screen-space pixels (y=0 at bottom, matching
+                    # gl_FragCoord.xy) and passed directly to the fragment shader.
+                    # The shader runs a winding-number point-in-polygon test + SDF
+                    # edge distance per fragment — zero CPU rasterization, zero texture
+                    # upload, mathematically perfect sub-pixel AA edges.
                     layer       = self._layers.get(lid, {})
                     poly_pts_3d = layer.get("poly_pts_3d")
-                    mask_w = self._layer_mask_tex.width
-                    mask_h = self._layer_mask_tex.height
+                    p           = self._proj_prog
                     if poly_pts_3d and len(poly_pts_3d) >= 3:
-                        from PIL import ImageFilter as _IF
-                        pts_w = np.array(poly_pts_3d, dtype=np.float32)
-                        pts4  = np.hstack([pts_w, np.ones((len(pts_w), 1), np.float32)])
-                        lproj = (mvp @ pts4.T).T
-                        lwc   = np.where(np.abs(lproj[:, 3]) < 1e-8, 1e-8, lproj[:, 3])
-                        l_sx  = ((lproj[:, 0] / lwc + 1.0) * 0.5 * mask_w).astype(int)
-                        l_sy  = ((1.0 - (lproj[:, 1] / lwc + 1.0) * 0.5) * mask_h).astype(int)
-                        # Supersample 4× for clean polygon edge anti-aliasing.
-                        # PIL Draw.polygon() has no native AA — rasterizing at 4× screen
-                        # resolution then Lanczos-downsampling gives sub-pixel smooth edges
-                        # with no staircase artifacts. Minimal blur (radius=1) feathers the
-                        # last sub-pixel fringe without introducing softness.
-                        _SS = 4
-                        lmask_hi = _PilProj.new("L", (mask_w * _SS, mask_h * _SS), 0)
-                        _PilDProj.Draw(lmask_hi).polygon(
-                            [(int(l_sx[k]) * _SS, int(l_sy[k]) * _SS)
-                             for k in range(len(l_sx))],
-                            fill=255,
-                        )
-                        lmask = lmask_hi.resize(
-                            (mask_w, mask_h), _PilProj.Resampling.LANCZOS
-                        )
-                        lmask = lmask.filter(_IF.GaussianBlur(radius=1))
-                        self._layer_mask_tex.write(np.array(lmask, dtype=np.uint8).tobytes())
+                        pts_w  = np.array(poly_pts_3d, dtype=np.float32)
+                        pts4   = np.hstack([pts_w, np.ones((len(pts_w), 1), np.float32)])
+                        lproj  = (mvp @ pts4.T).T
+                        lwc    = np.where(np.abs(lproj[:, 3]) < 1e-8, 1e-8, lproj[:, 3])
+                        # GL screen space: x left→right, y bottom→top (no Y-flip)
+                        l_sx   = (lproj[:, 0] / lwc + 1.0) * 0.5 * w_vp
+                        l_sy   = (lproj[:, 1] / lwc + 1.0) * 0.5 * h_vp
+                        n_verts = min(len(l_sx), 64)
+                        # Pack into flat float32 [x0,y0, x1,y1, ...] padded to 64 pairs
+                        poly_flat = np.zeros(128, dtype=np.float32)
+                        poly_flat[:n_verts * 2:2] = l_sx[:n_verts]
+                        poly_flat[1:n_verts * 2:2] = l_sy[:n_verts]
+                        p["poly_verts"].write(poly_flat.tobytes())
+                        p["poly_vert_count"].value = n_verts
                     else:
-                        # No polygon data — fill mask with white (no clipping)
-                        self._layer_mask_tex.write(
-                            bytes([255] * (mask_w * mask_h))
-                        )
+                        # No polygon — shader renders the full face selection uncropped
+                        p["poly_vert_count"].value = 0
 
-                    pr  = pdata["params"]
-                    p   = self._proj_prog
+                    p["proj_forward"].write(pdata["cam_fwd"].tobytes())
+                    pr = pdata["params"]
                     p["proj_right"].write(pr["right"].tobytes())
                     p["proj_up"].write(pr["up"].tobytes())
                     p["proj_r_min"].value    = pr["r_min"]
@@ -1759,7 +1849,6 @@ class ViewportWidget(QOpenGLWidget):
                     p["proj_offset_y"].value = pr["offset_y"]
                     p["proj_opacity"].value  = pr["opacity"]
                     pdata["gpu_tex"].use(1)
-                    self._layer_mask_tex.use(2)
                     pdata["vao"].render()
                 except Exception:
                     log.exception("paintGL: projection render EXCEPTION lid=%d", lid)
@@ -3372,9 +3461,14 @@ class ViewportWidget(QOpenGLWidget):
         """
         Close the polygon and determine exactly which mesh faces fall inside it.
 
-        Uses a pure CPU/numpy approach: projects every mesh vertex through the
-        current MVP matrix to screen space, then tests each face's vertices and
-        centroid against a PIL-rasterized polygon mask.
+        Uses a pure CPU/numpy+Shapely approach: projects every mesh vertex through
+        the current MVP matrix to screen space, then tests each face's screen-space
+        triangle against the drawn polygon using Shapely intersection.
+
+        Any face whose screen-space triangle overlaps the polygon at all is included
+        in the face set. This gives pixel-accurate boundary coverage — the GLSL
+        analytical polygon mask clips the outside portion of boundary triangles
+        precisely, producing clean projection edges without centroid-gap artifacts.
 
         This shares the exact same coordinate space as the drawn polygon — no
         OpenGL FBO, no Retina/DPR mismatch, no pixel-readback ambiguity. The
@@ -3446,33 +3540,46 @@ class ViewportWidget(QOpenGLWidget):
         isy = np.clip(sy.astype(np.int32), 0, h - 1)  # (N,)
 
         # ------------------------------------------------------------------ #
-        # 3.  Test each face against the polygon mask                         #
+        # 3.  Test each face against the polygon using Shapely intersection  #
         # ------------------------------------------------------------------ #
-        # A face is selected if ANY of its 3 vertices OR its centroid falls
-        # inside the drawn polygon.  The centroid test catches faces whose
-        # vertices are all just outside the polygon boundary but whose interior
-        # is clearly inside it — common for large triangles at shallow angles.
+        # Instead of testing face centroids (which gives jagged triangle-boundary
+        # edges because boundary triangles whose centroid falls just outside the
+        # polygon are excluded, leaving visible IBO gaps the GLSL mask cannot fill),
+        # we test whether the screen-space triangle intersects the drawn polygon at
+        # all. Any face with ANY screen-space overlap is included in the face set;
+        # the GLSL analytical polygon mask clips the outside portion precisely.
+        #
+        # Pre-filter with a numpy bounding-box check to skip obviously-excluded
+        # faces without calling into Shapely at all — keeps runtime acceptable for
+        # high-density meshes.
+        from shapely.geometry import Polygon as _ShPoly  # noqa: PLC0415
+
         vi0, vi1, vi2 = faces_arr[:, 0], faces_arr[:, 1], faces_arr[:, 2]
 
-        # Test face centroid against the polygon mask.
-        # Centroid = average of the three projected vertex screen positions.
-        # Using the centroid means "this face is mostly inside the polygon" —
-        # it spans the full selection area without over-selecting partial
-        # boundary faces, and avoids the strip/cluster artifacts that "all 3
-        # vertices inside" produces at the polygon edges.
-        cx_f = (sx[vi0] + sx[vi1] + sx[vi2]) / 3.0   # float centroid x (N,)
-        cy_f = (sy[vi0] + sy[vi1] + sy[vi2]) / 3.0   # float centroid y (N,)
-        cx_i = np.clip(cx_f.astype(np.int32), 0, w - 1)
-        cy_i = np.clip(cy_f.astype(np.int32), 0, h - 1)
-        face_inside = mask[cy_i, cx_i]                 # (M,) bool
+        # Build the selection polygon in screen space (same coords as sx/sy).
+        sel_poly = _ShPoly(self._poly_points)
+        p_min_x, p_min_y, p_max_x, p_max_y = sel_poly.bounds
 
-        # Centroid-only test: no front-face culling.
-        # Front-face culling was tried but Apple Object Capture OBJ files use
-        # CW winding, so trimesh face_normals are inverted relative to the camera
-        # convention. The culling was selecting the wrong faces (discarding ~86%
-        # of the correct front-visible faces). Centroid-only is clean enough on
-        # its own — back faces of a closed mesh project to different screen regions.
-        selected: set[int] = set(int(i) for i in np.where(face_inside)[0])
+        # Bounding-box pre-filter: compute per-face screen bbox in one numpy pass.
+        f_min_x = np.minimum(np.minimum(sx[vi0], sx[vi1]), sx[vi2])
+        f_max_x = np.maximum(np.maximum(sx[vi0], sx[vi1]), sx[vi2])
+        f_min_y = np.minimum(np.minimum(sy[vi0], sy[vi1]), sy[vi2])
+        f_max_y = np.maximum(np.maximum(sy[vi0], sy[vi1]), sy[vi2])
+        bbox_candidates = np.where(
+            (f_max_x >= p_min_x) & (f_min_x <= p_max_x) &
+            (f_max_y >= p_min_y) & (f_min_y <= p_max_y)
+        )[0]
+
+        # For each bbox-passing face, test true Shapely polygon intersection.
+        # This catches every boundary triangle regardless of where its centroid falls.
+        selected: set[int] = set()
+        for fi in bbox_candidates:
+            ax, ay = float(sx[vi0[fi]]), float(sy[vi0[fi]])
+            bx, by = float(sx[vi1[fi]]), float(sy[vi1[fi]])
+            cx_, cy = float(sx[vi2[fi]]), float(sy[vi2[fi]])
+            tri = _ShPoly([(ax, ay), (bx, by), (cx_, cy)])
+            if sel_poly.intersects(tri):
+                selected.add(int(fi))
 
         # ------------------------------------------------------------------ #
         # 4.  Average face normal for back-face culling of committed layers   #
@@ -4422,10 +4529,20 @@ class ViewportWidget(QOpenGLWidget):
         # managed GL frame (context guaranteed current, no makeCurrent needed).
         # Store everything the paintGL setup pass will need.
         # ------------------------------------------------------------------
+        # Capture camera forward direction now — used by the shader to discard
+        # back-face fragments when the camera orbits away from the original angle.
+        if self._camera is not None:
+            _fwd = self._camera.focal_point - self._camera.position
+            _n   = np.linalg.norm(_fwd)
+            _cam_fwd = (_fwd / _n if _n > 1e-8 else np.array([0.0, 0.0, -1.0])).astype(np.float32)
+        else:
+            _cam_fwd = np.array([0.0, 0.0, -1.0], dtype=np.float32)
+
         self._pending_proj_setups[layer_id] = {
             "texture_img": texture_img,   # RGBA PIL image
             "face_set":    face_set,
             "params":      params,
+            "cam_fwd":     _cam_fwd,      # world-space camera forward at projection time
             "visible":     True,
         }
         log.info("project_texture_to_layer: queued pending setup for layer %d (%d faces)",

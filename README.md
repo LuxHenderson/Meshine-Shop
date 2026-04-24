@@ -168,7 +168,7 @@ The viewport sits between the Process and Export pages. The pipeline auto-naviga
 
 **Polygon Selection + Layers**
 - Lasso tool: click to place polygon anchor points (committed instantly on press), Enter or double-click to finalize
-- CPU/numpy face selection: every mesh vertex projected to screen space via MVP; faces selected when centroid lands inside the drawn polygon mask — no FBO, no DPR mismatch
+- **Pixel-accurate face selection via Shapely intersection**: every mesh vertex projected to screen space via MVP; faces included when their screen-space triangle intersects the drawn polygon (Shapely `intersects()`) — not just faces whose centroid is inside. A numpy bounding-box pre-filter skips non-candidates before Shapely is invoked. Any face with any polygon overlap is included; the GLSL mask clips exterior portions precisely. No FBO, no DPR mismatch
 - **Pending overlay**: teal screen-space mask; reprojects from 3D anchor points each frame so the overlay tracks the mesh surface during orbit before saving
 - **In-progress anchor tracking**: world-space 3D positions are stored for each anchor at click time via BVH ray cast. On every camera movement — orbit, pan, WASD fly navigation — anchor positions are reprojected through the current camera MVP so the lasso overlay stays glued to the mesh surface. The rubber-band preview line suppresses itself during camera-only movement and reappears naturally on the next mouse move.
 - **Committed overlay**: per-frame 3D anchor reprojection — anchor points stored as world-space surface positions, reprojected through the current camera MVP each frame. The highlight stays glued to the model surface from any orbit angle or WASD camera movement without drifting.
@@ -180,10 +180,17 @@ The viewport sits between the Process and Export pages. The pipeline auto-naviga
 - Textures are projected onto the mesh via a dedicated GLSL second render pass — planar UV projection entirely in world-space, not UV-atlas space
 - Projection frame (Right, Up, Normal vectors) passed as shader uniforms; planar UVs computed in the fragment shader at GPU framerate
 - Source textures uploaded as trilinear mipmap `LINEAR_MIPMAP_LINEAR` moderngl textures for highest quality sampling at all distances and angles
-- **Screen-space polygon mask**: the drawn lasso polygon is rasterized each frame from its 3D world-space anchor points through the live MVP and bound to the projection shader as a sampler. The shader discards projected fragments outside the polygon shape — the projection clips exactly to the drawn selection boundary, not to full face boundaries
+- **GLSL analytical polygon mask**: the drawn lasso polygon is uploaded as `uniform vec2 poly_verts[64]` and tested per-fragment via a winding-number point-in-polygon algorithm entirely in GLSL. SDF edge distance drives a `smoothstep` 1.5px AA fringe. Zero CPU rasterization, zero texture upload per frame — mathematically exact sub-pixel edges at GPU framerate
+- **Back-face discard**: the camera's world-space forward direction at projection time is stored per layer as `proj_forward`. Each frame the shader discards fragments where the screen-space derivative normal (`dFdx`/`dFdy` cross product) no longer agrees with the original projection direction — hiding the projection when the camera orbits behind the mesh
 - **Depth test fix**: the projection pass re-draws the same faces as the base pass at equal depth. OpenGL's default `GL_LESS` discards equal-depth fragments (making the projection invisible). Fixed by setting `depth_func = "<="` before the projection pass and restoring `"<"` after
-- Each projection layer is independent: separate face-subset IBO, separate texture, separate screen-space mask, toggled via the layers panel eye icon
+- Each projection layer is independent: separate face-subset IBO, separate texture, separate polygon mask, toggled via the layers panel eye icon
 - **Export baking**: at export time, `bake_projections_to_atlas()` in `mesh_painter.py` implements the shader math in numpy — per-face UV triangle rasterization, barycentric interpolation of 3D positions, planar UV computation, bilinear texture sampling, alpha compositing. Runs at 2× supersampling resolution then LANCZOS downsamples to atlas size for anti-aliased results
+
+**Mesh Operations**
+- **Smooth Mesh**: 5-iteration Taubin smooth (alternating shrink/inflate Laplacian passes) — reduces reconstruction noise without mesh shrinkage. Seam-safe: edits propagate to UV-seam duplicate vertex pairs to prevent cracks. Undoable
+- **Fill Holes**: closes open boundary loops using trimesh's hole-fill repair — useful after Delete Faces or to patch scan coverage gaps. New patch vertices receive UV (0,0). Undoable
+- **Remove Floaters**: splits the mesh into connected components and discards any fragment below 100 faces — eliminates background debris and reconstruction artefacts while preserving the main subject. Undoable
+- **Decimate**: quadric error metric (QEM) polygon reduction via a target-face-count dialog showing the current count and defaulting to 50% reduction. UV coordinates are transferred to the new topology via KD-tree nearest-vertex lookup. Undoable
 
 ### UI/UX
 - Charcoal + crimson dark theme with cohesive outlined button styling
@@ -226,7 +233,7 @@ The viewport sits between the Process and Export pages. The pipeline auto-naviga
 - [x] 5f — Layer system: save, name, toggle visibility, delete, color swatches, 3D overlay tracking
 - [x] 5g — Ultra (400K / 8K) quality preset for maximum-fidelity hero assets
 - [x] 5h — Shader-based texture projection with screen-space polygon mask and export baking
-- [ ] 5i — Mesh operations (smooth, decimate, fill holes, subdivide, remove floaters)
+- [x] 5i — Mesh operations (smooth, decimate, fill holes, subdivide, remove floaters)
 - [ ] 5j — Settings dialog (camera sensitivity, keybindings)
 
 ### Phase 3: LiDAR Live Capture

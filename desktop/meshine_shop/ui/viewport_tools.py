@@ -744,6 +744,11 @@ class ViewportToolsPanel(QWidget):
     # Emitted when the sculpt brush radius or strength sliders change
     sculpt_radius_changed = Signal(float)
     sculpt_strength_changed = Signal(float)
+    # Mesh operation signals — no args; viewport/main_window handles params/dialogs
+    mesh_smooth_requested          = Signal()
+    mesh_fill_holes_requested      = Signal()
+    mesh_remove_floaters_requested = Signal()
+    mesh_decimate_requested        = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -992,6 +997,50 @@ class ViewportToolsPanel(QWidget):
         layout.addLayout(opacity_row)
 
         self._opacity_slider.valueChanged.connect(self._on_opacity_changed)
+
+        # ------------------------------------------------------------------ #
+        # Mesh Operations section                                              #
+        # ------------------------------------------------------------------ #
+        div_mesh = QFrame()
+        div_mesh.setFrameShape(QFrame.Shape.HLine)
+        div_mesh.setObjectName("tools_divider")
+        layout.addWidget(div_mesh)
+
+        mesh_header = QLabel("Mesh Operations")
+        mesh_header.setObjectName("tools_section_header")
+        layout.addWidget(mesh_header)
+
+        self._mesh_smooth_btn = QPushButton("≋  Smooth Mesh")
+        self._mesh_smooth_btn.setObjectName("reset_rotation_btn")
+        self._mesh_smooth_btn.setToolTip(
+            "Taubin smooth — reduce noise without shrinkage (5 iterations)"
+        )
+        self._mesh_smooth_btn.clicked.connect(self.mesh_smooth_requested.emit)
+        layout.addWidget(self._mesh_smooth_btn)
+
+        self._mesh_fill_btn = QPushButton("⬡  Fill Holes")
+        self._mesh_fill_btn.setObjectName("reset_rotation_btn")
+        self._mesh_fill_btn.setToolTip(
+            "Close open boundary loops left by Delete Faces or scan gaps"
+        )
+        self._mesh_fill_btn.clicked.connect(self.mesh_fill_holes_requested.emit)
+        layout.addWidget(self._mesh_fill_btn)
+
+        self._mesh_floaters_btn = QPushButton("✕  Remove Floaters")
+        self._mesh_floaters_btn.setObjectName("reset_rotation_btn")
+        self._mesh_floaters_btn.setToolTip(
+            "Discard small disconnected fragments (< 100 faces) left by reconstruction"
+        )
+        self._mesh_floaters_btn.clicked.connect(self.mesh_remove_floaters_requested.emit)
+        layout.addWidget(self._mesh_floaters_btn)
+
+        self._mesh_decimate_btn = QPushButton("⬡  Decimate")
+        self._mesh_decimate_btn.setObjectName("reset_rotation_btn")
+        self._mesh_decimate_btn.setToolTip(
+            "Reduce polygon count via quadric error decimation"
+        )
+        self._mesh_decimate_btn.clicked.connect(self.mesh_decimate_requested.emit)
+        layout.addWidget(self._mesh_decimate_btn)
 
         # ------------------------------------------------------------------ #
         # Spacer                                                               #
