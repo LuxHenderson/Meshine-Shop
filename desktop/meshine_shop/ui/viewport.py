@@ -1359,7 +1359,7 @@ class ViewportWidget(QOpenGLWidget):
     # Mesh Operations — destructive edits, all undoable                  #
     # ------------------------------------------------------------------ #
 
-    def apply_mesh_smooth(self, iterations: int = 5) -> None:
+    def apply_mesh_smooth(self, iterations: int = 1) -> None:
         """Taubin smooth the mesh in-place. Preserves UV seams."""
         if self._painter is None:
             return

@@ -92,7 +92,7 @@ Meshine Shop/
 
 **Centralized QSS theming:** All visual styling lives in a single `styles.py` file rather than being scattered across widgets. This makes theme changes trivial and keeps UI code focused on layout and behavior.
 
-## Current Features (Phase 1 + Phase 2 Complete, Phase 5 Viewport In Progress)
+## v1.0 Features
 
 ### Reconstruction Engines
 - **Apple Object Capture** (macOS): Metal-accelerated reconstruction producing ~250K vertices at `full` detail with PBR textures (diffuse, normal, roughness, AO, metallic) via RealityKit's PhotogrammetrySession API. Quality preset controls detail level: Mobile → `reduced`, PC/Cinematic/Ultra → `full`
@@ -186,11 +186,11 @@ The viewport sits between the Process and Export pages. The pipeline auto-naviga
 - Each projection layer is independent: separate face-subset IBO, separate texture, separate polygon mask, toggled via the layers panel eye icon
 - **Export baking**: at export time, `bake_projections_to_atlas()` in `mesh_painter.py` implements the shader math in numpy — per-face UV triangle rasterization, barycentric interpolation of 3D positions, planar UV computation, bilinear texture sampling, alpha compositing. Runs at 2× supersampling resolution then LANCZOS downsamples to atlas size for anti-aliased results
 
-**Mesh Operations**
-- **Smooth Mesh**: 5-iteration Taubin smooth (alternating shrink/inflate Laplacian passes) — reduces reconstruction noise without mesh shrinkage. Seam-safe: edits propagate to UV-seam duplicate vertex pairs to prevent cracks. Undoable
-- **Fill Holes**: closes open boundary loops using trimesh's hole-fill repair — useful after Delete Faces or to patch scan coverage gaps. New patch vertices receive UV (0,0). Undoable
-- **Remove Floaters**: splits the mesh into connected components and discards any fragment below 100 faces — eliminates background debris and reconstruction artefacts while preserving the main subject. Undoable
-- **Decimate**: quadric error metric (QEM) polygon reduction via a target-face-count dialog showing the current count and defaulting to 50% reduction. UV coordinates are transferred to the new topology via KD-tree nearest-vertex lookup. Undoable
+**Mesh Operations** *(partially implemented — in active development)*
+- **Smooth Mesh**: single-pass Taubin smooth per click (alternating shrink/inflate Laplacian, `λ=0.1 / μ=-0.11`) — reduces reconstruction noise without mesh shrinkage. Seam-safe: edits propagate to UV-seam duplicate vertex pairs to prevent cracks. Volume is near-stable across repeated applications. Undoable. *Status: working.*
+- **Fill Holes**: closes open boundary loops — useful after Delete Faces or to patch scan coverage gaps. Traces directed boundary half-edges into closed loops, splits figure-8 / bowtie boundaries at pinch-point vertices, then fan-triangulates each loop from its centroid. New patch vertices receive UV (0,0). Undoable. *Status: implemented, in verification.*
+- **Remove Floaters**: splits the mesh into connected components and discards any fragment below 100 faces — eliminates background debris and reconstruction artefacts while preserving the main subject. Undoable. *Status: working.*
+- **Decimate**: quadric error metric (QEM) polygon reduction via a target-face-count dialog showing the current count and defaulting to 50% reduction. UV coordinates are transferred to the new topology via KD-tree nearest-vertex lookup. Undoable. *Status: working.*
 
 ### UI/UX
 - Charcoal + crimson dark theme with cohesive outlined button styling
@@ -202,50 +202,49 @@ The viewport sits between the Process and Export pages. The pipeline auto-naviga
 
 ## Roadmap
 
-### Phase 1: Core Pipeline (Complete)
-- [x] 1a — Project scaffolding and app shell
-- [x] 1b — COLMAP photogrammetry engine integration
-- [x] 1c — Processing pipeline with stage-by-stage UI feedback
-- [x] 1d — Basic mesh export (.OBJ / .glTF)
-- [x] 1e — Apple Object Capture integration (macOS high-quality reconstruction)
-- [x] 1f — UI refinements (folder import, browse button, consistent styling)
+### v1.0 — Complete
+- [x] Project scaffolding and app shell
+- [x] COLMAP photogrammetry engine integration (SfM/MVS, CUDA on Windows, CPU fallback)
+- [x] Apple Object Capture integration (Metal-accelerated, ~250K vertices with PBR textures)
+- [x] Engine-agnostic pipeline: factory auto-selects best engine per platform
+- [x] Full 9-stage processing pipeline with live stage-by-stage UI feedback
+- [x] Mesh decimation with quality presets (Mobile 15K / PC 65K / Cinematic 200K / Ultra 400K)
+- [x] Automatic UV unwrapping (xatlas — non-overlapping atlas packed into [0,1]²)
+- [x] Five-map PBR texture baking: albedo, normal, AO, roughness, metallic
+- [x] Texel-space PBR baking from USDZ (BVH surface proximity + Cramér's-rule barycentric UV interpolation — full photographic resolution, zero Voronoi artifacts)
+- [x] Preset-scaled texture resolution (Mobile 1024 / PC 2048 / Cinematic 4096 / Ultra 8192)
+- [x] Selective PBR correction for Object Capture maps (organic zones corrected, metal zones preserved)
+- [x] Albedo clarity enhancement (shadow lift + saturation boost for dark-subject visibility)
+- [x] Vertex tangent embedding in GLB (MikkTSpace-compatible TANGENT for spec-compliant normal map rendering)
+- [x] Multi-format export: OBJ, glTF Binary (GLB), FBX — all with full PBR texture bundles
+- [x] Viewport projection baking: painted layers composited onto UV atlas at export time
+- [x] Custom OpenGL 4.1 viewport (moderngl + PySide6 QOpenGLWidget): textured mesh render, diffuse shading, deferred VBO upload
+- [x] Unreal Engine-style camera navigation (fly, orbit, pan, zoom, frame)
+- [x] Sculpt brushes: inflate, deflate, smooth, flatten — BVH ray cast hit detection, seam-safe deformation
+- [x] Undo/redo command stack (ICommand ABC — Ctrl+Z / Ctrl+Shift+Z)
+- [x] Polygon lasso selection: Shapely triangle–polygon intersection (pixel-accurate boundary faces), GLSL analytical polygon mask (winding-number, 1.5px AA), 3D anchor reprojection on orbit/fly
+- [x] Layer system: save, toggle visibility, rename, delete, per-layer color, crimson default
+- [x] Delete Faces: cookie-cutter clipping via Shapely + constrained Delaunay re-triangulation, GPU depth buffer back-face guard
+- [x] Shader-based texture projection: GLSL second render pass, planar UV in world space, proj_forward back-face discard, GLSL analytical polygon mask
+- [x] Smooth Mesh operation: conservative single-pass Taubin per click, seam-safe, undoable
+- [x] Remove Floaters operation: connected component analysis, discards fragments < 100 faces, undoable
+- [x] Decimate operation: QEM reduction to user-specified target, UV transfer via KD-tree, undoable
 
-### Phase 2: Game-Ready Optimization (Complete)
-- [x] 2a — Mesh decimation with quality presets
-- [x] 2b — Automatic UV unwrapping (xatlas)
-- [x] 2c — Texture baking (albedo, normals, AO)
-- [x] 2d — PBR material estimation (roughness + metallic from image-space HSV analysis)
-- [x] 2e — FBX export with texture bundle (via Assimp CLI)
-- [x] 2f — Mesh geometry quality (higher polygon budgets, pre-decimation smoothing, isolated fragment removal)
-- [x] 2g — Texel-space PBR baking from USDZ (full resolution sampling + texture dilation for all 5 maps)
-- [x] 2h — Apple Object Capture quality control (detail level tied to quality preset)
-- [x] 2i — Vertex tangent embedding in GLB (MikkTSpace-compatible TANGENT attribute for correct normal map rendering)
-- [x] 2j — Preset-scaled texture resolution (Mobile 1024, PC 2048, Cinematic 4096, Ultra 8192)
-- [x] 2k — Selective PBR correction (metallic-mask-guided: organic zones get roughness floor 0.60 + metallic → 0; metal zones preserved as chrome)
-- [x] 2l — Albedo clarity enhancement (shadow lift for dark-subject detail visibility + 1.5× saturation boost)
+### In Progress — Paused
+- 🔧 **Fill Holes**: boundary loop tracer + figure-8 split + fan triangulation implemented — pending full verification against Delete Faces output
+- 🔧 **Mesh Operations stability**: Smooth, Remove Floaters, and Decimate are working; overall mesh operations suite needs additional real-world testing before being considered stable
+- 🔧 **Depth overlay distance verification**: fix applied (threshold 0.9995 → 0.9999) but not yet verified at medium/far camera distances
 
-### Phase 5: 3D Viewport (In Progress)
-- [x] 5a — QOpenGLWidget + moderngl render loop (textured mesh, diffuse shading)
-- [x] 5b — Unreal Engine-style camera navigation (fly, orbit, pan, zoom, frame)
-- [x] 5c — Undo/redo command stack
-- [x] 5d — Sculpt brushes (inflate, deflate, smooth, flatten) with seam-safe deformation
-- [x] 5e — Polygon lasso selection with FBO face-ID rendering and pixel-based face collection
-- [x] 5f — Layer system: save, name, toggle visibility, delete, color swatches, 3D overlay tracking
-- [x] 5g — Ultra (400K / 8K) quality preset for maximum-fidelity hero assets
-- [x] 5h — Shader-based texture projection with screen-space polygon mask and export baking
-- [x] 5i — Mesh operations (smooth, decimate, fill holes, subdivide, remove floaters)
-- [ ] 5j — Settings dialog (camera sensitivity, keybindings)
-
-### Phase 3: LiDAR Live Capture
-- [ ] 3a — iOS companion app (ARKit + LiDAR)
-- [ ] 3b — WebSocket/gRPC streaming protocol
-- [ ] 3c — Real-time 3D point cloud preview
-- [ ] 3d — Capture-to-pipeline handoff
-
-### Phase 4: Polish & Packaging
-- [ ] Desktop installers (macOS + Windows)
-- [ ] Batch processing for multiple assets
-- [ ] First-run tutorial and documentation
+### Planned for Future Releases
+- **Windows / CUDA validation** — full pipeline tested on an NVIDIA RTX system; COLMAP CUDA path verified end-to-end
+- **Full-model texture projection** — project a texture across the entire mesh surface in a single operation, not just within a polygon selection
+- **Previous Jobs section** — reopen past reconstruction jobs in the viewport for continued editing; replace auto-trash-on-close with persistent job storage
+- **Mesh merge tool** — combine multiple photogrammetry captures of the same subject into a single unified mesh
+- **Performance optimization** — COLMAP sequential/vocab-tree matching for large datasets; image downscaling at ingest; BVH proximity bake caching for repeated exports on the same mesh
+- **LiDAR live capture** — iOS companion app (ARKit + LiDAR) streaming depth + RGB + pose to desktop via WebSocket/gRPC
+- **Viewport settings dialog** — camera sensitivity, keybindings customization
+- **Desktop installers** — PyInstaller bundles for macOS and Windows; first-run tutorial
+- **Batch processing** — multiple assets processed sequentially in one session
 
 ## Setup Instructions
 
@@ -303,15 +302,7 @@ poetry run python scripts/dev.py
 
 - **COLMAP on macOS is sparse-only:** Apple Silicon uses Metal, not CUDA. Dense reconstruction is skipped; meshing proceeds from the sparse point cloud. On macOS, Apple Object Capture is strongly preferred and automatically selected.
 - **iPhone photos are HEIC internally:** Even when named `.JPEG`, iPhone photos are HEIC format. The app handles this automatically via Pillow + pillow-heif conversion.
-- **macOS-only testing so far:** Cross-platform support is architected in but Windows testing has not started.
-
-## Future Improvements
-
-- Plugin system for custom pipeline stages
-- Cloud processing offload for large datasets
-- Android companion app for LiDAR capture
-- Real-time collaborative scanning (multiple phones contributing to one reconstruction)
-- Performance optimization: Apple Object Capture detail level control, COLMAP sequential/vocab-tree matching for large datasets, image preprocessing (auto-resize inputs)
-- Previous Jobs section — reopen past reconstruction jobs in the viewport for continued editing
-- Automated background removal in the Import stage (preprocessing pass before reconstruction)
-- Mesh merge tool for combining multi-session capture datasets
+- **macOS-only testing so far:** Cross-platform support is architected in (engine factory, platform-agnostic pipeline, PySide6 for UI) but Windows has not been tested. CUDA path is in the COLMAP engine but unverified on real hardware.
+- **Mesh operations are functional but early:** Smooth, Remove Floaters, and Decimate are working. Fill Holes is implemented and under verification. None have been stress-tested against the full range of reconstruction output topologies.
+- **Texture projection back-face bleed-through:** Minor fragmented bleed-through of the projected texture is visible from some rear camera angles. The `proj_forward` shader discard handles most cases; a small amount of bleed-through is accepted for v1.0.
+- **Fill Holes UV quality:** Vertices introduced by hole-filling receive UV (0,0) — the patch geometry is untextured. This is acceptable for structural closure (watertight export) but not for textured patches.
